@@ -13,16 +13,18 @@ SYSTEMD_DIR = "/etc/systemd/system/"
 SERVICE_PATTERN = re.compile(r"^llama-([a-zA-Z0-9_]+)\.service$")
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # ==========================================
 # 2. FILE PATHS
 # ==========================================
-MODELS_DIR = "/home/yourusername/ai_pipeline/models/"
-PROMPTS_DIR = "/home/yourusername/ai_pipeline/prompts/"
-ENV_NGL_FILE = "/home/yourusername/ai_pipeline/.env.ngl"       
-CACHE_DIR = "/home/yourusername/ai_pipeline/cache/"            
-RECOVERY_FILE = ".recovery_state.json"                         
-PERSISTENT_QUEUE_FILE = "/home/yourusername/ai_pipeline/.background_queue.json"
+MODELS_DIR = "/home/james/kinver-hub/models/"
+PROMPTS_DIR = "/home/james/kinver-hub/prompts/"
+ENV_NGL_FILE = "/home/james/kinver-hub/.env.ngl"       
+CACHE_DIR = "/home/james/kinver-hub/cache/"            
+RECOVERY_FILE = "/home/james/kinver-hub/proxy/recovery_state.json"                         
+PERSISTENT_QUEUE_FILE = "/home/james/kinver-hub/proxy/background_queue.json"
 
 # ==========================================
 # 3. TOOL CONFIGURATIONS

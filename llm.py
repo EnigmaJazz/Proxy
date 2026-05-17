@@ -13,7 +13,7 @@ async def wait_for_port_readiness(port, timeout=15):
     async with httpx.AsyncClient() as client:
         while time.time() - start_time < timeout:
             try:
-                res = await client.get(f"[http://127.0.0.1](http://127.0.0.1):{port}/health", timeout=1.0)
+                res = await client.get(f"http://127.0.0.1:{port}/health", timeout=1.0)
                 if res.status_code == 200: return True
             except: pass
             await asyncio.sleep(0.5) 
@@ -22,13 +22,13 @@ async def wait_for_port_readiness(port, timeout=15):
 async def clear_model_cache(port):
     """Wipes VRAM memory slots dynamically."""
     async with httpx.AsyncClient() as client:
-        try: await client.post(f"[http://127.0.0.1](http://127.0.0.1):{port}/slots/0?action=erase", timeout=5)
+        try: await client.post(f"http://127.0.0.1:{port}/slots/0?action=erase", timeout=5)
         except: pass
 
 async def manage_slot_cache(port, action, filename):
     """Saves/loads memory states directly to the NVMe disk."""
     async with httpx.AsyncClient() as client:
-        try: await client.post(f"[http://127.0.0.1](http://127.0.0.1):{port}/slots/0?action={action}", json={"filename": filename}, timeout=10.0)
+        try: await client.post(f"http://127.0.0.1:{port}/slots/0?action={action}", json={"filename": filename}, timeout=10.0)
         except Exception: pass
 
 def load_role_prompt(role_name):
@@ -68,7 +68,7 @@ async def call_model(port, prompt, profile="analytical", max_tokens=2048):
     else: payload.update({"temperature": 0.2, "top_p": 1.0})
 
     async with httpx.AsyncClient() as client:
-        try: return (await client.post(f"[http://127.0.0.1](http://127.0.0.1):{port}/completion", json=payload, timeout=300)).json().get("content", "")
+        try: return (await client.post(f"http://127.0.0.1:{port}/completion", json=payload, timeout=300)).json().get("content", "")
         except: return ""
 
 async def call_model_chat(port, messages, tools=None, profile="analytical", max_tokens=8192):
@@ -84,7 +84,7 @@ async def call_model_chat(port, messages, tools=None, profile="analytical", max_
     if profile == "deterministic": payload.update({"temperature": 0.0})
 
     async with httpx.AsyncClient() as client:
-        try: return (await client.post(f"[http://127.0.0.1](http://127.0.0.1):{port}/v1/chat/completions", json=payload, timeout=300)).json()["choices"][0]["message"]["content"]
+        try: return (await client.post(f"http://127.0.0.1:{port}/v1/chat/completions", json=payload, timeout=300)).json()["choices"][0]["message"]["content"]
         except: return ""
 
 async def openrouter_cloud_escalation(stage, prompt):
@@ -98,7 +98,7 @@ async def openrouter_cloud_escalation(stage, prompt):
     }
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.post("[https://openrouter.ai/api/v1/chat/completions](https://openrouter.ai/api/v1/chat/completions)", headers=headers, json=payload, timeout=60.0)
+            response = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=60.0)
             if response.status_code == 200: return response.json()["choices"][0]["message"]["content"]
             else: return f"[Cloud Escalation API Error: {response.status_code}]"
         except Exception as e: return f"[Cloud Escalation Network Error: {str(e)}]"

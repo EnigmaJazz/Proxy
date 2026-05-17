@@ -306,9 +306,9 @@ async def queue_worker():
         if job.domain not in ["cloud", "invalid"]: 
             await stream_system_feedback(job, f"Triage complete. Initial domain: {job.domain.capitalize()} (Complexity: {job.complexity.capitalize()}).")
             
-        if job.domain in ["coder", "architect", "professional", "creative", "scholar"]: set_predictive_cooling(100)
-        elif job.complexity == "high": set_predictive_cooling(75)
-        else: set_predictive_cooling(50)
+        if job.domain in ["coder", "architect", "professional", "creative", "scholar"]: set_predictive_cooling(100000)
+        elif job.complexity == "high": set_predictive_cooling(75000)
+        else: set_predictive_cooling(50000)
         
         try:
             if STATE["current_project"] != job.project:
@@ -384,17 +384,17 @@ async def queue_worker():
                 
                 _, p_port = get_service_info("planner")
                 _, a_port = get_service_info("auditor")
-                await stream_and_ingest_with_checkpoint(job, target_port, p_port, a_port)
+                generated_text, warnings = await stream_and_ingest_with_checkpoint(job, target_port, p_port, a_port)
                 
                 await manage_slot_cache(target_port, "save", cache_filename)
             else: 
                 _, worker_port = get_service_info("worker")
-                res = await call_model_chat(worker_port, [{"role": "system", "content": load_role_prompt(job.domain)}] + job.messages, profile="analytical")
-                await job.output_queue.put(res)
+                generated_text = await call_model_chat(worker_port, [{"role": "system", "content": load_role_prompt(job.domain)}] + job.messages, profile="analytical")
+                await job.output_queue.put(generated_text)
                 await job.output_queue.put("[DONE]")
                 
             if job.priority == 3:
-                snippet = res[:100].replace('\n', ' ') + "..." if 'res' in locals() else "Check output for details."
+                snippet = generated_text[:100].replace('\n', ' ') + "..." if 'generated_text' in locals() else "Check output for details."
                 msg_body = f"Domain: {job.domain.capitalize()}\nProject: {job.project}\n\nSnippet: {snippet}"
                 await asyncio.gather(
                     send_telegram_alert("✅ AI Proxy: Background Task Complete", msg_body),
@@ -421,7 +421,7 @@ async def queue_worker():
             STATE["active_priority"] = 99
             job_queue.task_done()
             if job_queue.empty():
-                set_predictive_cooling(30) 
+                set_predictive_cooling(30000) 
                 if STATE["active_heavy_model"]: await asyncio.create_subprocess_exec("sudo", "systemctl", "stop", STATE["active_heavy_model"])
                 worker_svc, _ = get_service_info("worker")
                 await asyncio.create_subprocess_exec("sudo", "systemctl", "start", worker_svc)

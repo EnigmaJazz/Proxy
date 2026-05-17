@@ -6,7 +6,7 @@ import logging
 import threading
 
 # --- Constants ---
-SHARED_ENV_FILE = "/etc/kinver/gpu_state.env"
+SHARED_ENV_FILE = "~/kinver-hub/gpu_state.env"
 COOLDOWN_SECONDS = 600  # 10 Minutes of inactivity before dropping VRAM clocks
 
 class HardwareWarden:

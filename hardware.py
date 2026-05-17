@@ -60,19 +60,19 @@ async def send_telegram_alert(title, message):
 
 async def send_bash_notification(title, message):
     """Executes your custom async bash notification script."""
-    BASH_FILE_PATH = "/home/yourusername/scripts/my_notifications.sh"
-    ASYNC_FUNCTION_NAME = "send_notification_async"
+    BASH_FILE_PATH = "~/ar-notify.sh"
+    ASYNC_FUNCTION_NAME = "notify_phone"
     try:
-        command = f"bash -c \"source {BASH_FILE_PATH} && {ASYNC_FUNCTION_NAME} '{title}' '{message}'\""
+        command = f"bash -c \"source {BASH_FILE_PATH} && {ASYNC_FUNCTION_NAME} 'ubuntu=:=active=:=green=:={title}:{message}'\""
         proc = await asyncio.create_subprocess_shell(command, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
         await proc.communicate()
     except Exception as e:
         logging.error(f"Failed to trigger bash notification: {e}")
 
-def set_predictive_cooling(synthetic_temp=30):
+def set_predictive_cooling(synthetic_temp=30000):
     """Triggers fan controllers ahead of heavy inference."""
     try:
-        with open("/tmp/ai_proxy_sensor.txt", "w") as f: f.write(f"{synthetic_temp}\n")
+        with open("/tmp/ai_proxy_sensor.txt", "w") as f: f.write(f"{synthetic_temp}")
     except: pass
 
 async def get_free_vram_mb():

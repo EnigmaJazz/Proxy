@@ -139,8 +139,8 @@ async def stream_system_feedback(job, message):
 
 async def submit_job(raw_prompt, messages):
     """Routes initial text to RAM-resident Front Desk for JSON-GBNF triage."""
-    _, fd_port = get_service_info("front_desk")
-    triage_prompt = f"[System: {load_role_prompt('front_desk')}]\nPrompt: {raw_prompt}"
+    _, fd_port = get_service_info("frontdesk")
+    triage_prompt = f"[System: {load_role_prompt('frontdesk')}]\nPrompt: {raw_prompt}"
     
     triage_json = await call_model(fd_port, triage_prompt, profile="json_gbnf")
     try: 
@@ -278,8 +278,8 @@ async def manage_heavy_model(target_service):
         return 
     
     worker_svc, _ = get_service_info("worker")
-    await asyncio.create_subprocess_exec("sudo", "systemctl", "stop", worker_svc)
-    if STATE["active_heavy_model"]: await asyncio.create_subprocess_exec("sudo", "systemctl", "stop", STATE["active_heavy_model"])
+    await asyncio.create_subprocess_exec( "systemctl", "stop", worker_svc)
+    if STATE["active_heavy_model"]: await asyncio.create_subprocess_exec( "systemctl", "stop", STATE["active_heavy_model"])
     
     await asyncio.sleep(2) 
     await verify_vram_availability() 
@@ -287,7 +287,7 @@ async def manage_heavy_model(target_service):
     
     _, target_port = get_service_info(target_service.replace("llama-", ""))
     await asyncio.to_thread(hub_warden.arm_gpu_for_inference, target_service, target_port)
-    await asyncio.create_subprocess_exec("sudo", "systemctl", "start", target_service)
+    await asyncio.create_subprocess_exec( "systemctl", "start", target_service)
     STATE["active_heavy_model"] = target_service
     await wait_for_port_readiness(target_port)
 
@@ -422,14 +422,14 @@ async def queue_worker():
             job_queue.task_done()
             if job_queue.empty():
                 set_predictive_cooling(30000) 
-                if STATE["active_heavy_model"]: await asyncio.create_subprocess_exec("sudo", "systemctl", "stop", STATE["active_heavy_model"])
+                if STATE["active_heavy_model"]: await asyncio.create_subprocess_exec( "systemctl", "stop", STATE["active_heavy_model"])
                 worker_svc, _ = get_service_info("worker")
-                await asyncio.create_subprocess_exec("sudo", "systemctl", "start", worker_svc)
+                await asyncio.create_subprocess_exec( "systemctl", "start", worker_svc)
                 STATE["active_heavy_model"] = None
 
 async def zram_keepalive_worker():
     """Pings core models to prevent Linux swap-out."""
-    core_domains = ["front_desk", "planner", "auditor", "worker"]
+    core_domains = ["frontdesk", "planner", "auditor", "worker"]
     while True:
         await asyncio.sleep(240) 
         async with httpx.AsyncClient() as client:
@@ -510,13 +510,13 @@ async def temperature_monitor_worker():
                 send_bash_notification("🚨 AI Proxy: THERMAL HALT", halt_msg)
             )
             thermal_halt_event.set() 
-            if STATE["active_heavy_model"]: await asyncio.create_subprocess_exec("sudo", "systemctl", "stop", STATE["active_heavy_model"])
-            await asyncio.create_subprocess_exec("sudo", "systemctl", "stop", worker_svc)
+            if STATE["active_heavy_model"]: await asyncio.create_subprocess_exec( "systemctl", "stop", STATE["active_heavy_model"])
+            await asyncio.create_subprocess_exec( "systemctl", "stop", worker_svc)
             STATE["active_heavy_model"] = None
         elif not sys_crit and thermal_halt_event.is_set():
             await send_wayland_notification("Recovery", "Temperatures normalized. Resuming.")
             thermal_halt_event.clear()
-            await asyncio.create_subprocess_exec("sudo", "systemctl", "start", worker_svc)
+            await asyncio.create_subprocess_exec( "systemctl", "start", worker_svc)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

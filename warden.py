@@ -91,7 +91,7 @@ class HardwareWarden:
                 subprocess.run(f"echo '{env_config}' | sudo tee {SHARED_ENV_FILE} > /dev/null", shell=True, check=True)
 
                 # 3. Restart the targeted model and hold traffic
-                subprocess.run(["sudo", "systemctl", "restart", target_service], check=True)
+                subprocess.run([ "systemctl", "restart", target_service], check=True)
                 self.wait_for_worker_hub(target_port)
 
             except subprocess.CalledProcessError as e:

@@ -283,7 +283,7 @@ async def manage_heavy_model(target_service):
     
     await asyncio.sleep(2) 
     await verify_vram_availability() 
-    await calculate_dynamic_ngl(target_service) 
+    await calculate_dynamic_ngl(target_service, hub_warden) 
     
     _, target_port = get_service_info(target_service.replace("llama-", ""))
     await asyncio.to_thread(hub_warden.arm_gpu_for_inference, target_service, target_port)
@@ -306,7 +306,7 @@ async def queue_worker():
         if job.domain not in ["cloud", "invalid"]: 
             await stream_system_feedback(job, f"Triage complete. Initial domain: {job.domain.capitalize()} (Complexity: {job.complexity.capitalize()}).")
             
-        if job.domain in ["coder", "architect", "professional", "creative", "scholar"]: set_predictive_cooling(100000)
+        if job.domain in ["coder", "architect", "professional", "creative", "scholar"]: set_predictive_cooling(75000)
         elif job.complexity == "high": set_predictive_cooling(75000)
         else: set_predictive_cooling(50000)
         
@@ -531,7 +531,7 @@ async def lifespan(app: FastAPI):
         open(PERSISTENT_QUEUE_FILE, 'w').close()
         
     worker_svc, _ = get_service_info("worker")
-    if not os.path.exists(ENV_NGL_FILE): await calculate_dynamic_ngl(worker_svc)
+    if not os.path.exists(ENV_NGL_FILE): await calculate_dynamic_ngl(worker_svc, hub_warden)
     
     task_queue = asyncio.create_task(queue_worker())
     task_zram = asyncio.create_task(zram_keepalive_worker())
@@ -580,7 +580,9 @@ async def chat_completions(request: Request):
     elif caller_type == "AGENTIC":
         raw_text_dump = " ".join([m.get("content", "") for m in messages if isinstance(m.get("content"), str)]).lower()
         is_dream_process = "soul.md" in raw_text_dump and "memory.md" in raw_text_dump and "user.md" in raw_text_dump
-        effective_domain = requested_model if requested_model in ["coder", "architect", "planner", "professional", "creative", "scholar"] else "standard"
+        # Strip "llama-" prefix if present to match domain names
+        model_domain = requested_model.replace("llama-", "") if requested_model.startswith("llama-") else requested_model
+        effective_domain = model_domain if model_domain in ["coder", "architect", "planner", "professional", "creative", "scholar"] else "standard"
 
         for m in messages:
             if m.get("role") == "system":

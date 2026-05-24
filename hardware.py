@@ -4,8 +4,7 @@ import os
 import re
 import logging
 import httpx
-from gguf import GGUFReader
-from constants import MODELS_DIR, ENV_NGL_FILE, SYSTEMD_DIR, SERVICE_PATTERN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+from constants import ENV_NGL_FILE, SYSTEMD_DIR, SERVICE_PATTERN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 PORT_CACHE = {}
 
@@ -86,50 +85,26 @@ async def get_free_vram_mb():
     except: pass
     return 0 
 
-def get_gguf_layers(model_name):
-    try:
-        reader = GGUFReader(os.path.join(MODELS_DIR, f"{model_name}.gguf"))
-        for f in reader.fields.values():
-            if f.name == 'llama.block_count': return int(f.parts[0].tolist()[0])
-    except: pass
-    return 0 
-
-def calculate_kv_cache_reserve(target_service, total_layers):
-    """Calculates context window memory footprint."""
-    context_size, ctk_type, ctv_type = 65536, "f16", "f16"
-    try:
-        with open(f"/etc/systemd/system/{target_service}.service", "r") as f:
-            content = f.read()
-            c_match, ctk_match, ctv_match = re.search(r'-c\s+(\d+)', content), re.search(r'-ctk\s+([a-zA-Z0-9_]+)', content), re.search(r'-ctv\s+([a-zA-Z0-9_]+)', content)
-            if c_match: context_size = int(c_match.group(1))
-            if ctk_match: ctk_type = ctk_match.group(1)
-            if ctv_match: ctv_type = ctv_match.group(1)
-    except: pass
-    def get_bytes(q): return 0.5 if q in ["q4_0", "q4_1", "q4", "turbo4", "q4_K"] else 0.625 if q in ["q5_0", "q5_1", "q5", "q5_K"] else 1.0 if q in ["q8_0", "q8"] else 2.0
-    return int((((get_bytes(ctk_type) + get_bytes(ctv_type)) / 2.0) / 0.5) * (total_layers / 60.0) * (context_size / 65536.0) * 3072)
-
-async def calculate_dynamic_ngl(target_service):
-    """Calculates GPU layers to offload, reserving 250MB for Wayland UI."""
-    model_name = "default"
-    try:
-        with open(f"/etc/systemd/system/{target_service}.service", "r") as f:
-            match = re.search(r'-m\s+/[^\s]+/([^/\s]+\.gguf)', f.read())
-            if match: model_name = match.group(1).replace('.gguf', '')
-    except: pass
-
-    free_vram = await get_free_vram_mb()
-    total_layers = get_gguf_layers(model_name)
-    try: file_size_mb = os.path.getsize(os.path.join(MODELS_DIR, f"{model_name}.gguf")) / (1024 * 1024)
-    except FileNotFoundError: file_size_mb = 20000 
+async def calculate_dynamic_ngl(target_service, warden=None):
+    """Sets fit-target buffer size based on session type - smaller for headless, larger for graphical."""
+    # Import here to avoid circular dependency
+    from warden import HardwareWarden
     
-    safety_buffer = 250 + (file_size_mb * 0.02)
-    kv_reserve = calculate_kv_cache_reserve(target_service, total_layers) if total_layers > 0 else 3072
-    usable_vram = free_vram - kv_reserve - safety_buffer
+    if warden is None:
+        warden = HardwareWarden()
     
-    adjusted_layer_size = ((file_size_mb / total_layers) if total_layers > 0 else 330) * 1.05 
-    ngl = max(0, min(int(usable_vram / adjusted_layer_size) if usable_vram > 0 else 0, total_layers))
+    is_headless = warden.is_system_headless()
     
-    with open(ENV_NGL_FILE, "w") as f: f.write(f"NGL_TARGET={ngl}\n")
+    # fit-target is the MB buffer to leave free when --fit calculates offloading
+    # Headless: minimal buffer (500MB) since no additional GPU workload expected
+    # Graphical: larger buffer (2000MB) to handle compositor/user actions
+    if is_headless:
+        fit_target = 500
+    else:
+        fit_target = 2000
+    
+    with open(ENV_NGL_FILE, "w") as f: f.write(f"FIT_TARGET={fit_target}\n")
+    logging.info(f"FIT_TARGET set to {fit_target}MB (headless={is_headless})")
 
 async def verify_vram_availability(required_mb=8000):
     """Prevents OOM crashes by halting orchestrator until VRAM clears."""

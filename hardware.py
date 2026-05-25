@@ -74,6 +74,17 @@ def set_predictive_cooling(synthetic_temp=30000):
         with open("/tmp/ai_proxy_sensor.txt", "w") as f: f.write(f"{synthetic_temp}")
     except: pass
 
+async def get_total_vram_mb():
+    """Gets total VRAM capacity from ROCm."""
+    try:
+        proc = await asyncio.create_subprocess_exec("rocm-smi", "--showmeminfo", "vram", "--json", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        data = json.loads(stdout.decode())
+        for card, info in data.items():
+            if "card" in card: return int(info.get("VRAM Total Memory (B)", 12884901888)) // (1024 * 1024)
+    except: pass
+    return 12800  # Default fallback for 12GB card
+
 async def get_free_vram_mb():
     """Polls ROCm asynchronously for VRAM metrics."""
     try:
@@ -109,6 +120,16 @@ async def calculate_dynamic_ngl(target_service, warden=None):
 async def verify_vram_availability(required_mb=8000):
     """Prevents OOM crashes by halting orchestrator until VRAM clears."""
     alerted = False
+    free_vram = await get_free_vram_mb()
+    logging.info(f"Current free VRAM: {free_vram}MB, Required: {required_mb}MB")
+    
+    # Only wait if VRAM is actually occupied (less than total VRAM minus requirement)
+    # If GPU is completely free, proceed immediately
+    total_vram = await get_total_vram_mb()
+    if free_vram >= total_vram - 100:  # Allow 100MB margin for system use
+        logging.info("GPU appears to be free, skipping VRAM wait")
+        return
+    
     while await get_free_vram_mb() < required_mb:
         await send_wayland_notification("Pipeline Paused", "Waiting for VRAM.")
         

@@ -296,7 +296,8 @@ async def stream_and_ingest_with_checkpoint(job, target_port, planner_port, audi
 
 async def manage_heavy_model(target_service):
     """Secures VRAM and safely triggers HardwareWarden clocks."""
-    logging.info(f"Managing heavy model: {target_service} (current: {STATE['active_heavy_model']})")
+    current_model = STATE["active_heavy_model"]
+    logging.info(f"Managing heavy model: {target_service} (current: {current_model if current_model else 'none'})")
     
     if STATE["active_heavy_model"] == target_service: 
         logging.info(f"Model {target_service} already active, just arming GPU")
@@ -304,7 +305,11 @@ async def manage_heavy_model(target_service):
         await asyncio.to_thread(hub_warden.arm_gpu_for_inference, target_service, target_port)
         return 
     
-    logging.info(f"Switching from {STATE['active_heavy_model']} to {target_service}")
+    if current_model:
+        logging.info(f"Switching from {current_model} to {target_service}")
+    else:
+        logging.info(f"Loading {target_service} (no model currently active)")
+    
     worker_svc, _ = get_service_info("worker")
     await asyncio.create_subprocess_exec( "systemctl", "stop", worker_svc)
     if STATE["active_heavy_model"]: 
@@ -393,7 +398,7 @@ async def queue_worker():
                     await stream_system_feedback(job, "GPU is busy. Routing basic query to RAM-resident Lifeboat...")
                     active_service = "lifeboat"
                     _, fallback_port = get_service_info(active_service)
-                    res = await call_model_chat(fallback_port, [{"role": "system", "content": load_role_prompt(active_service)}] + job.messages, profile="analytical")
+                    res = await call_model_chat(fallback_port, [{"role": "system", "content": load_role_prompt(active_service)}] + job.messages, tools=NATIVE_TOOLS, profile="analytical")
                     await job.output_queue.put(res)
                     await job.output_queue.put("[DONE]")
                     continue
@@ -404,7 +409,7 @@ async def queue_worker():
                     worker_svc, worker_port = get_service_info(active_service)
                     await asyncio.to_thread(hub_warden.arm_gpu_for_inference, worker_svc, worker_port)
                     if not await wait_for_port_readiness(worker_port): await stream_system_feedback(job, "Warning: Worker model delayed.")
-                    res = await call_model_chat(worker_port, [{"role": "system", "content": load_role_prompt(active_service)}] + job.messages, profile="analytical")
+                    res = await call_model_chat(worker_port, [{"role": "system", "content": load_role_prompt(active_service)}] + job.messages, tools=NATIVE_TOOLS, profile="analytical")
                     await job.output_queue.put(res)
                     await job.output_queue.put("[DONE]")
                     continue
@@ -432,7 +437,10 @@ async def queue_worker():
                 cache_filename = f"{job.project}_{job.domain}.bin"
                 if STATE["active_heavy_model"] != target_service: 
                     await stream_system_feedback(job, f"Hot-swapping VRAM to boot {job.domain.capitalize()} model...")
-                    await stream_system_feedback(job, f"Stopping current model ({STATE['active_heavy_model']}) and loading {target_service}...")
+                    if STATE["active_heavy_model"]:
+                        await stream_system_feedback(job, f"Stopping current model ({STATE['active_heavy_model']}) and loading {target_service}...")
+                    else:
+                        await stream_system_feedback(job, f"Loading {target_service}...")
                 
                 await manage_heavy_model(target_service)
                 await stream_system_feedback(job, f"Model loaded. Restoring cache for {job.project}...")
@@ -448,7 +456,7 @@ async def queue_worker():
             else: 
                 logging.info(f"Routing to Worker for domain: {job.domain}")
                 _, worker_port = get_service_info("worker")
-                generated_text = await call_model_chat(worker_port, [{"role": "system", "content": load_role_prompt(job.domain)}] + job.messages, profile="analytical")
+                generated_text = await call_model_chat(worker_port, [{"role": "system", "content": load_role_prompt(job.domain)}] + job.messages, tools=NATIVE_TOOLS, profile="analytical")
                 await job.output_queue.put(generated_text)
                 await job.output_queue.put("[DONE]")
                 
@@ -682,7 +690,7 @@ async def chat_completions(request: Request):
                 native_name = native_tool["function"]["name"]
                 extracted_tools = [t for t in extracted_tools if t.get("function", {}).get("name") not in [native_name, "search"]]
                 extracted_tools.append(native_tool)
-            processed_messages.append({"role": "system", "content": "\n\n[PROXY SYSTEM OVERRIDE: Issue ALL required tool calls simultaneously in a single parallel JSON array.]"})
+            processed_messages.append({"role": "system", "content": "\n\n[PROXY SYSTEM OVERRIDE: Issue ALL required tool calls simultaneously in a single parallel JSON array. Use the exact function name as defined in the tools schema. Assign a unique id to each tool call]"})
 
     raw_prompt_for_triage = "\n".join([m.get("content", "") for m in processed_messages if isinstance(m.get("content"), str)])
     

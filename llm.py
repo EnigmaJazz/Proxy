@@ -54,14 +54,17 @@ async def call_model(port, prompt, profile="analytical", max_tokens=2048):
             "json_schema": {
                 "type": "object", 
                 "properties": {
-                    "is_valid": {"type": "boolean"}, 
-                    "local_only": {"type": "boolean"},
-                    "cleaned_prompt": {"type": "string"}, 
-                    "priority": {"type": "string"}, 
-                    "complexity": {"type": "string"}, 
-                    "domain": {"type": "string"}, 
-                    "project": {"type": "string"}, 
-                    "file_paths": {"type": "array", "items": {"type": "string"}}
+                   "cleaned_prompt": {"type": "string"},
+                    "priority": {"type": "string"},
+                    "complexity": {"type": "string"},
+                    "domain": {"type": "string"},
+                    "project": {"type": "string"},
+                    "file_paths": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    },
+                    "is_valid": {"type": "boolean"},
+                    "local_only": {"type": "boolean"}
                 }
             }
         })

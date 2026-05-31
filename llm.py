@@ -8,7 +8,7 @@ from constants import PROMPTS_DIR, OPENROUTER_API_KEY
 # Universal stop sequences
 STOP_SEQS = ["<|eot_id|>", "<|im_end|>", "<|endoftext|>", "</s>", "Observation:", "```output"]
 
-async def wait_for_port_readiness(port, timeout=15):
+async def wait_for_port_readiness(port, timeout=120):
     """Pings a service to prevent sending traffic during cold-starts."""
     start_time = time.time()
     async with httpx.AsyncClient() as client:
@@ -96,7 +96,7 @@ async def call_model_chat(port, messages, tools=None, profile="analytical", max_
             return ""
 
 async def openrouter_cloud_escalation(stage, prompt):
-    """Fallback network request for Cloud Bypass and Auditor failures."""
+    """Fallback network request for Cloud Bypass and Reasoning failures."""
     if not OPENROUTER_API_KEY: return "[Cloud Escalation Failed: OPENROUTER_API_KEY not found.]"
     headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "HTTP-Referer": "http://localhost:13000", "X-Title": "Local Proxy"}
     payload = {

@@ -17,15 +17,26 @@ from llm import wait_for_port_readiness, clear_model_cache, manage_slot_cache, l
 from tools import execute_tool 
 from warden import HardwareWarden
 
-# Configure logging to both file and stdout
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler("~/kinver-hub/proxy/proxy.log"),
-        logging.StreamHandler()
-    ]
+# Configure logging to both file and stdout with rotation
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+
+# File handler with rotation (10MB max, keep 5 backups)
+from logging.handlers import RotatingFileHandler
+file_handler = RotatingFileHandler(
+    "~/kinver-hub/proxy/proxy.log",
+    maxBytes=10*1024*1024,  # 10MB
+    backupCount=5
 )
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+
+# Console handler
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
+
 print("PROXY STARTING - Logging configured")
 hub_warden = HardwareWarden()
 
@@ -407,7 +418,7 @@ async def queue_worker():
                     await stream_system_feedback(job, "GPU is busy. Routing basic query to RAM-resident Lifeboat...")
                     active_service = "lifeboat"
                     _, fallback_port = get_service_info(active_service)
-                    res = await call_model_chat(fallback_port, [{"role": "system", "content": load_role_prompt(active_service)}] + job.messages, tools=NATIVE_TOOLS, profile="analytical")
+                    res = await call_model_chat(fallback_port, [{"role": "system", "content": load_role_prompt(active_service)}] + job.messages, profile="analytical")
                     await job.output_queue.put(res)
                     await job.output_queue.put("[DONE]")
                     continue
@@ -418,7 +429,7 @@ async def queue_worker():
                     worker_svc, worker_port = get_service_info(active_service)
                     await asyncio.to_thread(hub_warden.arm_gpu_for_inference, worker_svc, worker_port)
                     if not await wait_for_port_readiness(worker_port): await stream_system_feedback(job, "Warning: Worker model delayed.")
-                    res = await call_model_chat(worker_port, [{"role": "system", "content": load_role_prompt(active_service)}] + job.messages, tools=NATIVE_TOOLS, profile="analytical")
+                    res = await call_model_chat(worker_port, [{"role": "system", "content": load_role_prompt(active_service)}] + job.messages, profile="analytical")
                     await job.output_queue.put(res)
                     await job.output_queue.put("[DONE]")
                     continue
@@ -465,7 +476,7 @@ async def queue_worker():
             else: 
                 logging.info(f"Routing to Worker for domain: {job.domain}")
                 _, worker_port = get_service_info("worker")
-                generated_text = await call_model_chat(worker_port, [{"role": "system", "content": load_role_prompt(job.domain)}] + job.messages, tools=NATIVE_TOOLS, profile="analytical")
+                generated_text = await call_model_chat(worker_port, [{"role": "system", "content": load_role_prompt(job.domain)}] + job.messages, profile="analytical")
                 await job.output_queue.put(generated_text)
                 await job.output_queue.put("[DONE]")
                 
@@ -701,7 +712,14 @@ async def chat_completions(request: Request):
                 extracted_tools.append(native_tool)
             processed_messages.append({"role": "system", "content": "\n\n[PROXY SYSTEM OVERRIDE: Issue ALL required tool calls simultaneously in a single parallel JSON array. Use the exact function name as defined in the tools schema. Assign a unique id to each tool call]"})
 
-    raw_prompt_for_triage = "\n".join([m.get("content", "") for m in processed_messages if isinstance(m.get("content"), str)])
+    # Extract only the latest user message for triage
+    latest_user_message = ""
+    for m in reversed(processed_messages):
+        if m.get("role") == "user":
+            latest_user_message = m.get("content", "")
+            break
+
+    raw_prompt_for_triage = latest_user_message
     
     # 1. Intercept /pause [minutes]
     pause_match = re.search(r'(?i)^\s*/pause(?:\s+(\d+))?\s*$', raw_prompt_for_triage)
@@ -775,7 +793,7 @@ async def chat_completions(request: Request):
                 yield f"data: {json.dumps(openai_chunk)}\n\n"
                 continue
                 
-            openai_chunk = {"id": f"chatcmpl-{int(time.time())}", "object": "chat.completion.chunk", "created": int(time.time()), "model": requested_model, "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}]}
+            openai_chunk = {"id": f"chatcmpl-{int(time.time())}", "object": "chat.completion.chunk", "created": int(time.time()), "model": requested_model if requested_model != "auto" else "llama-worker", "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}]}
             yield f"data: {json.dumps(openai_chunk)}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

@@ -17,7 +17,16 @@ from llm import wait_for_port_readiness, clear_model_cache, manage_slot_cache, l
 from tools import execute_tool 
 from warden import HardwareWarden
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# Configure logging to both file and stdout
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("~/kinver-hub/proxy/proxy.log"),
+        logging.StreamHandler()
+    ]
+)
+print("PROXY STARTING - Logging configured")
 hub_warden = HardwareWarden()
 
 # Global State & Queues
@@ -772,4 +781,4 @@ async def chat_completions(request: Request):
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 if __name__ == "__main__":
-    uvicorn.run("proxy:app", host="0.0.0.0", port=13000, loop="asyncio")
+    uvicorn.run("proxy:app", host="0.0.0.0", port=13000, loop="asyncio", log_config=None)

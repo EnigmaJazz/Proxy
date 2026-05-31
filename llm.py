@@ -1,5 +1,6 @@
 import asyncio
 import httpx
+import logging
 import os
 import time
 from constants import PROMPTS_DIR, OPENROUTER_API_KEY
@@ -87,8 +88,12 @@ async def call_model_chat(port, messages, tools=None, profile="analytical", max_
     if profile == "deterministic": payload.update({"temperature": 0.0})
 
     async with httpx.AsyncClient() as client:
-        try: return (await client.post(f"http://127.0.0.1:{port}/v1/chat/completions", json=payload, timeout=300)).json()["choices"][0]["message"]["content"]
-        except: return ""
+        try:
+            response = (await client.post(f"http://127.0.0.1:{port}/v1/chat/completions", json=payload, timeout=300)).json()
+            return response["choices"][0]["message"]["content"]
+        except Exception as e:
+            logging.error(f"call_model_chat error: {e}")
+            return ""
 
 async def openrouter_cloud_escalation(stage, prompt):
     """Fallback network request for Cloud Bypass and Auditor failures."""

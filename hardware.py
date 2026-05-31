@@ -78,22 +78,38 @@ async def get_total_vram_mb():
     """Gets total VRAM capacity from ROCm."""
     try:
         proc = await asyncio.create_subprocess_exec("rocm-smi", "--showmeminfo", "vram", "--json", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        if proc.returncode != 0:
+            logging.error(f"rocm-smi failed with return code {proc.returncode}: {stderr.decode()}")
+            return 12800
         data = json.loads(stdout.decode())
         for card, info in data.items():
             if "card" in card: return int(info.get("VRAM Total Memory (B)", 12884901888)) // (1024 * 1024)
-    except: pass
+    except FileNotFoundError:
+        logging.error("rocm-smi not found. Please install ROCm tools to detect VRAM.")
+    except asyncio.TimeoutError:
+        logging.error("rocm-smi command timed out")
+    except Exception as e:
+        logging.error(f"Failed to get total VRAM: {e}")
     return 12800  # Default fallback for 12GB card
 
 async def get_free_vram_mb():
     """Polls ROCm asynchronously for VRAM metrics."""
     try:
         proc = await asyncio.create_subprocess_exec("rocm-smi", "--showmeminfo", "vram", "--json", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        if proc.returncode != 0:
+            logging.error(f"rocm-smi failed with return code {proc.returncode}: {stderr.decode()}")
+            return 0
         data = json.loads(stdout.decode())
         for card, info in data.items():
             if "card" in card: return (int(info.get("VRAM Total Memory (B)", 12884901888)) - int(info.get("VRAM Total Used Memory (B)", 0))) // (1024 * 1024)
-    except: pass
+    except FileNotFoundError:
+        logging.error("rocm-smi not found. Please install ROCm tools to detect VRAM.")
+    except asyncio.TimeoutError:
+        logging.error("rocm-smi command timed out")
+    except Exception as e:
+        logging.error(f"Failed to get free VRAM: {e}")
     return 0 
 
 async def calculate_dynamic_ngl(target_service, warden=None):
@@ -110,9 +126,9 @@ async def calculate_dynamic_ngl(target_service, warden=None):
     # Headless: minimal buffer (500MB) since no additional GPU workload expected
     # Graphical: larger buffer (2000MB) to handle compositor/user actions
     if is_headless:
-        fit_target = 500
+        fit_target = 256
     else:
-        fit_target = 2000
+        fit_target = 1024
     
     with open(ENV_NGL_FILE, "w") as f: f.write(f"FIT_TARGET={fit_target}\n")
     logging.info(f"FIT_TARGET set to {fit_target}MB (headless={is_headless})")

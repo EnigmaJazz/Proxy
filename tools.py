@@ -32,7 +32,7 @@ async def execute_tool(job, tool_call_dict, stream_feedback_callback):
         
         if "[Search Error" in raw_markdown or "[Search failed" in raw_markdown: return raw_markdown 
             
-        await stream_feedback_callback(job, "Synthesizing research via RAM-resident Lifeboat & Auditor...")
+        await stream_feedback_callback(job, "Synthesizing research via RAM-resident Lifeboat & Reasoning...")
         return await lifeboat_reflexion_loop(raw_markdown, query, depth)
         
     return f"[Error: Native tool '{name}' not recognized.]"
@@ -40,7 +40,7 @@ async def execute_tool(job, tool_call_dict, stream_feedback_callback):
 async def lifeboat_reflexion_loop(raw_markdown: str, query: str, depth: str) -> str:
     """CPU-bound Reflexion loop. Summarizes search data and self-audits."""
     _, lb_port = get_service_info("lifeboat")
-    _, aud_port = get_service_info("auditor")
+    _, r_port = get_service_info("reasoning")
     cfg = DEPTH_CONFIG.get(depth.lower(), DEPTH_CONFIG["standard"])
     
     lb_prompt = (
@@ -51,14 +51,14 @@ async def lifeboat_reflexion_loop(raw_markdown: str, query: str, depth: str) -> 
     for attempt in range(3):
         summary = await call_model(lb_port, lb_prompt, profile="analytical", max_tokens=1024)
         
-        auditor_prompt = (
+        reasoning_prompt = (
             f"[System: {load_role_prompt('auditor_search')} ]\n\n"
             f"Raw Context:\n{raw_markdown[:2000]}...\n\nSummary to Evaluate:\n{summary}"
         )
-        evaluation = await call_model(aud_port, auditor_prompt, profile="deterministic", max_tokens=50)
+        evaluation = await call_model(r_port, reasoning_prompt, profile="deterministic", max_tokens=50)
         
         if evaluation.strip().startswith("OK"): return summary
-        else: lb_prompt += f"\n\n[Auditor Feedback: {evaluation}. Rewrite the summary.]"
+        else: lb_prompt += f"\n\n[Reasoning Feedback: {evaluation}. Rewrite the summary.]"
     return summary 
 
 async def scrape_site(client, url, char_limit):

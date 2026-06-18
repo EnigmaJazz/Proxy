@@ -1,0 +1,17 @@
+[Unit]
+Description=AI Multi-Agent Proxy Service
+After=network.target
+
+[Service]
+Type=simple
+User=james
+Group=james
+WorkingDirectory=~/kinver-hub/proxy
+Environment="PATH=~/kinver-hub/proxy/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=~/kinver-hub/proxy/.env
+ExecStart=~/kinver-hub/proxy/.venv/bin/python proxy.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

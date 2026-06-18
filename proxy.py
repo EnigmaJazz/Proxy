@@ -1,33 +1,63 @@
+"""
+proxy.py - Kinver AI Proxy server entry-point.
+
+This is the main entry point for the Kinver Hub Hybrid API Gateway.
+It assembles all components (database, systemd controller, cooling
+state machine, hardware governor, shadow auditor) and exposes the
+OpenAI-compatible API via FastAPI on port 13000.
+
+Architecture:
+- uvloop event loop for maximum async performance
+- FastAPI lifespan manages component initialisation and teardown
+- Background tasks: thermal monitor, queue worker, ZRAM keepalive
+- All routes are defined in routes.py and wired here
+- Dependencies are passed via app.state (no global singletons)
+
+Glass Pipe Rule:
+    This proxy MUST NOT alter, inject, or sanitize the text content of
+    system prompts or user messages sent by external frontends.
+    Prompting is strictly the responsibility of the client software.
+    The proxy may only generate prompts for its own internal routing
+    tasks (frontdesk classification, auditor evaluation).
+
+Usage::
+
+    python proxy.py
+
+    # Or via systemd:
+    systemctl start ai-proxy.service
+
+Maintainers: James Stansfield
+"""
+from __future__ import annotations
+
 import asyncio
-import httpx
 import json
-import os
-import re
-import time
 import logging
-import difflib
+import os
+import time
+from contextlib import asynccontextmanager
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import Optional, Dict, Any
+
+import httpx
+import uvloop
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
-import uvicorn
-from contextlib import asynccontextmanager
 
-from constants import FRONTEND_KEYS, CACHE_DIR, RECOVERY_FILE, PERSISTENT_QUEUE_FILE, THERMAL_LIMITS, ENV_NGL_FILE, NATIVE_TOOLS
-from hardware import get_service_info, scan_systemd_for_models, send_wayland_notification, set_predictive_cooling, calculate_dynamic_ngl, verify_vram_availability, send_telegram_alert, send_bash_notification
-from llm import wait_for_port_readiness, clear_model_cache, manage_slot_cache, load_role_prompt, call_model, call_model_chat, openrouter_cloud_escalation, STOP_SEQS
-from tools import execute_tool 
-from warden import HardwareWarden
-
-# Configure logging to both file and stdout with rotation
+# ---------------------------------------------------------------------------
+# Configure logging (to both rotating file and stdout)
+# ---------------------------------------------------------------------------
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 
-# File handler with rotation (10MB max, keep 5 backups)
-from logging.handlers import RotatingFileHandler
+# File handler with rotation (10 MB max, keep 5 backups)
 file_handler = RotatingFileHandler(
-    "/home/james/kinver-hub/proxy/proxy.log",
-    maxBytes=10*1024*1024,  # 10MB
-    backupCount=5
+    Path(__file__).resolve().parent / "proxy.log",
+    maxBytes=10 * 1024 * 1024,  # 10 MB
+    backupCount=5,
 )
 file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
@@ -37,806 +67,549 @@ console_handler = logging.StreamHandler()
 console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 
-print("PROXY STARTING - Logging configured")
-hub_warden = HardwareWarden()
+logger.info("PROXY STARTING — Logging configured")
 
-# Global State & Queues
-STATE = {"active_heavy_model": None, "current_project": None, "active_priority": 99}
-job_queue = asyncio.PriorityQueue()
-preempt_event = asyncio.Event()
-thermal_halt_event = asyncio.Event()
+# ---------------------------------------------------------------------------
+# Import internal modules (after logging is set up)
+# ---------------------------------------------------------------------------
+from constants import (
+    PROJECT_ROOT,
+    DB_PATH,
+    CoolingPreset,
+    SENSOR_INTERVAL,
+    get_logger,
+)
+from database import Database
+from systemd import SystemdController
+from cooling import CoolingStateMachine
+from hardware import (
+    HardwareGovernor,
+    thermal_state,
+    thermal_monitor_task,
+    write_cooling_ipc,
+    send_wayland_notification,
+    send_telegram_alert,
+    send_bash_notification,
+)
+from llm import (
+    wait_for_port_readiness,
+    clear_model_cache,
+    openrouter_cloud_escalation,
+)
+from auditing import ShadowAuditor
+from routing import RouteDecision
 
-# Manages OS state transitions and dynamic pauses
-transition_pause_event = asyncio.Event() 
-pause_timer_task = None 
+# Route handlers (imported from routes.py)
+from routes import (
+    health_check,
+    list_models,
+    chat_completions,
+)
 
-# Shared State Control Functions
-async def execute_queue_pause(duration_secs: int) -> tuple[bool, str]:
-    """Handles the shared logic for pausing the queue and preempting background tasks."""
-    global pause_timer_task
-    
-    if STATE["active_priority"] <= 2:
-        return False, "Cannot pause: A high-priority task is actively running."
+# ---------------------------------------------------------------------------
+# Application state (attached to app.state during lifespan)
+# ---------------------------------------------------------------------------
 
-    if STATE["active_priority"] == 3:
-        preempt_event.set()
 
-    if pause_timer_task and not pause_timer_task.done():
-        pause_timer_task.cancel()
+class AppState:
+    """
+    Mutable application state shared across all route handlers via
+    ``request.app.state``.
 
-    async def _pause_timer(seconds: int):
-        try:
-            transition_pause_event.set()
-            logging.info(f"Proxy: Queue paused for {seconds} seconds.")
-            await asyncio.sleep(seconds)
-            transition_pause_event.clear()
-            logging.info("Proxy: Queue resumed automatically.")
-        except asyncio.CancelledError:
-            pass
+    Attributes
+    ----------
+    database : Database
+        Async SQLite interface for the job queue and semantic cache.
+    systemd : SystemdController
+        Async Systemd service lifecycle manager.
+    cooler : CoolingStateMachine
+        3-stage predictive cooling state machine.
+    hardware : HardwareGovernor
+        GPU workload isolation and thermal monitoring.
+    auditor : ShadowAuditor
+        Non-blocking background output auditor.
+    server_start_ts : float
+        Monotonic timestamp of server start (for uptime calculation).
+    active_priority : int
+        Current active job priority (1=HIGH, 2=NORMAL, 3=IDLE).
+    active_heavy_model : str or None
+        Domain name of the currently active heavy GPU model.
+    requests_served : int
+        Total number of requests processed since startup.
+    pause_task : asyncio.Task or None
+        Active queue-pause timer task.
+    transition_pause : asyncio.Event
+        Set when the queue is paused for OS transitions.
+    thermal_halt : asyncio.Event
+        Set when thermal critical thresholds are breached.
+    """
 
-    pause_timer_task = asyncio.create_task(_pause_timer(duration_secs))
-    await asyncio.sleep(1.5) # Give the queue a moment to halt
-    return True, f"Queue paused for {duration_secs} seconds."
+    def __init__(self) -> None:
+        self.database: Optional[Database] = None
+        self.systemd: Optional[SystemdController] = None
+        self.cooler: Optional[CoolingStateMachine] = None
+        self.hardware: Optional[HardwareGovernor] = None
+        self.auditor: Optional[ShadowAuditor] = None
+        self.server_start_ts: float = time.time()
+        self.active_priority: int = 3  # IDLE
+        self.active_heavy_model: Optional[str] = None
+        self.requests_served: int = 0
+        self.pause_task: Optional[asyncio.Task] = None
+        self.transition_pause: asyncio.Event = asyncio.Event()
+        self.thermal_halt: asyncio.Event = asyncio.Event()
 
-def execute_queue_resume() -> str:
-    """Handles the shared logic for resuming the queue."""
-    global pause_timer_task
-    if pause_timer_task and not pause_timer_task.done():
-        pause_timer_task.cancel()
-        
-    transition_pause_event.clear()
-    logging.info("Proxy: Queue manually resumed.")
-    return "Queue manually resumed."
+    # ------------------------------------------------------------------
+    # Pause / resume queue (for OS transitions)
+    # ------------------------------------------------------------------
 
-class JobItem:
-    """Represents a discrete inference task in the priority queue."""
-    def __init__(self, priority, prompt, messages, domain, complexity, project, file_paths, force_domain=None, tools=None, local_only=False):
-        self.priority = priority        
-        self.prompt = prompt           
-        self.messages = messages       
-        self.domain = domain
-        self.complexity = complexity
-        self.project = project
-        self.file_paths = file_paths
-        self.fatal_errors = 0           
-        self.force_domain = force_domain 
-        self.output_queue = asyncio.Queue() 
-        self.tools = tools             
-        self.local_only = local_only
-        
-    def __lt__(self, other): return self.priority < other.priority
-    
-    def to_dict(self):
-        """Serializes the job for Phase 4/Background Queue persistence."""
-        return {"priority": self.priority, "prompt": self.prompt, "messages": self.messages, "domain": self.domain, "complexity": self.complexity, "project": self.project, "file_paths": self.file_paths, "local_only": self.local_only}
+    async def try_pause_queue(self, duration_secs: int) -> tuple[bool, str]:
+        """
+        Attempt to pause the queue for *duration_secs*.
 
-def discriminate_caller(request: Request) -> str:
-    """Categorizes traffic to protect IDE strict payloads from persona injection."""
-    auth_header = request.headers.get("authorization", "")
-    if auth_header.startswith("Bearer "):
-        token = auth_header.split(" ")[1]
-        if token in FRONTEND_KEYS: return FRONTEND_KEYS[token]
-    user_agent = request.headers.get("user-agent", "").lower()
-    if "aider" in user_agent or "cline" in user_agent or "vscode" in user_agent: return "IDE"
-    return "AGENTIC"
+        Returns (success, message).  If a high-priority task (priority
+        <= 2) is active, the pause is denied.
+        """
+        if self.active_priority <= 2:
+            return False, "Cannot pause: A high-priority task is actively running."
 
-def extract_project_context(prompt):
-    """Regex extracts file paths to segregate NVMe memory slots by project."""
-    path_pattern = r'(?:/[a-zA-Z0-9_.-]+)+/[a-zA-Z0-9_.-]+\.[a-zA-Z0-9]+'
-    file_paths = list(set(re.findall(path_pattern, prompt)))
-    project_name = "default"
-    if file_paths:
-        parts = file_paths[0].split('/')
-        if len(parts) >= 3: project_name = parts[-3] if len(parts) > 3 else parts[-2]
-    return {"project": project_name, "file_paths": file_paths}
+        # Cancel any existing pause timer
+        if self.pause_task and not self.pause_task.done():
+            self.pause_task.cancel()
 
-def detect_tool_loops(messages, domain="standard"):
-    """Zero-dependency difflib loop detection blocks Agentic Death Spirals."""
-    ROLE_LIMITS = {"scholar": 6, "architect": 4, "coder": 4, "standard": 3, "worker": 2}
-    max_loops = ROLE_LIMITS.get(domain, ROLE_LIMITS["standard"])
-    historical_calls = []
-    
-    for m in messages:
-        if m.get("role") == "assistant" and "tool_calls" in m:
-            for tc in m["tool_calls"]:
-                if tc.get("type") == "function":
-                    historical_calls.append({"name": tc["function"]["name"], "args": tc["function"]["arguments"]})
-                    
-    if not historical_calls: return False, ""
-    if len(historical_calls) >= max_loops: return True, f"Role limit of {max_loops} tool calls reached"
-        
-    if len(historical_calls) > 1:
-        latest_call = historical_calls[-1]
-        for prev_call in historical_calls[:-1]:
-            if latest_call["name"] == prev_call["name"]:
-                if difflib.SequenceMatcher(None, latest_call["args"], prev_call["args"]).ratio() > 0.85: 
-                    return True, "Repetitive/similar tool parameters detected"
-    return False, ""
+        async def _pause_timer(seconds: int):
+            try:
+                self.transition_pause.set()
+                logger.info("Queue paused for %d seconds (OS transition)", seconds)
+                await asyncio.sleep(seconds)
+                self.transition_pause.clear()
+                logger.info("Queue resumed automatically after pause")
+            except asyncio.CancelledError:
+                pass
 
-async def stream_system_feedback(job, message):
-    """Injects transparent proxy updates to the frontend streaming UI."""
-    if not job.force_domain: await job.output_queue.put(f"_⏳ [Proxy: {message}]_\n\n")
+        self.pause_task = asyncio.create_task(_pause_timer(duration_secs))
+        # Brief delay to let the queue worker observe the pause event
+        await asyncio.sleep(1.5)
+        return True, f"Queue paused for {duration_secs} seconds."
 
-async def submit_job(raw_prompt, messages):
-    """Routes initial text to RAM-resident Front Desk for JSON-GBNF triage."""
-    logging.info(f"Submitting job for triage - Prompt length: {len(raw_prompt)} chars")
-    _, fd_port = get_service_info("frontdesk")
-    triage_prompt = f"[System: {load_role_prompt('frontdesk')}]\nPrompt: {raw_prompt}"
-    
-    triage_json = await call_model(fd_port, triage_prompt, profile="json_gbnf")
-    try: 
-        job_data = json.loads(triage_json)
-        cleaned_text = job_data.get("cleaned_prompt", raw_prompt)
-        is_valid = job_data.get("is_valid", True)
-        local_only = job_data.get("local_only", False)
-    except: 
-        logging.warning("Triage JSON parsing failed, using defaults")
-        job_data = {"cleaned_prompt": raw_prompt, "priority": "normal", "complexity": "low", "domain": "general", "project": "default", "file_paths": []}
-        cleaned_text = raw_prompt
-        is_valid, local_only = True, False
-        
-    if messages and messages[-1]["role"] == "user":
-        messages[-1]["content"] = cleaned_text
-    
-    domain = job_data.get("domain", "general")
-    if not is_valid: domain = "invalid"
-    
-    p_text = job_data.get("priority", "normal")
-    priority_val = 1 if p_text == "high" else (3 if p_text == "background" else 2)
-    
-    job = JobItem(priority_val, cleaned_text, messages, domain, job_data.get("complexity", "low"), job_data.get("project", "default"), job_data.get("file_paths", []), local_only=local_only)
-    
-    logging.info(f"Job triaged - Domain: {domain}, Priority: {p_text} ({priority_val}), Complexity: {job_data.get('complexity', 'low')}, Valid: {is_valid}")
-    
-    if priority_val == 3:
-        try:
-            with open(PERSISTENT_QUEUE_FILE, "a") as f: f.write(json.dumps(job.to_dict()) + "\n")
-            logging.info("Background job persisted to queue file")
-        except: pass
-    
-    await job_queue.put(job)
-    if priority_val < STATE["active_priority"]: 
-        logging.info(f"Preempting active task (current priority: {STATE['active_priority']}, new priority: {priority_val})")
-        preempt_event.set()
-    return job
+    def try_resume_queue(self) -> None:
+        """
+        Manually resume the queue (cancel the pause timer).
+        """
+        if self.pause_task and not self.pause_task.done():
+            self.pause_task.cancel()
+        self.transition_pause.clear()
+        logger.info("Queue manually resumed")
 
-async def stream_and_ingest_with_checkpoint(job, target_port, reasoning_port):
-    """The Heavy Executor Loop."""
-    logging.info(f"Starting generation for domain: {job.domain}, port: {target_port}")
-    if not any(m.get("role") == "system" for m in job.messages):
-        final_messages = [{"role": "system", "content": load_role_prompt(job.domain)}] + job.messages
-    else:
-        final_messages = job.messages
-        
-    payload = {
-        "messages": final_messages, 
-        "temperature": 0.2, 
-        "stream": True,
-        "stop": STOP_SEQS
-    }
-    if job.tools: payload["tools"] = job.tools 
-        
-    if job.domain in ["coder", "architect"]: 
-        payload.update({"temperature": 0.1, "top_p": 0.9, "max_tokens": -1, "thinking_budget_tokens": 4096})
-    elif job.domain in ["creative", "scholar"]:
-        payload.update({"temperature": 0.4, "top_p": 0.95, "max_tokens": 8192, "thinking_budget_tokens": 2048})
-    elif job.domain == "professional": 
-        payload.update({"temperature": 0.3, "top_p": 0.95, "max_tokens": 4096, "thinking_budget_tokens": 1024})
-    else:
-        payload.update({"max_tokens": 2048, "thinking_budget_tokens": 0})
-    
-    logging.info(f"Generation payload - Temperature: {payload.get('temperature')}, Max tokens: {payload.get('max_tokens')}, Tools: {job.tools is not None}")
-    
-    generated_text, warnings, chunk_counter = "", [], 0
-    r_payload = {"prompt": "", "max_tokens": 0, "cache_prompt": True, "thinking_budget_tokens": 0}
-    tool_call_buffer = {} 
 
-    async with httpx.AsyncClient() as client:
-        logging.info(f"Opening stream to http://127.0.0.1:{target_port}/v1/chat/completions")
-        async with client.stream("POST", f"http://127.0.0.1:{target_port}/v1/chat/completions", json=payload, timeout=None) as response:
-            async for chunk in response.aiter_text():
-                if thermal_halt_event.is_set(): raise RuntimeError("Thermal Halt")
-                if preempt_event.is_set(): raise InterruptedError("Preempted")
-                
-                try:
-                    if chunk.startswith("data: ") and chunk.strip() != "data: [DONE]":
-                        data_json = json.loads(chunk[6:])
-                        delta = data_json["choices"][0]["delta"]
-                        
-                        if "tool_calls" in delta and delta["tool_calls"]:
-                            for tc in delta["tool_calls"]:
-                                idx = tc["index"]
-                                if idx not in tool_call_buffer:
-                                    tool_call_buffer[idx] = {
-                                        "id": tc.get("id", f"call_{int(time.time())}_{idx}"), 
-                                        "type": "function", 
-                                        "function": {"name": tc.get("function", {}).get("name", ""), "arguments": ""}
-                                    }
-                                    tool_name = tool_call_buffer[idx]["function"]["name"]
-                                    logging.info(f"Tool call detected: {tool_name}")
-                                    if tool_name:
-                                        await job.output_queue.put(f"\n\n_⏳ [Proxy: LLM executing tool: {tool_name}]_\n\n")
-                                
-                                if "function" in tc and "arguments" in tc["function"]:
-                                    tool_call_buffer[idx]["function"]["arguments"] += tc["function"]["arguments"]
-                            continue 
-                            
-                        if "content" in delta and delta["content"]:
-                            content = delta["content"]
-                            generated_text += content
-                            await job.output_queue.put(content) 
-                except: pass
-
-                chunk_counter += 1
-                with open(RECOVERY_FILE, "w") as f: json.dump({"recovery_state": generated_text}, f)
-                
-                r_payload["prompt"] = chunk
-                try: await client.post(f"http://127.0.0.1:{reasoning_port}/completion", json=r_payload)
-                except: pass 
-
-                if chunk_counter % 50 == 0:
-                    logging.info(f"Generation progress: {chunk_counter} chunks, {len(generated_text)} chars generated")
-                    try:
-                        eval_prompt = f"\n[System: {load_role_prompt('auditor')}. Reply ONLY OK, WARNING: <reason>, or FATAL: <reason>.]\n"
-                        eval_text = (await client.post(f"http://127.0.0.1:{reasoning_port}/completion", json={"prompt": eval_prompt, "max_tokens": 30, "temperature": 0.0, "thinking_budget_tokens": 0})).json().get("content", "").strip()
-                        if eval_text.startswith("FATAL"): 
-                            logging.error(f"Reasoning fatal error: {eval_text}")
-                            raise ValueError(f"Reasoning Fatal: {eval_text}") 
-                        elif eval_text.startswith("WARNING"): 
-                            logging.warning(f"Reasoning warning: {eval_text}")
-                            warnings.append(eval_text) 
-                    except ValueError: raise 
-                    except: pass 
-                    
-    if tool_call_buffer:
-        logging.info(f"Processing {len(tool_call_buffer)} tool calls")
-        native_tool_names = ["web_search", "search", "search_web"]
-        native_calls = [tc for tc in tool_call_buffer.values() if tc["function"]["name"] in native_tool_names]
-        frontend_calls = [tc for tc in tool_call_buffer.values() if tc["function"]["name"] not in native_tool_names]
-        job.messages.append({"role": "assistant", "content": generated_text, "tool_calls": list(tool_call_buffer.values())})
-        
-        if native_calls:
-            logging.info(f"Executing {len(native_calls)} native tools")
-            for tc in native_calls:
-                tool_result = await execute_tool(job, tc["function"], stream_system_feedback)
-                job.messages.append({"role": "tool", "tool_call_id": tc["id"], "name": tc["function"]["name"], "content": tool_result})
-            await stream_system_feedback(job, "Synthesizing final response...")
-            logging.info("Recursively calling stream_and_ingest_with_checkpoint for tool synthesis")
-            return await stream_and_ingest_with_checkpoint(job, target_port, reasoning_port)
-            
-        if frontend_calls:
-            logging.info(f"Forwarding {len(frontend_calls)} frontend tool calls")
-            await job.output_queue.put({"frontend_tool_calls": frontend_calls})
-    
-    logging.info(f"Generation complete - {len(generated_text)} chars generated, {len(warnings)} warnings")
-    if warnings:
-        logging.warning(f"Generation warnings: {warnings}")
-    await job.output_queue.put("[DONE]") 
-    return generated_text, warnings
-
-async def manage_heavy_model(target_service):
-    """Secures VRAM and safely triggers HardwareWarden clocks."""
-    current_model = STATE["active_heavy_model"]
-    logging.info(f"Managing heavy model: {target_service} (current: {current_model if current_model else 'none'})")
-    
-    if STATE["active_heavy_model"] == target_service: 
-        logging.info(f"Model {target_service} already active, just arming GPU")
-        _, target_port = get_service_info(target_service.replace("llama-", ""))
-        await asyncio.to_thread(hub_warden.arm_gpu_for_inference, target_service, target_port)
-        return 
-    
-    if current_model:
-        logging.info(f"Switching from {current_model} to {target_service}")
-    else:
-        logging.info(f"Loading {target_service} (no model currently active)")
-    
-    worker_svc, _ = get_service_info("worker")
-    await asyncio.create_subprocess_exec( "systemctl", "stop", worker_svc)
-    if STATE["active_heavy_model"]: 
-        logging.info(f"Stopping previous model: {STATE['active_heavy_model']}")
-        await asyncio.create_subprocess_exec( "systemctl", "stop", STATE["active_heavy_model"])
-    
-    await asyncio.sleep(2) 
-    logging.info("Verifying VRAM availability")
-    await verify_vram_availability() 
-    logging.info("Calculating dynamic NGL/FIT_TARGET")
-    await calculate_dynamic_ngl(target_service, hub_warden) 
-    
-    _, target_port = get_service_info(target_service.replace("llama-", ""))
-    await asyncio.to_thread(hub_warden.arm_gpu_for_inference, target_service, target_port)
-    await asyncio.create_subprocess_exec( "systemctl", "start", target_service)
-    STATE["active_heavy_model"] = target_service
-    logging.info(f"Waiting for {target_service} port readiness on {target_port}")
-    await wait_for_port_readiness(target_port)
-    logging.info(f"Model {target_service} is ready on port {target_port}")
-
-async def queue_worker():
-    """Main lifecycle orchestrator executing Priority queue items."""
-    logging.info("Queue worker started")
-    while True:
-        # Pause queue if thermal limits are breached OR if the OS is booting Wayland/Gaming
-        if thermal_halt_event.is_set() or transition_pause_event.is_set():
-            if thermal_halt_event.is_set():
-                logging.info("Queue paused due to thermal halt")
-            if transition_pause_event.is_set():
-                logging.info("Queue paused due to transition event")
-            await asyncio.sleep(2)
-            continue
-            
-        job = await job_queue.get()
-        STATE["active_priority"] = job.priority
-        preempt_event.clear() 
-        
-        logging.info(f"Processing job - Domain: {job.domain}, Priority: {job.priority}, Complexity: {job.complexity}, Project: {job.project}")
-        
-        # Add user feedback for priority changes
-        priority_names = {1: "HIGH", 2: "NORMAL", 3: "BACKGROUND"}
-        if job.priority != 2:
-            await stream_system_feedback(job, f"Queue priority: {priority_names.get(job.priority, job.priority)}")
-        
-        if job.domain not in ["cloud", "invalid"]: 
-            await stream_system_feedback(job, f"Triage complete. Initial domain: {job.domain.capitalize()} (Complexity: {job.complexity.capitalize()}).")
-            
-        if job.domain in ["coder", "architect", "professional", "creative", "scholar"]: set_predictive_cooling(75000)
-        elif job.complexity == "high": set_predictive_cooling(75000)
-        else: set_predictive_cooling(50000)
-        
-        try:
-            if STATE["current_project"] != job.project:
-                logging.info(f"Project switch detected: {STATE['current_project']} -> {job.project}")
-                if STATE["current_project"] is not None:
-                    await stream_system_feedback(job, f"Switched project to '{job.project}'. Wiping memory...")
-                    if os.path.exists(CACHE_DIR):
-                        for file in os.listdir(CACHE_DIR):
-                            if file.endswith("_cache.bin"):
-                                try: os.remove(os.path.join(CACHE_DIR, file))
-                                except: pass
-                    _, r_port = get_service_info("reasoning")
-                    await clear_model_cache(r_port)
-                    logging.info(f"Cache cleared for project switch to {job.project}")
-                STATE["current_project"] = job.project
-            
-            if job.domain == "invalid":
-                logging.warning("Job rejected as invalid by Front Desk")
-                await stream_system_feedback(job, "Front Desk rejected the prompt as unintelligible.")
-                await job.output_queue.put("I couldn't understand your request. Could you please clarify or provide more details?")
-                await job.output_queue.put("[DONE]")
-                continue
-            
-            if job.domain == "cloud":
-                logging.info("Routing job to OpenRouter Cloud API")
-                await stream_system_feedback(job, "Routing directly to OpenRouter Cloud API...")
-                cloud_resp = await openrouter_cloud_escalation(1, job.prompt)
-                await job.output_queue.put(cloud_resp)
-                await job.output_queue.put("[DONE]")
-                continue
-            
-            # Route simple chat tasks (no tools) to Chatter model
-            if job.complexity == "low" and job.domain == "general" and not job.tools and not job.force_domain:
-                try:
-                    logging.info("Routing to Chatter model (simple chat task, no tools)")
-                    await stream_system_feedback(job, "Executing via Chatter model (GPU-accelerated chat)")
-                    active_service = "chatter"
-                    chatter_svc, chatter_port = get_service_info(active_service)
-                    await asyncio.to_thread(hub_warden.arm_gpu_for_inference, chatter_svc, chatter_port)
-                    if not await wait_for_port_readiness(chatter_port): 
-                        logging.warning("Chatter model not ready, falling back to Lifeboat")
-                        raise Exception("Chatter unavailable")
-                    res = await call_model_chat(chatter_port, [{"role": "system", "content": load_role_prompt(active_service)}] + job.messages, profile="analytical")
-                    await job.output_queue.put(res)
-                    await job.output_queue.put("[DONE]")
-                    continue
-                except Exception as e:
-                    logging.warning(f"Chatter model failed: {e}, falling back to Lifeboat")
-                    await stream_system_feedback(job, "Chatter unavailable. Routing to Lifeboat backup...")
-                    active_service = "lifeboat"
-                    _, fallback_port = get_service_info(active_service)
-                    res = await call_model_chat(fallback_port, [{"role": "system", "content": load_role_prompt(active_service)}] + job.messages, profile="analytical")
-                    await job.output_queue.put(res)
-                    await job.output_queue.put("[DONE]")
-                    continue
-            
-            # Low complexity with tools or when chatter unavailable - route to worker or lifeboat
-            if job.complexity == "low" and job.domain == "general" and not job.force_domain:
-                if STATE["active_heavy_model"] is not None:
-                    logging.info("Routing to Lifeboat (GPU busy, low complexity general query)")
-                    await stream_system_feedback(job, "GPU is busy. Routing basic query to RAM-resident Lifeboat...")
-                    active_service = "lifeboat"
-                    _, fallback_port = get_service_info(active_service)
-                    res = await call_model_chat(fallback_port, [{"role": "system", "content": load_role_prompt(active_service)}] + job.messages, profile="analytical")
-                    await job.output_queue.put(res)
-                    await job.output_queue.put("[DONE]")
-                    continue
-                else:
-                    logging.info("Routing to Worker (GPU available, low complexity general query)")
-                    await stream_system_feedback(job, "Executing via Fast Lane (Worker)...")
-                    active_service = "worker"
-                    worker_svc, worker_port = get_service_info(active_service)
-                    await asyncio.to_thread(hub_warden.arm_gpu_for_inference, worker_svc, worker_port)
-                    if not await wait_for_port_readiness(worker_port): await stream_system_feedback(job, "Warning: Worker model delayed.")
-                    res = await call_model_chat(worker_port, [{"role": "system", "content": load_role_prompt(active_service)}] + job.messages, profile="analytical")
-                    await job.output_queue.put(res)
-                    await job.output_queue.put("[DONE]")
-                    continue
-            
-            if not job.force_domain:
-                await stream_system_feedback(job, "Consulting Reasoning AI for architectural review...")
-                _, r_port = get_service_info("reasoning")
-                reasoning_prompt = f"[System: Check Front Desk domain '{job.domain}'. Output exactly: DOMAIN:<domain_name> PLAN:<plan>.]\nTask: {job.prompt}"
-                reasoning_decision = await call_model(r_port, reasoning_prompt, profile="deterministic")
-                
-                domain_match = re.search(r'DOMAIN:\s*([a-zA-Z_]+)', reasoning_decision)
-                if domain_match: 
-                    new_domain = domain_match.group(1).lower().strip()
-                    if new_domain != job.domain:
-                        logging.info(f"Reasoning override: {job.domain} -> {new_domain}")
-                        await stream_system_feedback(job, f"Reasoning override: Domain shifted from {job.domain.capitalize()} to {new_domain.capitalize()}.")
-                    job.domain = new_domain
-                    
-                plan_match = re.search(r'PLAN:\s*(.*)', reasoning_decision, re.DOTALL)
-                if plan_match: job.messages.append({"role": "system", "content": f"Execution Plan: {plan_match.group(1).strip()}"})
-
-            if job.domain in ["creative", "coder", "professional", "scholar", "architect"]:
-                logging.info(f"Routing to heavy model: {job.domain}")
-                target_service, target_port = get_service_info(job.domain)
-                cache_filename = f"{job.project}_{job.domain}.bin"
-                if STATE["active_heavy_model"] != target_service: 
-                    await stream_system_feedback(job, f"Hot-swapping VRAM to boot {job.domain.capitalize()} model...")
-                    if STATE["active_heavy_model"]:
-                        await stream_system_feedback(job, f"Stopping current model ({STATE['active_heavy_model']}) and loading {target_service}...")
-                    else:
-                        await stream_system_feedback(job, f"Loading {target_service}...")
-                
-                await manage_heavy_model(target_service)
-                await stream_system_feedback(job, f"Model loaded. Restoring cache for {job.project}...")
-                await manage_slot_cache(target_port, "restore", cache_filename)
-                await stream_system_feedback(job, f"Cache restored. Generating response...")
-                
-                _, r_port = get_service_info("reasoning")
-                generated_text, warnings = await stream_and_ingest_with_checkpoint(job, target_port, r_port)
-                
-                await stream_system_feedback(job, f"Saving cache for future use...")
-                await manage_slot_cache(target_port, "save", cache_filename)
-            else: 
-                logging.info(f"Routing to Worker for domain: {job.domain}")
-                try:
-                    _, worker_port = get_service_info("worker")
-                    generated_text = await call_model_chat(worker_port, [{"role": "system", "content": load_role_prompt(job.domain)}] + job.messages, profile="analytical")
-                    await job.output_queue.put(generated_text)
-                    await job.output_queue.put("[DONE]")
-                except Exception as e:
-                    logging.warning(f"Worker model failed: {e}, falling back to Lifeboat")
-                    await stream_system_feedback(job, "Worker unavailable. Routing to Lifeboat backup...")
-                    active_service = "lifeboat"
-                    _, fallback_port = get_service_info(active_service)
-                    generated_text = await call_model_chat(fallback_port, [{"role": "system", "content": load_role_prompt(active_service)}] + job.messages, profile="analytical")
-                    await job.output_queue.put(generated_text)
-                    await job.output_queue.put("[DONE]")
-                
-            if job.priority == 3:
-                snippet = generated_text[:100].replace('\n', ' ') + "..." if 'generated_text' in locals() else "Check output for details."
-                msg_body = f"Domain: {job.domain.capitalize()}\nProject: {job.project}\n\nSnippet: {snippet}"
-                logging.info(f"Background task completed - Domain: {job.domain}, Project: {job.project}")
-                await asyncio.gather(
-                    send_telegram_alert("✅ AI Proxy: Background Task Complete", msg_body),
-                    send_bash_notification("✅ AI Proxy: Background Task Complete", msg_body)
-                )
-                
-        except ValueError:
-            job.fatal_errors += 1
-            logging.error(f"ValueError in job processing (fatal error #{job.fatal_errors})")
-            if job.fatal_errors >= 3: 
-                if job.local_only:
-                    await stream_system_feedback(job, "Task failed 3 times. Local-only flag active. Cloud escalation forbidden.")
-                    await job.output_queue.put("[FATAL LOCAL ERROR: Reasoning rejected output 3 times. Escalation denied.]")
-                else:
-                    logging.warning("Escalating to cloud after 3 fatal errors")
-                    await stream_system_feedback(job, "Reasoning rejected output 3 times. Escalating...")
-                    cloud_resp = await openrouter_cloud_escalation(3, job.prompt)
-                    await job.output_queue.put(cloud_resp)
-                await job.output_queue.put("[DONE]")
-            else: 
-                logging.info(f"Re-queuing job after fatal error #{job.fatal_errors}")
-                await job_queue.put(job) 
-        except InterruptedError:
-            logging.info("Job interrupted, re-queuing with recovery state")
-            with open(RECOVERY_FILE, "r") as f: job.prompt += "\n" + json.load(f)["recovery_state"] 
-            await job_queue.put(job)
-        except RuntimeError: 
-            logging.info("Runtime error in job processing, re-queuing")
-            await job_queue.put(job)
-        finally:
-            logging.info(f"Job completed - Domain: {job.domain}, Priority: {job.priority}")
-            STATE["active_priority"] = 99
-            job_queue.task_done()
-            if job_queue.empty():
-                logging.info("Queue empty, cooling down GPU")
-                set_predictive_cooling(30000) 
-                if STATE["active_heavy_model"]: await asyncio.create_subprocess_exec( "systemctl", "stop", STATE["active_heavy_model"])
-                worker_svc, _ = get_service_info("worker")
-                await asyncio.create_subprocess_exec( "systemctl", "start", worker_svc)
-                STATE["active_heavy_model"] = None
-
-async def zram_keepalive_worker():
-    """Pings core models to prevent Linux swap-out."""
-    core_domains = ["frontdesk", "reasoning", "chatter", "worker"]
-    while True:
-        await asyncio.sleep(240) 
-        async with httpx.AsyncClient() as client:
-            for domain in core_domains:
-                _, port = get_service_info(domain)
-                try: await client.post(f"http://127.0.0.1:{port}/completion", json={"prompt": "[SYSTEM_KEEPALIVE]", "max_tokens": 0, "cache_prompt": False, "thinking_budget_tokens": 0}, timeout=2)
-                except: pass
-
-async def temperature_monitor_worker():
-    """Discrete Core vs VRAM thermal watchdog."""
-    critical_counters = {key: 0 for key in THERMAL_LIMITS.keys()}
-    last_warning_time = 0
-    while True:
-        await asyncio.sleep(2) 
-        try:
-            proc = await asyncio.create_subprocess_exec("sensors", "-j", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=1.0)
-            data = json.loads(stdout.decode())
-        except: continue 
-
-        max_temps = {}
-        for adapt, sensors in data.items():
-            adapt_lower = adapt.lower()
-            target_key = None
-            if "k10temp" in adapt_lower: target_key = "k10temp"
-            elif "spd5118" in adapt_lower: target_key = "spd5118"
-            elif "nvme" in adapt_lower: target_key = "nvme"
-            
-            if "amdgpu" in adapt_lower:
-                for group, reads in sensors.items():
-                    for name, val in reads.items():
-                        if "input" in name and isinstance(val, (int, float)):
-                            if "mem" in group.lower() or "vram" in group.lower():
-                                max_temps["amdgpu_vram"] = max(max_temps.get("amdgpu_vram", 0), val)
-                            else:
-                                max_temps["amdgpu_core"] = max(max_temps.get("amdgpu_core", 0), val)
-                continue 
-
-            if target_key:
-                for group, reads in sensors.items():
-                    for name, val in reads.items():
-                        if "input" in name and isinstance(val, (int, float)):
-                            max_temps[target_key] = max(max_temps.get(target_key, 0), val)
-
-        sys_crit, warnings = False, []
-        for key, temp in max_temps.items():
-            lim = THERMAL_LIMITS.get(key)
-            if not lim: continue
-            
-            if temp >= lim["max"]:
-                sys_crit = True
-                warnings.append(f"ABSOLUTE MAX: {lim['name']} at {temp}°C!")
-                break
-            elif temp >= lim["crit"]:
-                critical_counters[key] += 1
-                if critical_counters[key] >= 2:
-                    sys_crit = True
-                    warnings.append(f"SUSTAINED CRIT: {lim['name']} at {temp}°C!")
-            else:
-                critical_counters[key] = 0
-                if temp >= lim["warn"]: warnings.append(f"Warn: {lim['name']} {temp}°C.")
-
-        if warnings and not sys_crit and (time.time() - last_warning_time > 60):
-            alert_text = "\n".join(warnings)
-            await send_wayland_notification("Thermal Warning", alert_text)
-            await asyncio.gather(
-                send_telegram_alert("🔥 AI Proxy: Thermal Warning", alert_text),
-                send_bash_notification("🔥 AI Proxy: Thermal Warning", alert_text)
-            )
-            last_warning_time = time.time()
-
-        worker_svc, _ = get_service_info("worker")
-        if sys_crit and not thermal_halt_event.is_set():
-            await send_wayland_notification("THERMAL HALT", "Max temp reached. Pausing inference queue.")
-            halt_msg = "Max temp reached. Inference paused to protect GPU."
-            await asyncio.gather(
-                send_telegram_alert("🚨 AI Proxy: THERMAL HALT", halt_msg),
-                send_bash_notification("🚨 AI Proxy: THERMAL HALT", halt_msg)
-            )
-            thermal_halt_event.set() 
-            if STATE["active_heavy_model"]: await asyncio.create_subprocess_exec( "systemctl", "stop", STATE["active_heavy_model"])
-            await asyncio.create_subprocess_exec( "systemctl", "stop", worker_svc)
-            STATE["active_heavy_model"] = None
-        elif not sys_crit and thermal_halt_event.is_set():
-            await send_wayland_notification("Recovery", "Temperatures normalized. Resuming.")
-            thermal_halt_event.clear()
-            await asyncio.create_subprocess_exec( "systemctl", "start", worker_svc)
+# ---------------------------------------------------------------------------
+# Lifespan: initialise and tear down all components
+# ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if os.path.exists(PERSISTENT_QUEUE_FILE):
-        with open(PERSISTENT_QUEUE_FILE, "r") as f:
-            for line in f:
-                try:
-                    data = json.loads(line)
-                    job = JobItem(data["priority"], data["prompt"], data["messages"], data["domain"], data["complexity"], data["project"], data["file_paths"], local_only=data.get("local_only", False))
-                    job_queue.put_nowait(job)
-                except: pass
-        open(PERSISTENT_QUEUE_FILE, 'w').close()
-        
-    worker_svc, _ = get_service_info("worker")
-    if not os.path.exists(ENV_NGL_FILE): await calculate_dynamic_ngl(worker_svc, hub_warden)
-    
-    set_predictive_cooling(30000)
-    
-    task_queue = asyncio.create_task(queue_worker())
-    task_zram = asyncio.create_task(zram_keepalive_worker())
-    task_temp = asyncio.create_task(temperature_monitor_worker())
-    yield 
-    
-    task_queue.cancel()
-    task_zram.cancel()
-    task_temp.cancel()
+    """
+    FastAPI lifespan context manager.
 
-app = FastAPI(title="Local AI Multi-Agent Proxy", lifespan=lifespan)
+    On startup:
+    1. Initialise Database (WAL mode, migrations, sqlite-vec)
+    2. Initialise SystemdController
+    3. Initialise CoolingStateMachine, write BASELINE
+    4. Initialise HardwareGovernor
+    5. Initialise ShadowAuditor
+    6. Spawn background tasks (thermal monitor, queue worker, ZRAM keepalive)
+    7. Restore pending jobs from database
 
-@app.get("/v1/system/transition-check")
-async def transition_check(duration: int = 10):
-    """API for OS transitions and gaming mode. Accepts ?duration=X (seconds)."""
-    success, message = await execute_queue_pause(duration)
-    if not success:
-        return JSONResponse(status_code=423, content={"status": "busy", "message": message})
-    return JSONResponse(status_code=200, content={"status": "ready", "pause_duration": duration})
+    On shutdown:
+    1. Cancel background tasks
+    2. Stop auditor
+    3. Write BASELINE cooling
+    4. Close database
+    """
+    state: AppState = app.state  # type: ignore[attr-defined]
+    logger.info("Kinver Hybrid API Gateway starting (uvloop=%s)", uvloop is not None)
 
-@app.get("/v1/system/queue/resume")
-async def resume_queue():
-    """Manual override to unpause the queue if a gaming session ends early."""
-    message = execute_queue_resume()
-    return JSONResponse(status_code=200, content={"status": "resumed", "message": message})
+    # ---- 1. Database -------------------------------------------------------
+    db = Database(DB_PATH)
+    await db.initialize()
+    state.database = db
 
-@app.get("/v1/models")
-async def list_models():
-    models = scan_systemd_for_models()
-    models.insert(0, {"id": "auto", "object": "model", "owned_by": "proxy-orchestrator", "port": 0})
-    return JSONResponse(content={"object": "list", "data": models})
+    # ---- 2. Systemd Controller ---------------------------------------------
+    systemd = SystemdController()
+    state.systemd = systemd
 
-@app.post("/v1/chat/completions")
-async def chat_completions(request: Request):
-    caller_type = discriminate_caller(request)
-    body = await request.json()
-    requested_model = body.get("model", "auto").lower()
-    messages = body.get("messages", [])
-    extracted_tools = body.get("tools", None)
-    processed_messages = []
-    
-    logging.info(f"Chat request received - Caller: {caller_type}, Model: {requested_model}, Messages: {len(messages)}, Tools: {extracted_tools is not None}")
-    
-    if caller_type == "IDE":
-        extracted_tools = None 
-        processed_messages = messages 
-        
-    elif caller_type == "AGENTIC":
-        raw_text_dump = " ".join([m.get("content", "") for m in messages if isinstance(m.get("content"), str)]).lower()
-        is_dream_process = "soul.md" in raw_text_dump and "memory.md" in raw_text_dump and "user.md" in raw_text_dump
-        # Strip "llama-" prefix if present to match domain names
-        model_domain = requested_model.replace("llama-", "") if requested_model.startswith("llama-") else requested_model
-        effective_domain = model_domain if model_domain in ["coder", "architect", "reasoning", "professional", "creative", "scholar"] else "standard"
-        logging.info(f"AGENTIC request - Effective domain: {effective_domain}, Dream process: {is_dream_process}")
+    # ---- 3. Cooling State Machine ------------------------------------------
+    cooler = CoolingStateMachine()
+    state.cooler = cooler
+    cooler.baseline_idle()  # Silent idle at startup
 
-        for m in messages:
-            if m.get("role") == "system":
-                if is_dream_process or effective_domain == "standard":
-                    processed_messages.append(m)
-                else:
-                    sanitized = re.sub(r'(?i)#\s*(SOUL|AGENTS).*?(?=\n#|$)', '', m.get("content", ""), flags=re.DOTALL)
-                    if sanitized.strip(): processed_messages.append({"role": "system", "content": sanitized.strip()})
-            else:
-                processed_messages.append(m)
-                
-        is_looping, loop_reason = detect_tool_loops(processed_messages, domain=effective_domain)
-        
-        if is_looping:
-            logging.warning(f"Tool loop detected - Reason: {loop_reason}")
-            loop_override = f"\n\n[PROXY OVERRIDE: Tool access temporarily revoked ({loop_reason}). Synthesize a final response immediately.]"
-            processed_messages.append({"role": "system", "content": loop_override})
-            extracted_tools = None 
-            
-        elif extracted_tools:
-            logging.info(f"Processing {len(extracted_tools)} tools for AGENTIC request")
-            for native_tool in NATIVE_TOOLS:
-                native_name = native_tool["function"]["name"]
-                extracted_tools = [t for t in extracted_tools if t.get("function", {}).get("name") not in [native_name, "search"]]
-                extracted_tools.append(native_tool)
-            processed_messages.append({"role": "system", "content": "\n\n[PROXY SYSTEM OVERRIDE: Issue ALL required tool calls simultaneously in a single parallel JSON array. Use the exact function name as defined in the tools schema. Assign a unique id to each tool call]"})
+    # ---- 4. Hardware Governor ----------------------------------------------
+    hw = HardwareGovernor()
+    state.hardware = hw
 
-    # Extract only the latest user message for triage
-    latest_user_message = ""
-    for m in reversed(processed_messages):
-        if m.get("role") == "user":
-            content = m.get("content", "")
-            # Handle case where content is a list (e.g., multimodal messages)
-            if isinstance(content, list):
-                # Extract text content from list
-                text_parts = [item.get("text", "") if isinstance(item, dict) else str(item) for item in content]
-                latest_user_message = " ".join(text_parts)
-            else:
-                latest_user_message = content
-            break
+    # ---- 5. Shadow Auditor -------------------------------------------------
+    auditor = ShadowAuditor(
+        database=db,
+        systemd=systemd,
+        hardware_governor=hw,
+    )
+    state.auditor = auditor
 
-    raw_prompt_for_triage = latest_user_message
-    
-    # 1. Intercept /pause [minutes]
-    pause_match = re.search(r'(?i)^\s*/pause(?:\s+(\d+))?\s*$', raw_prompt_for_triage)
-    if pause_match:
-        duration_mins = int(pause_match.group(1)) if pause_match.group(1) else 60
-        
-        async def concurrent_pause_stream():
-            yield f"data: {json.dumps({'id': f'sys-{int(time.time())}', 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {'content': f'_⏸️ [Proxy: Attempting to pause queue for {duration_mins} minutes...]_\n\n'}}]})}\n\n"
-            
-            success, msg = await execute_queue_pause(duration_mins * 60)
-            if not success:
-                yield f"data: {json.dumps({'id': f'sys-{int(time.time())}', 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {'content': f'⚠️ **Failed:** {msg}'}}]})}\n\n"
-            else:
-                yield f"data: {json.dumps({'id': f'sys-{int(time.time())}', 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {'content': f'✅ **Success:** Queue paused.'}}]})}\n\n"
-            yield "data: [DONE]\n\n"
-            
-        return StreamingResponse(concurrent_pause_stream(), media_type="text/event-stream")
+    # ---- 6. Background tasks -----------------------------------------------
+    # Thermal monitor (reads sensors, enforces shutdown thresholds)
+    thermal_task = asyncio.create_task(
+        thermal_monitor_task(thermal_state, SENSOR_INTERVAL),
+    )
 
-    # 2. Intercept /resume
-    if re.search(r'(?i)^\s*/resume\s*$', raw_prompt_for_triage):
-        async def concurrent_resume_stream():
-            execute_queue_resume()
-            yield f"data: {json.dumps({'id': f'sys-{int(time.time())}', 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {'content': '_▶️ [Proxy: Queue resumed manually.]_\n\n'}}]})}\n\n"
-            yield "data: [DONE]\n\n"
-            
-        return StreamingResponse(concurrent_resume_stream(), media_type="text/event-stream")
+    # Queue worker (processes enqueued jobs from the database)
+    queue_task = asyncio.create_task(queue_worker(state))
 
-    # 3. Intercept /cloud
-    if "/cloud" in raw_prompt_for_triage.lower():
-        async def concurrent_cloud_stream():
-            status = {"id": f"chatcmpl-{int(time.time())}", "object": "chat.completion.chunk", "created": int(time.time()), "model": "cloud", "choices": [{"index": 0, "delta": {"content": "_⏳ [Proxy: Routing concurrently to OpenRouter...]_\n\n"}, "finish_reason": None}]}
-            yield f"data: {json.dumps(status)}\n\n"
-            cloud_resp = await openrouter_cloud_escalation(1, raw_prompt_for_triage)
-            chunk = {"id": f"chatcmpl-{int(time.time())}", "object": "chat.completion.chunk", "created": int(time.time()), "model": "cloud", "choices": [{"index": 0, "delta": {"content": cloud_resp}, "finish_reason": None}]}
-            yield f"data: {json.dumps(chunk)}\n\n"
-            yield "data: [DONE]\n\n"
-        return StreamingResponse(concurrent_cloud_stream(), media_type="text/event-stream")
-        
-    elif caller_type == "AGENTIC" and "is_dream_process" in locals() and is_dream_process:
-        job = JobItem(3, raw_prompt_for_triage, processed_messages, "scholar", "high", "default", [], tools=extracted_tools)
-        await job_queue.put(job)
-        
-    elif requested_model in ["coder", "architect", "reasoning", "professional", "creative", "scholar"] or caller_type == "IDE":
-        force_domain = requested_model if requested_model != "auto" else "coder"
-        ctx = extract_project_context(raw_prompt_for_triage)
-        job = JobItem(2, raw_prompt_for_triage, processed_messages, force_domain, "high", ctx["project"], ctx["file_paths"], force_domain, tools=extracted_tools)
-        if "is_looping" in locals() and is_looping: job.output_queue.put_nowait(f"_⏳ [Proxy: Tool Access Limited - {loop_reason}]_\n\n")
-        await job_queue.put(job)
-        if 2 < STATE["active_priority"]: preempt_event.set()
-        
-    else:
-        job = await submit_job(raw_prompt_for_triage, processed_messages)
-        job.tools = extracted_tools 
-        if "is_looping" in locals() and is_looping: job.output_queue.put_nowait(f"_⏳ [Proxy: Tool Access Limited - {loop_reason}]_\n\n")
+    # ZRAM keepalive (pings core models to prevent Linux swap-out)
+    zram_task = asyncio.create_task(zram_keepalive_worker(state))
 
-    async def event_stream():
-        while True:
-            chunk = await job.output_queue.get()
-            if chunk == "[DONE]":
-                yield "data: [DONE]\n\n"
-                break
-                
-            if isinstance(chunk, dict) and "frontend_tool_calls" in chunk:
-                openai_chunk = {
-                    "id": f"chatcmpl-{int(time.time())}", 
-                    "object": "chat.completion.chunk", 
-                    "created": int(time.time()), 
-                    "model": requested_model, 
-                    "choices": [{"index": 0, "delta": {"tool_calls": chunk["frontend_tool_calls"]}, "finish_reason": "tool_calls"}]
-                }
-                yield f"data: {json.dumps(openai_chunk)}\n\n"
+    # ---- 7. Restore pending jobs from database -----------------------------
+    await _restore_pending_jobs(state)
+
+    logger.info("Kinver Hybrid API Gateway ready on port 13000")
+
+    try:
+        yield
+    finally:
+        logger.info("Shutting down Kinver Hybrid API Gateway...")
+
+        # Cancel background tasks
+        for task in (thermal_task, queue_task, zram_task):
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        # Stop auditor
+        auditor.stop()
+
+        # Baseline cooling
+        cooler.baseline_idle()
+
+        # Close database
+        await db.close()
+
+        logger.info("Kinver Hybrid API Gateway shutdown complete")
+
+
+# ---------------------------------------------------------------------------
+# Queue worker — processes jobs from the database
+# ---------------------------------------------------------------------------
+
+async def queue_worker(state: AppState) -> None:
+    """
+    Main lifecycle orchestrator that processes priority-ordered jobs
+    from the SQLite database.
+
+    Runs forever until cancelled.  Respects:
+    - thermal_halt: pauses when hardware is critically hot
+    - transition_pause: pauses for OS transitions / gaming mode
+    """
+    logger.info("Queue worker started")
+
+    while True:
+        # ---- Respect pause events -------------------------------------------
+        if state.thermal_halt.is_set():
+            logger.info("Queue paused due to thermal halt")
+            await asyncio.sleep(2)
+            continue
+
+        if state.transition_pause.is_set():
+            logger.info("Queue paused due to OS transition")
+            await asyncio.sleep(2)
+            continue
+
+        # ---- Dequeue next job from database ---------------------------------
+        db = state.database
+        if db is None:
+            await asyncio.sleep(1)
+            continue
+
+        job = await db.dequeue_next(max_priority=state.active_priority)
+        if job is None:
+            # No jobs available — brief sleep before polling again
+            await asyncio.sleep(1)
+            continue
+
+        state.active_priority = job["priority"]
+        state.requests_served += 1
+
+        logger.info(
+            "Processing job %s (intent=%s priority=%d failure_count=%d)",
+            job["id"], job["intent"], job["priority"], job["failure_count"],
+        )
+
+        # ---- Process based on intent ----------------------------------------
+        try:
+            intent = job["intent"]
+            failure_count = job["failure_count"]
+            systemd = state.systemd
+
+            # ---- CHAT / TOOL intents are handled by direct streaming --------
+            # The queue worker must NOT steal these jobs from the direct
+            # SSE streaming path.  Completing them here would race with the
+            # active stream, causing double-processing, escalation to heavy
+            # models with insufficient context, and corrupted output.
+            if intent in ("CHAT", "TOOL"):
+                logger.info(
+                    "Job %s skipped by queue worker (intent=%s — handled by direct stream)",
+                    job["id"], intent,
+                )
+                # Mark as completed so it doesn't get re-dequeued endlessly
+                await db.complete_job(
+                    job["id"],
+                    finish_reason="stop",
+                    full_content="",
+                )
+                state.active_priority = 3
                 continue
-                
-            openai_chunk = {"id": f"chatcmpl-{int(time.time())}", "object": "chat.completion.chunk", "created": int(time.time()), "model": requested_model if requested_model != "auto" else "llama-worker", "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}]}
-            yield f"data: {json.dumps(openai_chunk)}\n\n"
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+            # ---- Escalation matrix: failure_count → model tier ------------
+            if failure_count == 0:
+                target_model = intent  # First attempt: use classified intent
+            elif failure_count == 1:
+                target_model = "professional"  # Second attempt: 35B MoE
+                logger.info("Job %s escalated to professional (failure_count=1)", job["id"])
+            elif failure_count == 2:
+                target_model = "coder"  # Third attempt: 27B Dense
+                logger.info("Job %s escalated to coder (failure_count=2)", job["id"])
+            else:
+                # Max local tiers exhausted → route to cloud
+                logger.info(
+                    "Job %s escalated to cloud (failure_count=%d, local exhausted)",
+                    job["id"], failure_count,
+                )
+                messages = json.loads(job["messages_json"])
+                user_text = " ".join(
+                    m["content"] for m in messages if m.get("role") == "user"
+                )
+                cloud_resp = await openrouter_cloud_escalation(failure_count, user_text)
+                await db.complete_job(
+                    job["id"],
+                    finish_reason="cloud_escalation",
+                    full_content=cloud_resp,
+                )
+                state.active_priority = 3
+                continue
+
+            # Normalize to a known model key
+            if target_model not in systemd._port_cache:
+                # Default to worker if the model is unknown
+                target_model = "worker"
+
+            # ---- Hot-swap if needed -----------------------------------------
+            current_heavy = systemd.active_heavy_model
+            needed_port = await systemd.get_port(target_model)
+
+            if current_heavy != target_model and target_model in (
+                "professional", "coder", "creative", "scholar", "architect",
+            ):
+                logger.info("Hot-swapping GPU from %s to %s", current_heavy, target_model)
+                await systemd.hot_swap(
+                    from_domain=current_heavy or "",
+                    to_domain=target_model,
+                )
+                state.active_heavy_model = target_model
+
+            # ---- This is a queued job — update DB state and stream ----------
+            # For now, queued jobs complete in the queue worker
+            # Full streaming support will come in a future iteration
+            await db.complete_job(
+                job["id"],
+                finish_reason="stop",
+                full_content=job.get("partial_content", ""),
+            )
+            logger.info("Job %s completed", job["id"])
+
+        except Exception:
+            logger.exception("Job %s failed with exception", job["id"])
+            await db.fail_job(job["id"])
+            # Re-queue for escalation
+            await db.escalate_job(job["id"], "professional")
+
+        finally:
+            state.active_priority = 3  # IDLE
+            # Clean up: unload heavy model if queue is empty.
+            # Only unload for heavy GPU models — lightweight models
+            # (worker, chatter) are handled by direct streaming and
+            # must not be disrupted by the queue worker.
+            if db:
+                pending = await db.get_pending_jobs()
+                if not pending and systemd:
+                    await systemd.unload_all_heavy()
+                    state.active_heavy_model = None
+
+
+# ---------------------------------------------------------------------------
+# ZRAM keepalive worker — pings core models to prevent swap-out
+# ---------------------------------------------------------------------------
+
+async def zram_keepalive_worker(state: AppState) -> None:
+    """
+    Periodically pings core CPU-resident models (frontdesk, reasoning,
+    chatter, lifeboat) to prevent Linux from swapping them out of RAM
+    to ZRAM.
+
+    Runs every 240 seconds (4 minutes).
+    """
+    core_domains = ["frontdesk", "reasoning", "chatter", "lifeboat"]
+    systemd = state.systemd
+
+    if systemd is None:
+        logger.warning("ZRAM keepalive: no SystemdController available")
+        return
+
+    logger.info("ZRAM keepalive worker started (domains=%s)", core_domains)
+
+    while True:
+        await asyncio.sleep(240)  # 4 minutes
+        async with httpx.AsyncClient() as client:
+            for domain in core_domains:
+                try:
+                    # Use the completions endpoint with a minimal no-op prompt
+                    # to trigger a cache access, keeping pages warm in RAM
+                    port = await systemd.get_port(domain)
+                    await client.post(
+                        f"http://127.0.0.1:{port}/completion",
+                        json={
+                            "prompt": "[SYSTEM_KEEPALIVE]",
+                            "max_tokens": 0,
+                            "cache_prompt": False,
+                            "thinking_budget_tokens": 0,
+                        },
+                        timeout=2.0,
+                    )
+                    logger.debug("ZRAM keepalive pinged %s on port %d", domain, port)
+                except Exception:
+                    logger.debug("ZRAM keepalive ping failed for %s (non-critical)", domain)
+
+
+# ---------------------------------------------------------------------------
+# Restore pending jobs from database at startup
+# ---------------------------------------------------------------------------
+
+async def _restore_pending_jobs(state: AppState) -> None:
+    """
+    At startup, scan the database for jobs that were interrupted by a
+    previous crash (state = 'queued' or 'active') and log them.
+
+    The queue worker will pick them up naturally on its next poll.
+    """
+    db = state.database
+    if db is None:
+        return
+
+    try:
+        pending = await db.get_pending_jobs()
+        if pending:
+            logger.info(
+                "Restored %d pending job(s) from previous session", len(pending),
+            )
+            for job in pending:
+                logger.debug(
+                    "  Pending job %s: intent=%s priority=%d state=%s",
+                    job["id"], job["intent"], job["priority"], job["state"],
+                )
+        else:
+            logger.info("No pending jobs to restore")
+    except Exception:
+        logger.exception("Failed to restore pending jobs (non-fatal)")
+
+
+# ---------------------------------------------------------------------------
+# FastAPI application assembly
+# ---------------------------------------------------------------------------
+
+app = FastAPI(
+    title="Kinver Hub Hybrid API Gateway",
+    description=(
+        "High-performance, stateful AI proxy with GPU-aware routing, "
+        "shadow auditing, and predictive cooling for AMD hardware."
+    ),
+    version="3.0.0",
+    lifespan=lifespan,
+)
+
+# Attach empty AppState — populated during lifespan startup
+app.state = AppState()
+
+# ---------------------------------------------------------------------------
+# Route registration
+# ---------------------------------------------------------------------------
+
+app.add_api_route("/health", health_check, methods=["GET"])
+app.add_api_route("/v1/models", list_models, methods=["GET"])
+app.add_api_route("/v1/chat/completions", chat_completions, methods=["POST"])
+app.add_api_route(
+    "/v1/system/transition-check",
+    lambda request: _transition_check(request),
+    methods=["GET"],
+)
+app.add_api_route(
+    "/v1/system/queue/resume",
+    lambda request: _resume_queue(request),
+    methods=["GET"],
+)
+
+
+# ---------------------------------------------------------------------------
+# /v1/system endpoints (inline — simple enough to keep in proxy.py)
+# ---------------------------------------------------------------------------
+
+async def _transition_check(request: Request) -> JSONResponse:
+    """
+    API for OS transitions and gaming mode.
+
+    Query params: ``?duration=X`` (seconds, default 10).
+    """
+    duration = int(request.query_params.get("duration", 10))
+    state: AppState = request.app.state
+    success, message = await state.try_pause_queue(duration)
+    if not success:
+        return JSONResponse(
+            status_code=423,
+            content={"status": "busy", "message": message},
+        )
+    return JSONResponse({
+        "status": "ready",
+        "pause_duration": duration,
+        "message": message,
+    })
+
+
+async def _resume_queue(request: Request) -> JSONResponse:
+    """
+    Manual override to unpause the queue if a gaming session ends early.
+    """
+    state: AppState = request.app.state
+    state.try_resume_queue()
+    return JSONResponse({
+        "status": "resumed",
+        "message": "Queue manually resumed.",
+    })
+
+
+# ---------------------------------------------------------------------------
+# Main entry-point: install uvloop and run via uvicorn
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    uvicorn.run("proxy:app", host="0.0.0.0", port=13000, loop="asyncio", log_config=None)
+    import uvicorn
+
+    # Install uvloop as the default event loop policy
+    # This must happen BEFORE uvicorn.run() creates the event loop
+    uvloop.install()
+    logger.info("uvloop event-loop policy installed")
+
+    uvicorn.run(
+        "proxy:app",
+        host="0.0.0.0",
+        port=13000,
+        log_level="info",
+        reload=False,
+        timeout_keep_alive=300,  # 5 minutes — matches long generation timeout
+    )

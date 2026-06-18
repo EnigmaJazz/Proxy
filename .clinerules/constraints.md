@@ -1,0 +1,2 @@
+Language & Framework: Pure asynchronous Python utilizing `uvloop` for the event loop.
+Zero Bloat: Maintain strict, decoupled logic. No external monolithic frameworks; use lightweight async HTTP libraries (e.g., FastAPI/Starlette or raw `aiohttp`).

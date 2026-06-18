@@ -76,7 +76,7 @@ class HardwareWarden:
             logging.info(f"Triage: Arming GPU for {target_service} via {backend.upper()}.")
 
             try:
-                # 1. Lock VRAM  & underclock core
+                # 1. Lock VRAM to 2150 MHz & underclock core
                 subprocess.run(["sudo", "lact", "cli", "profile", "set", "Headless_Pinned"], check=True)
                 time.sleep(0.2) 
                 self.current_state = "Pinned"

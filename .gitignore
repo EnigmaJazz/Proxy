@@ -223,3 +223,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# Local AI queue database (live state, never commit)
+ai_queue.db
+ai_queue.db-shm
+ai_queue.db-wal
+
+# Backup directories kept as "snapshots" inside the repo (defeats git history)
+backup_*/

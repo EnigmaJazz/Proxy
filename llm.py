@@ -119,6 +119,10 @@ def translate_to_deepseek_r1(messages: list[dict]) -> list[dict]:
     Preserves the original message text verbatim — only the structural
     wrapping changes.  This is required by the Glass Pipe Rule.
 
+    Glass Pipe exception — intentional: this function is the only
+    structural transformation permitted because DeepSeek R1 does not
+    support the ``system`` role; no message text is altered.
+
     Parameters
     ----------
     messages : list[dict]

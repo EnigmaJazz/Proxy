@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -159,15 +160,25 @@ class TestExceptions:
 
     async def test_R2_doc_labels_present(self, app_client: httpx.AsyncClient) -> None:
         """translate_to_deepseek_r1 carries an intentional-exception label."""
-        pass
+        repo_root = Path(__file__).parent.parent
+        routes_source = (repo_root / "routes.py").read_text()
+        llm_source = (repo_root / "llm.py").read_text()
+        assert "Glass Pipe exception" in routes_source
+        assert "Glass Pipe exception" in llm_source
 
     async def test_R8_stop_seq_doc_present(self, app_client: httpx.AsyncClient) -> None:
         """Stop-sequence filter carries an intentional-exception label."""
-        pass
+        repo_root = Path(__file__).parent.parent
+        routes_source = (repo_root / "routes.py").read_text()
+        assert "Glass Pipe exception" in routes_source
+        assert "ReAct-era stops" in routes_source or "mid-tool-call" in routes_source
 
     async def test_R9_param_overrides_doc_present(self, app_client: httpx.AsyncClient) -> None:
         """Parameter intent-default block carries an intentional-exception label."""
-        pass
+        repo_root = Path(__file__).parent.parent
+        routes_source = (repo_root / "routes.py").read_text()
+        assert "Glass Pipe exception" in routes_source
+        assert "intent defaults only fill gaps" in routes_source
 
 
 class TestHarness:

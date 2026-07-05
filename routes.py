@@ -444,7 +444,8 @@ async def chat_completions(request: Request) -> StreamingResponse:
     state.requests_served += 1
 
     # ---- Build generation parameters ---------------------------------------
-    # Glass Pipe: client-sent values win; intent defaults fill only gaps.
+    # Glass Pipe exception — intentional: intent defaults only fill gaps
+    # left by the client.  Client-sent values win for every parameter.
     thinking_budget_tokens = body.get("thinking_budget_tokens")
     parameters = {
         "temperature": temperature,
@@ -509,6 +510,8 @@ async def chat_completions(request: Request) -> StreamingResponse:
     # mid-tool-call.  The model's native chat template handles tool calls
     # natively and doesn't need these Agent-loop artifacts.  Without tools,
     # all stop sequences are preserved for clean text generation.
+    # Glass Pipe exception — intentional: removes ReAct-era stops that
+    # terminate mid-tool-call, which would corrupt native tool calling.
     effective_stops = list(STOP_SEQS)
     if tools:
         effective_stops = [

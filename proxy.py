@@ -418,10 +418,16 @@ async def queue_worker(state: AppState) -> None:
             # ---- This is a queued job — update DB state and stream ----------
             # For now, queued jobs complete in the queue worker
             # Full streaming support will come in a future iteration
+            # R16: parse the partial_content sentinel so the resume/retry path
+            # doesn't write the |||TOOL_CALLS||| JSON suffix as plain text.
+            raw_partial = job.get("partial_content", "")
+            text, carried_tool_calls = db.parse_tool_calls_from_partial(raw_partial)
+            tool_calls_json = json.dumps(carried_tool_calls) if carried_tool_calls else ""
             await db.complete_job(
                 job["id"],
                 finish_reason="stop",
-                full_content=job.get("partial_content", ""),
+                full_content=text,
+                tool_calls_json=tool_calls_json,
             )
             logger.info("Job %s completed", job["id"])
 

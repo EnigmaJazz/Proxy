@@ -967,14 +967,23 @@ async def _handle_pause_command(
             f"_⏸️ [Proxy: Attempting to pause queue for "
             f"{duration_mins} minutes...]_\n\n"
         )
-        yield f"data: {json.dumps(_make_system_chunk(pause_msg))}\n\n"
+        yield _emit_proxy_event(
+            "status",
+            {"subkind": "pause", "message": pause_msg},
+        )
 
         # Execute the pause logic via the state's transition management
         success, msg = await state.try_pause_queue(duration_mins * 60)
         if not success:
-            yield f"data: {json.dumps(_make_system_chunk(f'⚠️ **Failed:** {msg}'))}\n\n"
+            yield _emit_proxy_event(
+                "status",
+                {"subkind": "pause", "message": f"⚠️ **Failed:** {msg}"},
+            )
         else:
-            yield f"data: {json.dumps(_make_system_chunk('✅ **Success:** Queue paused.'))}\n\n"
+            yield _emit_proxy_event(
+                "status",
+                {"subkind": "pause", "message": "✅ **Success:** Queue paused."},
+            )
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(_stream(), media_type="text/event-stream")
@@ -989,7 +998,10 @@ async def _handle_resume_command(state) -> StreamingResponse:
     async def _stream():
         state.try_resume_queue()
         msg = "_▶️ [Proxy: Queue resumed manually.]_\n\n"
-        yield f"data: {json.dumps(_make_system_chunk(msg))}\n\n"
+        yield _emit_proxy_event(
+            "status",
+            {"subkind": "resume", "message": msg},
+        )
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(_stream(), media_type="text/event-stream")
@@ -1003,7 +1015,10 @@ async def _handle_cloud_command(user_text: str) -> StreamingResponse:
     """
     async def _stream():
         status_msg = "_⏳ [Proxy: Routing concurrently to OpenRouter...]_\n\n"
-        yield f"data: {json.dumps(_make_system_chunk(status_msg))}\n\n"
+        yield _emit_proxy_event(
+            "status",
+            {"subkind": "cloud", "message": status_msg},
+        )
 
         cloud_resp = await openrouter_cloud_escalation(1, user_text)
         chunk = {

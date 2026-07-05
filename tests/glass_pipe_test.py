@@ -9,7 +9,7 @@ import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -288,6 +288,32 @@ class TestStreamIntegrity:
                 delta = chunk.get("choices", [{}])[0].get("delta", {})
                 content = delta.get("content", "")
                 assert "Proxy triage" not in (content or ""), "triage leaked into delta.content"
+
+    async def test_R14_command_status_events(self, app_client: httpx.AsyncClient) -> None:
+        """Pause/resume/cloud embedded commands emit kinver.proxy.status."""
+        from routes import _handle_pause_command
+
+        mock_state = MagicMock()
+        mock_state.try_pause_queue = AsyncMock(return_value=(True, ""))
+        response = await _handle_pause_command(5, mock_state)
+        body = "".join([chunk async for chunk in response.body_iterator]).encode("utf-8")
+        lines = _parse_sse_lines(body)
+        events = _extract_event_lines(lines)
+        pause_events = [
+            e for e in events
+            if e.get("kind") == "status" and e.get("data", {}).get("subkind") == "pause"
+        ]
+        assert pause_events, "pause status event not found"
+        # No synthetic content chunk should carry the pause text.
+        for line in lines:
+            if line.startswith("data: {"):
+                try:
+                    chunk = json.loads(line[len("data: "):])
+                except json.JSONDecodeError:
+                    continue
+                delta = chunk.get("choices", [{}])[0].get("delta", {})
+                content = delta.get("content", "")
+                assert "Queue paused" not in (content or ""), "pause text leaked into delta.content"
 
 
 class TestHarness:

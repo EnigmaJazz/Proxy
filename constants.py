@@ -244,6 +244,22 @@ STOP_SEQS: list[str] = [
     "```output",
 ]
 
+# OpenAI chat-completion fields the proxy forwards as-is when the client sends them.
+# No validation, no transformation — the Glass Pipe Rule applies.
+OPENAI_FORWARD_FIELDS: tuple[str, ...] = (
+    "tool_choice",
+    "parallel_tool_calls",
+    "frequency_penalty",
+    "presence_penalty",
+    "logit_bias",
+    "seed",
+    "user",
+    "response_format",
+    "top_logprobs",
+    "n",
+    "logprobs",
+)
+
 # Retry / timeout settings for LLM HTTP calls
 MAX_RETRIES: int = 3
 # Retry delay bumped from 2.0 to 5.0 seconds to give heavy GPU models

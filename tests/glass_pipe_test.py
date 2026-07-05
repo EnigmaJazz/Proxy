@@ -114,7 +114,44 @@ class TestPassthrough:
 
     async def test_R11_full_openai_field_set(self, app_client: httpx.AsyncClient) -> None:
         """Optional OpenAI fields are forwarded when client sends them."""
-        pass
+        captured: list[dict] = []
+
+        async def _fake_stream(*, payload: dict, **kwargs):
+            captured.append(payload)
+            if False:
+                yield {}
+
+        classification = {
+            "is_valid": True,
+            "intent": "CODE",
+            "priority": 1,
+            "complexity": "low",
+            "project_name": "general",
+            "is_factual": False,
+            "tools_required": False,
+        }
+        body = {
+            "messages": [{"role": "user", "content": "hello"}],
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
+            "seed": 42,
+            "response_format": {"type": "json_object"},
+        }
+        with patch("routes.stream_llm", side_effect=_fake_stream):
+            with patch("routes.classify_with_frontdesk", new=AsyncMock(return_value=classification)):
+                response = await app_client.post(
+                    "/v1/chat/completions",
+                    json=body,
+                    headers={"Authorization": "Bearer agent-key"},
+                )
+        assert response.status_code == 200
+        assert captured, "stream_llm was not called"
+        payload = captured[0]
+        assert payload["tool_choice"] == "auto"
+        assert payload["parallel_tool_calls"] is True
+        assert payload["seed"] == 42
+        assert payload["response_format"] == {"type": "json_object"}
+        assert "frequency_penalty" not in payload
 
 
 class TestExceptions:

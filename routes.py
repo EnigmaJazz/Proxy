@@ -31,6 +31,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from constants import (
     IDE_PASSTHROUGH_HEADER,
     STOP_SEQS,
+    OPENAI_FORWARD_FIELDS,
     NATIVE_TOOLS,
     CoolingPreset,
     get_logger,
@@ -525,6 +526,10 @@ async def chat_completions(request: Request) -> StreamingResponse:
     }
     if "thinking_budget_tokens" in parameters:
         payload["thinking_budget_tokens"] = parameters["thinking_budget_tokens"]
+    # Glass Pipe: forward every OpenAI field the client sent, unchanged.
+    for field in OPENAI_FORWARD_FIELDS:
+        if field in body and body[field] is not None:
+            payload[field] = body[field]
     if tools:
         payload["tools"] = tools
 

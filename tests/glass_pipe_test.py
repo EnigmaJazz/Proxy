@@ -181,6 +181,34 @@ class TestExceptions:
         assert "intent defaults only fill gaps" in routes_source
 
 
+class TestStreamIntegrity:
+    """R3, R4, R5, R6, R14 — SSE stream integrity and proxy events."""
+
+    async def test_R3_lane_b_tools_passthrough(self, app_client: httpx.AsyncClient) -> None:
+        """Lane B/IDE callers forward client tools unchanged."""
+        captured: list[dict] = []
+
+        async def _fake_stream(*, payload: dict, **kwargs):
+            captured.append(payload)
+            if False:
+                yield {}
+
+        tools = [{"type": "function", "function": {"name": "read_file"}}]
+        body = {
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": tools,
+        }
+        with patch("routes.stream_llm", side_effect=_fake_stream):
+            response = await app_client.post(
+                "/v1/chat/completions",
+                json=body,
+                headers={"sk-ide-pass": "sk-ide-pass"},
+            )
+        assert response.status_code == 200
+        assert captured, "stream_llm was not called"
+        assert captured[0].get("tools") == tools
+
+
 class TestHarness:
     """R10 — the test harness itself is sane."""
 

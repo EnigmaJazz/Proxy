@@ -170,27 +170,26 @@ async def chat_completions(request: Request) -> StreamingResponse:
     # ---- Prepare messages (Glass Pipe Rule: NO text alteration) ------------
     processed_messages: list = list(messages)  # Shallow copy
 
-    # ---- Lane B (IDE passthrough): strip tools, bypass frontdesk -----------
+    # Dream detection via Nanobot template phrases (see routing.py).
+    # Template phrases like "extract new facts from conversation history"
+    # only appear in Nanobot's autonomous dream tasks — they do NOT
+    # appear in regular chat, making them a reliable fingerprint.
+    raw_text = " ".join(
+        m.get("content", "") for m in processed_messages
+        if isinstance(m.get("content"), str)
+    ).lower()
+    is_dream = is_dream_process(raw_text)
+
+    # ---- Lane B (IDE passthrough): forward client tools, bypass frontdesk --
     if caller_type == "IDE" or lane_b:
-        tools = None  # IDE gets no tool injection
-        # Messages pass through unchanged
-        logger.info("Lane B (IDE passthrough) — bypassing frontdesk")
+        # Messages pass through unchanged; client tools forwarded verbatim.
+        logger.info("Lane B (IDE passthrough) — forwarding client tools")
     elif caller_type == "AGENTIC":
         # ---- AGENTIC: handle tool loops and inject native tools -------------
         # Strip "llama-" prefix if present for domain matching
         model_domain = requested_model
         if model_domain.startswith("llama-"):
             model_domain = model_domain.replace("llama-", "")
-
-        # Dream detection via Nanobot template phrases (see routing.py).
-        # Template phrases like "extract new facts from conversation history"
-        # only appear in Nanobot's autonomous dream tasks — they do NOT
-        # appear in regular chat, making them a reliable fingerprint.
-        raw_text = " ".join(
-            m.get("content", "") for m in processed_messages
-            if isinstance(m.get("content"), str)
-        ).lower()
-        is_dream = is_dream_process(raw_text)
 
         effective_domain = model_domain if model_domain in (
             "coder", "architect", "reasoning", "professional", "creative", "scholar",
@@ -253,7 +252,7 @@ async def chat_completions(request: Request) -> StreamingResponse:
         return await _handle_cloud_command(user_text)
 
     # ---- Dream/soul fast-path: bypass frontdesk, route to architect --------
-    if is_dream:
+    if is_dream and caller_type == "AGENTIC":
         logger.info("Dream/soul process detected — routing to architect (priority 3)")
         port = await systemd.get_port("architect")
         route = RouteDecision(

@@ -666,7 +666,7 @@ async def _event_stream(
     triage_msg = _build_triage_message(route)
     yield _emit_proxy_event(
         "status",
-        {"subkind": "triage", "message": triage_msg},
+        {"kind": "triage", "message": triage_msg},
     )
 
     try:
@@ -818,7 +818,7 @@ async def _event_stream_with_model_startup(
             )
             yield _emit_proxy_event(
                 "status",
-                {"subkind": "loading", "message": loading_msg},
+                {"kind": "loading", "message": loading_msg},
             )
 
             try:
@@ -888,7 +888,7 @@ async def _event_stream_with_model_startup(
                     )
                     yield _emit_proxy_event(
                         "status",
-                        {"subkind": "cache_restore", "message": cache_msg},
+                        {"kind": "cache_restore", "message": cache_msg},
                     )
                 except Exception:
                     logger.debug(
@@ -986,7 +986,7 @@ async def _handle_pause_command(
         )
         yield _emit_proxy_event(
             "status",
-            {"subkind": "pause", "message": pause_msg},
+            {"kind": "pause", "message": pause_msg},
         )
 
         # Execute the pause logic via the state's transition management
@@ -994,12 +994,12 @@ async def _handle_pause_command(
         if not success:
             yield _emit_proxy_event(
                 "status",
-                {"subkind": "pause", "message": f"⚠️ **Failed:** {msg}"},
+                {"kind": "pause", "message": f"⚠️ **Failed:** {msg}"},
             )
         else:
             yield _emit_proxy_event(
                 "status",
-                {"subkind": "pause", "message": "✅ **Success:** Queue paused."},
+                {"kind": "pause", "message": "✅ **Success:** Queue paused."},
             )
         yield "data: [DONE]\n\n"
 
@@ -1017,7 +1017,7 @@ async def _handle_resume_command(state) -> StreamingResponse:
         msg = "_▶️ [Proxy: Queue resumed manually.]_\n\n"
         yield _emit_proxy_event(
             "status",
-            {"subkind": "resume", "message": msg},
+            {"kind": "resume", "message": msg},
         )
         yield "data: [DONE]\n\n"
 
@@ -1034,7 +1034,7 @@ async def _handle_cloud_command(user_text: str) -> StreamingResponse:
         status_msg = "_⏳ [Proxy: Routing concurrently to OpenRouter...]_\n\n"
         yield _emit_proxy_event(
             "status",
-            {"subkind": "cloud", "message": status_msg},
+            {"kind": "cloud", "message": status_msg},
         )
 
         cloud_resp = await openrouter_cloud_escalation(1, user_text)

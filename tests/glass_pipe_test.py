@@ -277,8 +277,8 @@ class TestStreamIntegrity:
         events = _extract_event_lines(lines)
         status_events = [e for e in events if e.get("kind") == "status"]
         assert status_events, "kinver.proxy.status event not found"
-        triage_events = [e for e in status_events if e.get("data", {}).get("subkind") == "triage"]
-        assert triage_events, "triage subkind not found"
+        triage_events = [e for e in status_events if e.get("data", {}).get("kind") == "triage"]
+        assert triage_events, "triage kind not found"
         # No banner text should appear inside a content delta.
         for line in lines:
             if line.startswith("data: {"):
@@ -302,7 +302,7 @@ class TestStreamIntegrity:
         events = _extract_event_lines(lines)
         pause_events = [
             e for e in events
-            if e.get("kind") == "status" and e.get("data", {}).get("subkind") == "pause"
+            if e.get("kind") == "status" and e.get("data", {}).get("kind") == "pause"
         ]
         assert pause_events, "pause status event not found"
         # No synthetic content chunk should carry the pause text.

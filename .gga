@@ -23,7 +23,7 @@ PROVIDER="claude"
 #   FILE_PATTERNS="*.ts,*.tsx"
 #   FILE_PATTERNS="*.py"
 #   FILE_PATTERNS="*.go,*.mod"
-FILE_PATTERNS="*.ts,*.tsx,*.js,*.jsx"
+FILE_PATTERNS="*.py,*.ts,*.tsx,*.js,*.jsx"
 
 # File patterns to exclude from review (comma-separated)
 # Default: none
@@ -38,12 +38,14 @@ RULES_FILE="AGENTS.md"
 
 # Strict mode: fail if AI response is ambiguous
 # Default: true
-STRICT_MODE="true"
+# Set to false so a slow/noisy AI response does not block commits.
+# Real review happens at PR time.
+STRICT_MODE="false"
 
 # Timeout in seconds for AI provider response
 # Default: 300 (5 minutes)
-# Increase for large changesets or slow connections
-TIMEOUT="300"
+# 60s is the upper bound acceptable for a pre-commit hook; fail fast on hangs.
+TIMEOUT="60"
 
 # Base branch for --pr-mode (auto-detects main/master/develop if empty)
 # Default: auto-detect

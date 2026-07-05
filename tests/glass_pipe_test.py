@@ -184,6 +184,16 @@ class TestExceptions:
 class TestHarness:
     """R10 — the test harness itself is sane."""
 
+    async def test_R10_pyproject_config(self, app_client: httpx.AsyncClient) -> None:
+        """pyproject.toml configures pytest-asyncio in auto mode."""
+        repo_root = Path(__file__).parent.parent
+        pyproject = (repo_root / "pyproject.toml").read_text()
+        assert 'asyncio_mode = "auto"' in pyproject
+        assert 'testpaths = ["tests"]' in pyproject
+
     async def test_R10_harness_imports_safely(self, app_client: httpx.AsyncClient) -> None:
         """The harness can be imported and exercised without real hardware."""
-        pass
+        response = await app_client.get("/health")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "ok"

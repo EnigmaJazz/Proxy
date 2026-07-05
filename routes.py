@@ -658,7 +658,10 @@ async def _event_stream(
     if proxy_preamble:
         yield proxy_preamble
     triage_msg = _build_triage_message(route)
-    yield f"data: {json.dumps(_make_system_chunk(triage_msg))}\n\n"
+    yield _emit_proxy_event(
+        "status",
+        {"subkind": "triage", "message": triage_msg},
+    )
 
     try:
         async for chunk in stream_llm(
@@ -802,7 +805,10 @@ async def _event_stream_with_model_startup(
                 f"🔃 [Proxy: Loading {label}, please wait..."
                 f"(cold start may take 30-120 seconds)]"
             )
-            yield f"data: {json.dumps(_make_system_chunk(loading_msg))}\n\n"
+            yield _emit_proxy_event(
+                "status",
+                {"subkind": "loading", "message": loading_msg},
+            )
 
             try:
                 # Before loading a heavy GPU model, stop any lightweight
@@ -869,7 +875,10 @@ async def _event_stream_with_model_startup(
                         f"💾 [Proxy: Restored project cache "
                         f"'{project_id}' for {label}]"
                     )
-                    yield f"data: {json.dumps(_make_system_chunk(cache_msg))}\n\n"
+                    yield _emit_proxy_event(
+                        "status",
+                        {"subkind": "cache_restore", "message": cache_msg},
+                    )
                 except Exception:
                     logger.debug(
                         "Cache restore skipped for %s (non-critical)",

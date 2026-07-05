@@ -245,6 +245,50 @@ class TestStreamIntegrity:
         assert event_idx is not None and first_data_idx is not None
         assert event_idx < first_data_idx
 
+    async def test_R5_proxy_status_events(self, app_client: httpx.AsyncClient) -> None:
+        """Triage banner is emitted as kinver.proxy.status, not delta.content."""
+
+        async def _fake_stream(*, payload: dict, **kwargs):
+            yield {"choices": [{"delta": {"content": "hello"}}]}
+
+        body = {
+            "messages": [{"role": "user", "content": "hello"}],
+            "model": "professional",
+        }
+        classification = {
+            "is_valid": True,
+            "intent": "CHAT",
+            "priority": 2,
+            "complexity": "low",
+            "project_name": "general",
+            "is_factual": False,
+            "tools_required": False,
+        }
+        with patch("routes.stream_llm", side_effect=_fake_stream):
+            with patch("routes.classify_with_frontdesk", new=AsyncMock(return_value=classification)):
+                response = await app_client.post(
+                    "/v1/chat/completions",
+                    json=body,
+                    headers={"Authorization": "Bearer agent-key"},
+                )
+        assert response.status_code == 200
+        lines = _parse_sse_lines(response.content)
+        events = _extract_event_lines(lines)
+        status_events = [e for e in events if e.get("kind") == "status"]
+        assert status_events, "kinver.proxy.status event not found"
+        triage_events = [e for e in status_events if e.get("data", {}).get("subkind") == "triage"]
+        assert triage_events, "triage subkind not found"
+        # No banner text should appear inside a content delta.
+        for line in lines:
+            if line.startswith("data: {"):
+                try:
+                    chunk = json.loads(line[len("data: "):])
+                except json.JSONDecodeError:
+                    continue
+                delta = chunk.get("choices", [{}])[0].get("delta", {})
+                content = delta.get("content", "")
+                assert "Proxy triage" not in (content or ""), "triage leaked into delta.content"
+
 
 class TestHarness:
     """R10 — the test harness itself is sane."""

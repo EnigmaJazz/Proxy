@@ -444,6 +444,46 @@ class TestAuditorCoverage:
         finally:
             auditing.ShadowAuditor = saved_class
 
+    async def test_R15_stream_extracts_tool_calls(self, app_client: httpx.AsyncClient) -> None:
+        """Stream loop extracts delta.tool_calls and passes full chunks to auditor."""
+
+        class _RecordingAuditor:
+            def __init__(self):
+                self.chunks: list[dict] = []
+                self._on_fatal = None
+
+            @staticmethod
+            def should_audit(*args, **kwargs):
+                return True
+
+            def start(self, *, on_fatal, **kwargs):
+                self._on_fatal = on_fatal
+
+            def feed_chunk(self, chunk: dict) -> None:
+                self.chunks.append(chunk)
+
+            def stop(self) -> None:
+                pass
+
+        async def _fake_stream(*, payload: dict, **kwargs):
+            yield {"choices": [{"delta": {"tool_calls": [{"id": "call_1"}]}}]}
+
+        proxy.app.state.auditor = _RecordingAuditor()
+        body = {"messages": [{"role": "user", "content": "hello"}]}
+        with patch("routes.stream_llm", side_effect=_fake_stream):
+            with patch("routes.ShadowAuditor.should_audit", return_value=True):
+                response = await app_client.post(
+                    "/v1/chat/completions",
+                    json=body,
+                    headers={"Authorization": "Bearer agent-key"},
+                )
+        assert response.status_code == 200
+        tool_chunks = [
+            c for c in proxy.app.state.auditor.chunks
+            if c.get("choices", [{}])[0].get("delta", {}).get("tool_calls")
+        ]
+        assert tool_chunks, "tool_calls chunk not fed to auditor"
+
 
 class TestHarness:
     """R10 — the test harness itself is sane."""

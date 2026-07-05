@@ -651,6 +651,7 @@ async def _event_stream(
 
     first_chunk_seen = False
     full_content: list[str] = []
+    full_tool_calls: list[dict] = []
     chunk_seq = 0
     accumulated = ""
 
@@ -686,15 +687,19 @@ async def _event_stream(
 
             chunk_seq += 1
 
-            # ---- Extract content delta ---------------------------------------
+            # ---- Extract content and tool_call deltas -------------------------
             choices = chunk.get("choices", [])
             delta_content = ""
+            delta_tool_calls = None
             if choices:
                 delta = choices[0].get("delta", {})
                 delta_content = delta.get("content", "")
+                delta_tool_calls = delta.get("tool_calls")
                 if delta_content:
                     full_content.append(delta_content)
                     accumulated += delta_content
+                if delta_tool_calls:
+                    full_tool_calls.extend(delta_tool_calls)
 
             # ---- Feed to shadow auditor (non-blocking) ------------------------
             if auditor and auditor_active:

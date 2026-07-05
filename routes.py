@@ -443,6 +443,7 @@ async def chat_completions(request: Request) -> StreamingResponse:
     state.requests_served += 1
 
     # ---- Build generation parameters ---------------------------------------
+    # Glass Pipe: client-sent values win; intent defaults fill only gaps.
     parameters = {
         "temperature": temperature,
         "top_p": top_p,
@@ -451,31 +452,27 @@ async def chat_completions(request: Request) -> StreamingResponse:
 
     # Set thinking_budget_tokens and other domain-specific params
     if route.intent in ("CODE", "ARCHITECT"):
-        parameters.update({
-            "temperature": 0.1,
-            "top_p": 0.9,
-            "max_tokens": -1,  # No hard cap for code
-            "thinking_budget_tokens": 4096,
-        })
+        # Glass Pipe fallback — applies only when client omitted the field.
+        parameters.setdefault("temperature", 0.1)
+        parameters.setdefault("top_p", 0.9)
+        parameters.setdefault("max_tokens", -1)  # No hard cap for code
+        parameters["thinking_budget_tokens"] = 4096
     elif route.intent in ("CREATIVE", "SCHOLAR"):
-        parameters.update({
-            "temperature": 0.4,
-            "top_p": 0.95,
-            "max_tokens": 8192,
-            "thinking_budget_tokens": 2048,
-        })
+        # Glass Pipe fallback — applies only when client omitted the field.
+        parameters.setdefault("temperature", 0.4)
+        parameters.setdefault("top_p", 0.95)
+        parameters.setdefault("max_tokens", 8192)
+        parameters["thinking_budget_tokens"] = 2048
     elif route.intent == "PROFESSIONAL":
-        parameters.update({
-            "temperature": 0.3,
-            "top_p": 0.95,
-            "max_tokens": 4096,
-            "thinking_budget_tokens": 1024,
-        })
+        # Glass Pipe fallback — applies only when client omitted the field.
+        parameters.setdefault("temperature", 0.3)
+        parameters.setdefault("top_p", 0.95)
+        parameters.setdefault("max_tokens", 4096)
+        parameters["thinking_budget_tokens"] = 1024
     else:
-        parameters.update({
-            "max_tokens": 2048,
-            "thinking_budget_tokens": 0,
-        })
+        # Glass Pipe fallback — applies only when client omitted the field.
+        parameters.setdefault("max_tokens", 2048)
+        parameters["thinking_budget_tokens"] = 0
 
     # ---- Register job in database -------------------------------------------
     job_id = str(uuid.uuid4())

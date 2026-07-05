@@ -109,10 +109,10 @@ class _NoOpCooling:
     def __init__(self, *args, **kwargs) -> None:
         pass
 
-    def prefill_burst(self, path: str) -> None:
+    async def prefill_burst(self, path: str) -> None:
         pass
 
-    def generation_hold(self, path: str) -> None:
+    async def generation_hold(self, path: str) -> None:
         pass
 
     def baseline_idle(self) -> None:
@@ -176,6 +176,6 @@ async def app_client() -> AsyncIterator[httpx.AsyncClient]:
     proxy.app.state.active_priority = 3
     proxy.app.state.requests_served = 0
 
-    transport = httpx.ASGITransport(app=proxy.app, lifespan="off")
+    transport = httpx.ASGITransport(app=proxy.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         yield client

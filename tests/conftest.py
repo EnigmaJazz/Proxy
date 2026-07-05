@@ -112,7 +112,9 @@ class _NoOpCooling:
     async def prefill_burst(self, path: str) -> None:
         pass
 
-    async def generation_hold(self, path: str) -> None:
+    def generation_hold(self, path: str) -> None:
+        # Sync to match the real cooling.CoolingStateMachine.generation_hold
+        # (cooling.py:209).  routes.py:686 calls it without `await`.
         pass
 
     def baseline_idle(self) -> None:

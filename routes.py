@@ -64,8 +64,10 @@ logger = get_logger("proxy.routes")
 # ---------------------------------------------------------------------------
 # /v1/system commands (embedded in user prompts)
 # ---------------------------------------------------------------------------
-_PAUSE_RE = re.compile(r"(?i)^\s*/pause(?:\s+(\d+))?\s*$")
-_RESUME_RE = re.compile(r"(?i)^\s*/resume\s*$")
+# Optional leading "[role]: " prefix because routes.py:239 wraps every
+# context line as f"[{role}]: {content}\n" before the embedded-command match.
+_PAUSE_RE = re.compile(r"(?i)^\s*(?:\[[^\]]+\]:\s*)?/pause(?:\s+(\d+))?\s*$")
+_RESUME_RE = re.compile(r"(?i)^\s*(?:\[[^\]]+\]:\s*)?/resume\s*$")
 _CLOUD_RE = re.compile(r"/cloud")
 
 

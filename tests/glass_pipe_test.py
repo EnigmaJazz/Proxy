@@ -16,6 +16,7 @@ import httpx
 import pytest
 
 import proxy
+from routes import _PAUSE_RE, _RESUME_RE
 
 
 # ---------------------------------------------------------------------------
@@ -538,3 +539,45 @@ class TestHarness:
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "ok"
+
+
+class TestCommandRegex:
+    """R14 — _PAUSE_RE and _RESUME_RE patterns handle prefixed and bare commands."""
+
+    def test_pause_with_prefix_and_minutes(self) -> None:
+        """[role]: /pause 5 captures the duration."""
+        match = _PAUSE_RE.match("[user]: /pause 5")
+        assert match is not None
+        assert match.group(1) == "5"
+
+    def test_pause_with_prefix_default_minutes(self) -> None:
+        """[role]: /pause omits group 1, defaulting to 60 minutes."""
+        match = _PAUSE_RE.match("[user]: /pause")
+        assert match is not None
+        assert match.group(1) is None
+
+    def test_pause_does_not_match_resume(self) -> None:
+        """_PAUSE_RE rejects the /resume command."""
+        assert _PAUSE_RE.match("[user]: /resume") is None
+
+    def test_pause_bare_command_backward_compat(self) -> None:
+        """Bare /pause 5 still matches for backward compatibility."""
+        match = _PAUSE_RE.match("/pause 5")
+        assert match is not None
+        assert match.group(1) == "5"
+
+    def test_pause_strict_no_extra_tokens(self) -> None:
+        """_PAUSE_RE rejects trailing tokens after the optional minutes."""
+        assert _PAUSE_RE.match("[user]: /pause 5 extra") is None
+
+    def test_pause_rejects_other_command(self) -> None:
+        """_PAUSE_RE rejects unrelated commands."""
+        assert _PAUSE_RE.match("[user]: /foo") is None
+
+    def test_resume_with_prefix(self) -> None:
+        """[role]: /resume matches the resume command."""
+        assert _RESUME_RE.match("[user]: /resume") is not None
+
+    def test_resume_partial_rejected(self) -> None:
+        """A truncated /resum does not match."""
+        assert _RESUME_RE.match("[user]: /resum") is None

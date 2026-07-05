@@ -5,6 +5,7 @@ PR2 will extend this file with R3, R4, R5, R6, R12, R13, R14, R15, R16.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -314,6 +315,68 @@ class TestStreamIntegrity:
                 delta = chunk.get("choices", [{}])[0].get("delta", {})
                 content = delta.get("content", "")
                 assert "Queue paused" not in (content or ""), "pause text leaked into delta.content"
+
+
+class TestGuillotine:
+    """R6 — audit halts emit kinver.proxy.audit_halt and a clean error chunk."""
+
+    async def test_R6_audit_halt_event_and_error_chunk(self, app_client: httpx.AsyncClient) -> None:
+        """FATAL audit emits audit_halt event and a standards-compliant error chunk."""
+
+        class _FatalAuditor:
+            def __init__(self):
+                self._on_fatal = None
+
+            @staticmethod
+            def should_audit(*args, **kwargs):
+                return True
+
+            def start(self, *, on_fatal, **kwargs):
+                self._on_fatal = on_fatal
+
+            def feed_chunk(self, chunk: dict) -> None:
+                if self._on_fatal:
+                    asyncio.get_event_loop().call_soon(
+                        asyncio.create_task, self._on_fatal("job-id", "unsafe output")
+                    )
+
+            def stop(self) -> None:
+                pass
+
+        async def _fake_stream(*, payload: dict, **kwargs):
+            yield {"choices": [{"delta": {"content": "step 1"}}]}
+            # Yield control so the fatal callback task can run.
+            await asyncio.sleep(0.01)
+            yield {"choices": [{"delta": {"content": "more"}}]}
+
+        proxy.app.state.auditor = _FatalAuditor()
+        body = {
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+        with patch("routes.stream_llm", side_effect=_fake_stream):
+            with patch("routes.ShadowAuditor.should_audit", return_value=True):
+                response = await app_client.post(
+                "/v1/chat/completions",
+                json=body,
+                headers={"Authorization": "Bearer agent-key"},
+            )
+        assert response.status_code == 200
+        lines = _parse_sse_lines(response.content)
+        events = _extract_event_lines(lines)
+        halt_events = [e for e in events if e.get("kind") == "audit_halt"]
+        assert halt_events, "audit_halt event not found"
+        assert halt_events[0]["data"]["reason"] == "unsafe output"
+
+        # Find the final data: chunk (last JSON before [DONE]).
+        data_chunks = [
+            json.loads(line[len("data: "):])
+            for line in lines
+            if line.startswith("data: {")
+        ]
+        final_chunk = data_chunks[-1]
+        assert final_chunk["choices"][0]["finish_reason"] == "stop"
+        assert final_chunk.get("error", {}).get("type") == "proxy_audit_halt"
+        assert "content" not in final_chunk["choices"][0].get("delta", {})
 
 
 class TestHarness:

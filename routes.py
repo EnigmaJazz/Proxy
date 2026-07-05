@@ -921,31 +921,37 @@ async def _graceful_guillotine_chunk(
     reason: str,
 ) -> str:
     """
-    Generate the final SSE chunk that cleanly terminates a stream after
+    Generate the final SSE chunks that cleanly terminate a stream after
     a confirmed audit failure.
 
-    Balances trailing JSON/Markdown syntax and appends the proxy audit
-    override message before closing.
+    Emits a kinver.proxy.audit_halt event for Kinver frontends, followed
+    by a standards-compliant error chunk with finish_reason="stop" and an
+    empty delta so in-flight tool_calls are not corrupted.
     """
-    # The override message informs the client that the proxy halted the
-    # stream due to a quality/safety concern.
-    override_msg = (
-        f"\n\n[PROXY AUDIT OVERRIDE: Error detected. Stream halted. "
-        f"Reason: {reason}]"
+    halt_event = _emit_proxy_event(
+        "audit_halt",
+        {"reason": reason},
     )
-
-    chunk = {
+    error_chunk = {
         "id": f"chatcmpl-{job_id[:8]}",
         "object": "chat.completion.chunk",
         "created": int(time.time()),
-        "model": "proxy-audit-override",
+        "model": "proxy-audit-halt",
+        "error": {
+            "message": f"Stream halted by proxy: {reason}",
+            "type": "proxy_audit_halt",
+        },
         "choices": [{
             "index": 0,
-            "delta": {"content": override_msg},
-            "finish_reason": "audit_override",
+            "delta": {},
+            "finish_reason": "stop",
         }],
     }
-    return f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n"
+    return (
+        halt_event
+        + f"data: {json.dumps(error_chunk)}\n\n"
+        + "data: [DONE]\n\n"
+    )
 
 
 # ---------------------------------------------------------------------------

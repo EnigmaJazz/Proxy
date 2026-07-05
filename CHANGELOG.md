@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - `is_dream` `UnboundLocalError` in the Lane B / IDE code path (latent crash).
+- Parameter default fallback order: client value → intent default → global
+  default. Previously, omitting a parameter on an intent-driven request
+  (e.g. `CODE` without `temperature`) would use the global default (0.7)
+  instead of the intent default (0.1). Now the intent default applies
+  when the client omits the field.
 
 ### Changed
 

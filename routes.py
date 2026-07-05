@@ -694,8 +694,8 @@ async def _event_stream(
                     accumulated += delta_content
 
             # ---- Feed to shadow auditor (non-blocking) ------------------------
-            if auditor and auditor_active and delta_content:
-                auditor.feed_chunk(delta_content)
+            if auditor and auditor_active:
+                auditor.feed_chunk(chunk)
 
             # ---- Persist chunk to database ------------------------------------
             if db and delta_content:

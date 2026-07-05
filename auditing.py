@@ -40,6 +40,7 @@ Maintainers: James Stansfield
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Optional, Dict, Any, List
 
@@ -184,9 +185,9 @@ class ShadowAuditor:
         self._job_id = None
         logger.debug("ShadowAuditor stopped")
 
-    def feed_chunk(self, text: str) -> None:
+    def feed_chunk(self, chunk: dict) -> None:
         """
-        Feed a text chunk into the auditor's ingestion queue.
+        Feed a full streaming chunk dict into the auditor's ingestion queue.
 
         This is called from the main SSE streaming loop for every delta
         chunk received from the model.  It is non-blocking — the chunk
@@ -194,18 +195,18 @@ class ShadowAuditor:
 
         Parameters
         ----------
-        text : str
-            A text delta from the SSE stream.
+        chunk : dict
+            A full chat.completion.chunk dict from the SSE stream.
         """
         if not self._active:
             return
         try:
-            self._chunk_queue.put_nowait(text)
+            self._chunk_queue.put_nowait(chunk)
         except asyncio.QueueFull:
             logger.debug("Auditor chunk queue full — dropping oldest chunk")
             try:
                 self._chunk_queue.get_nowait()
-                self._chunk_queue.put_nowait(text)
+                self._chunk_queue.put_nowait(chunk)
             except Exception:
                 pass
 
@@ -234,7 +235,13 @@ class ShadowAuditor:
                 except asyncio.TimeoutError:
                     continue
 
-                self._accumulated_text += chunk
+                delta = chunk.get("choices", [{}])[0].get("delta", {})
+                content = delta.get("content", "")
+                tool_calls = delta.get("tool_calls")
+                if content:
+                    self._accumulated_text += content
+                if tool_calls:
+                    self._accumulated_text += json.dumps(tool_calls)
                 self._chunk_counter += 1
 
                 # ---- Determine if it's time to evaluate --------------------

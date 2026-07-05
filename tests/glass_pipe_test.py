@@ -379,6 +379,30 @@ class TestGuillotine:
         assert "content" not in final_chunk["choices"][0].get("delta", {})
 
 
+class TestAuditorCoverage:
+    """R12, R15, R16 — auditor and DB observe tool_calls deltas."""
+
+    async def test_R12_auditor_sees_tool_calls(self, app_client: httpx.AsyncClient) -> None:
+        """ShadowAuditor.feed_chunk accepts a chunk dict and observes tool_calls."""
+        import auditing
+        import importlib
+
+        # Conftest replaced ShadowAuditor with a no-op; reload to test the real class.
+        saved_class = auditing.ShadowAuditor
+        importlib.reload(auditing)
+        try:
+            auditor = auditing.ShadowAuditor(None, None, None)
+            auditor.start(job_id="j1", project_id="p1", messages=[])
+            auditor.feed_chunk({"choices": [{"delta": {"tool_calls": [{"id": "c1"}]}}]})
+            auditor.feed_chunk({"choices": [{"delta": {"content": "text"}}]})
+            await asyncio.sleep(0.05)
+            auditor.stop()
+            assert "c1" in auditor._accumulated_text
+            assert "text" in auditor._accumulated_text
+        finally:
+            auditing.ShadowAuditor = saved_class
+
+
 class TestHarness:
     """R10 — the test harness itself is sane."""
 

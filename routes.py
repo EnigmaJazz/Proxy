@@ -167,6 +167,10 @@ async def chat_completions(request: Request) -> StreamingResponse:
     caller_type = discriminate_caller(headers)
     lane_b = is_lane_b(headers)
 
+    # Optional proxy-level SSE preamble (e.g. tool_stripped event) emitted
+    # before the first model chunk.
+    proxy_preamble = ""
+
     # ---- Prepare messages (Glass Pipe Rule: NO text alteration) ------------
     processed_messages: list = list(messages)  # Shallow copy
 
@@ -210,6 +214,10 @@ async def chat_completions(request: Request) -> StreamingResponse:
             logger.warning(
                 "Tool loop detected for domain '%s': %s — stripping tools",
                 effective_domain, loop_reason,
+            )
+            proxy_preamble = _emit_proxy_event(
+                "tool_stripped",
+                {"reason": loop_reason, "domain": effective_domain},
             )
             tools = None
 
@@ -300,6 +308,7 @@ async def chat_completions(request: Request) -> StreamingResponse:
                 requested_model="architect",
                 hardware_path=hardware_path,
                 auditor_active=False,
+                proxy_preamble="",
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
@@ -572,6 +581,7 @@ async def chat_completions(request: Request) -> StreamingResponse:
             requested_model=requested_model,
             hardware_path=hardware_path,
             auditor_active=auditor_active,
+            proxy_preamble=proxy_preamble,
         ),
         media_type="text/event-stream",
         headers={
@@ -596,6 +606,7 @@ async def _event_stream(
     requested_model: str,
     hardware_path: str,
     auditor_active: bool,
+    proxy_preamble: str = "",
 ) -> AsyncIterator[str]:
     """
     Core SSE streaming generator.
@@ -644,6 +655,8 @@ async def _event_stream(
     # Let the frontend know which model was selected and why, so users
     # understand the routing decision.  This is informational only and
     # does not affect the conversation content (Glass Pipe Rule).
+    if proxy_preamble:
+        yield proxy_preamble
     triage_msg = _build_triage_message(route)
     yield f"data: {json.dumps(_make_system_chunk(triage_msg))}\n\n"
 
@@ -749,6 +762,7 @@ async def _event_stream_with_model_startup(
     requested_model: str,
     hardware_path: str,
     auditor_active: bool,
+    proxy_preamble: str = "",
 ) -> AsyncIterator[str]:
     """
     Wrapper around ``_event_stream`` that ensures heavy GPU models are
@@ -874,6 +888,7 @@ async def _event_stream_with_model_startup(
         requested_model=requested_model,
         hardware_path=hardware_path,
         auditor_active=auditor_active,
+        proxy_preamble=proxy_preamble,
     ):
         yield chunk
 
@@ -1051,6 +1066,18 @@ def _make_system_chunk(content: str) -> dict:
             "finish_reason": None,
         }],
     }
+
+
+def _emit_proxy_event(kind: str, data: dict) -> str:
+    """
+    Format a kinver.proxy.* SSE event line with the unified envelope.
+
+    Backward-compat note: clients that previously parsed these banners
+    out of delta.content will no longer see them — they are now on a
+    dedicated event type that standard OpenAI clients ignore by spec.
+    """
+    envelope = json.dumps({"kind": kind, "ts": int(time.time()), "data": data})
+    return f"event: kinver.proxy.{kind}\ndata: {envelope}\n\n"
 
 
 # ---------------------------------------------------------------------------

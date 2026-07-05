@@ -208,6 +208,43 @@ class TestStreamIntegrity:
         assert captured, "stream_llm was not called"
         assert captured[0].get("tools") == tools
 
+    async def test_R4_tool_stripped_event_emitted(self, app_client: httpx.AsyncClient) -> None:
+        """Loop detection emits kinver.proxy.tool_stripped before the first chunk."""
+        captured: list[dict] = []
+
+        async def _fake_stream(*, payload: dict, **kwargs):
+            captured.append(payload)
+            yield {"choices": [{"delta": {"content": "ok"}}]}
+
+        body = {
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{"type": "function", "function": {"name": "read_file"}}],
+        }
+        with patch("routes.stream_llm", side_effect=_fake_stream):
+            with patch("routes.detect_tool_loops", new=AsyncMock(return_value=(True, "repeated_tool_call"))):
+                response = await app_client.post(
+                    "/v1/chat/completions",
+                    json=body,
+                    headers={"Authorization": "Bearer agent-key"},
+                )
+        assert response.status_code == 200
+        lines = _parse_sse_lines(response.content)
+        events = _extract_event_lines(lines)
+        tool_stripped = [e for e in events if e.get("kind") == "tool_stripped"]
+        assert tool_stripped, "tool_stripped event not found"
+        assert tool_stripped[0]["data"]["reason"] == "repeated_tool_call"
+        # The event must appear before any model data chunk.
+        first_data_idx = next(
+            (i for i, line in enumerate(lines) if line.startswith("data: {")),
+            None,
+        )
+        event_idx = next(
+            (i for i, line in enumerate(lines) if line == "event: kinver.proxy.tool_stripped"),
+            None,
+        )
+        assert event_idx is not None and first_data_idx is not None
+        assert event_idx < first_data_idx
+
 
 class TestHarness:
     """R10 — the test harness itself is sane."""

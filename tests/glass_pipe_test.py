@@ -379,6 +379,48 @@ class TestGuillotine:
         assert "content" not in final_chunk["choices"][0].get("delta", {})
 
 
+class TestMidToolFlowOptOut:
+    """R13 — X-Kinver-Allow-Mid-Tool-Switch header disables the implicit lock."""
+
+    async def test_R13_mid_tool_flow_opt_out(self, app_client: httpx.AsyncClient) -> None:
+        """Header present → frontdesk classification runs despite tool history."""
+        captured: list[dict] = []
+
+        async def _fake_stream(*, payload: dict, **kwargs):
+            captured.append(payload)
+            if False:
+                yield {}
+
+        classification = {
+            "is_valid": True,
+            "intent": "CHAT",
+            "priority": 2,
+            "complexity": "low",
+            "project_name": "general",
+            "is_factual": False,
+            "tools_required": False,
+        }
+        body = {
+            "messages": [
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}]},
+                {"role": "tool", "content": "result", "tool_call_id": "c1"},
+                {"role": "user", "content": "now what?"},
+            ],
+        }
+        with patch("routes.stream_llm", side_effect=_fake_stream):
+            with patch("routes.classify_with_frontdesk", new=AsyncMock(return_value=classification)) as mock_cls:
+                response = await app_client.post(
+                    "/v1/chat/completions",
+                    json=body,
+                    headers={
+                        "Authorization": "Bearer agent-key",
+                        "X-Kinver-Allow-Mid-Tool-Switch": "true",
+                    },
+                )
+        assert response.status_code == 200
+        mock_cls.assert_awaited_once()
+
+
 class TestAuditorCoverage:
     """R12, R15, R16 — auditor and DB observe tool_calls deltas."""
 

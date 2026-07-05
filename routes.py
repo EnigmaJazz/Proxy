@@ -338,7 +338,10 @@ async def chat_completions(request: Request) -> StreamingResponse:
         "tools_required": False,
     }
 
-    if has_tool_calls:
+    allow_mid_tool_switch = (
+        request.headers.get("X-Kinver-Allow-Mid-Tool-Switch", "").lower() == "true"
+    )
+    if has_tool_calls and not allow_mid_tool_switch:
         # Conversation already has tool calls — stay with Worker, don't
         # let frontdesk reclassify and accidentally switch models
         classification["intent"] = "TOOL"

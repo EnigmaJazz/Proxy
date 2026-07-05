@@ -156,6 +156,66 @@ class TestPassthrough:
         assert payload["response_format"] == {"type": "json_object"}
         assert "frequency_penalty" not in payload
 
+    async def test_R1_client_omits_temperature_uses_intent_default(self, app_client: httpx.AsyncClient) -> None:
+        """Client omits temperature → CODE intent default fills the gap."""
+        captured: list[dict] = []
+
+        async def _fake_stream(*, payload: dict, **kwargs):
+            captured.append(payload)
+            if False:
+                yield {}
+
+        classification = {
+            "is_valid": True,
+            "intent": "CODE",
+            "priority": 1,
+            "complexity": "low",
+            "project_name": "general",
+            "is_factual": False,
+            "tools_required": False,
+        }
+        body = {"messages": [{"role": "user", "content": "hello"}]}
+        with patch("routes.stream_llm", side_effect=_fake_stream):
+            with patch("routes.classify_with_frontdesk", new=AsyncMock(return_value=classification)):
+                response = await app_client.post(
+                    "/v1/chat/completions",
+                    json=body,
+                    headers={"Authorization": "Bearer agent-key"},
+                )
+        assert response.status_code == 200
+        assert captured, "stream_llm was not called"
+        assert captured[0]["temperature"] == 0.1
+
+    async def test_R7_client_omits_thinking_budget_uses_intent_default(self, app_client: httpx.AsyncClient) -> None:
+        """Client omits thinking_budget_tokens → CODE intent default fills the gap."""
+        captured: list[dict] = []
+
+        async def _fake_stream(*, payload: dict, **kwargs):
+            captured.append(payload)
+            if False:
+                yield {}
+
+        classification = {
+            "is_valid": True,
+            "intent": "CODE",
+            "priority": 1,
+            "complexity": "low",
+            "project_name": "general",
+            "is_factual": False,
+            "tools_required": False,
+        }
+        body = {"messages": [{"role": "user", "content": "hello"}]}
+        with patch("routes.stream_llm", side_effect=_fake_stream):
+            with patch("routes.classify_with_frontdesk", new=AsyncMock(return_value=classification)):
+                response = await app_client.post(
+                    "/v1/chat/completions",
+                    json=body,
+                    headers={"Authorization": "Bearer agent-key"},
+                )
+        assert response.status_code == 200
+        assert captured, "stream_llm was not called"
+        assert captured[0]["thinking_budget_tokens"] == 4096
+
 
 class TestExceptions:
     """R2, R8, R9 — intentional Glass-Pipe exceptions are documented."""
@@ -420,6 +480,41 @@ class TestMidToolFlowOptOut:
         assert response.status_code == 200
         mock_cls.assert_awaited_once()
 
+    async def test_R13_mid_tool_flow_lock_preserved_without_header(self, app_client: httpx.AsyncClient) -> None:
+        """No opt-out header → frontdesk is skipped and the implicit lock applies."""
+        captured: list[dict] = []
+
+        async def _fake_stream(*, payload: dict, **kwargs):
+            captured.append(payload)
+            if False:
+                yield {}
+
+        classification = {
+            "is_valid": True,
+            "intent": "CHAT",
+            "priority": 2,
+            "complexity": "low",
+            "project_name": "general",
+            "is_factual": False,
+            "tools_required": False,
+        }
+        body = {
+            "messages": [
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}]},
+                {"role": "tool", "content": "result", "tool_call_id": "c1"},
+                {"role": "user", "content": "now what?"},
+            ],
+        }
+        with patch("routes.stream_llm", side_effect=_fake_stream):
+            with patch("routes.classify_with_frontdesk", new=AsyncMock(return_value=classification)) as mock_cls:
+                response = await app_client.post(
+                    "/v1/chat/completions",
+                    json=body,
+                    headers={"Authorization": "Bearer agent-key"},
+                )
+        assert response.status_code == 200
+        mock_cls.assert_not_awaited()
+
 
 class TestAuditorCoverage:
     """R12, R15, R16 — auditor and DB observe tool_calls deltas."""
@@ -520,6 +615,25 @@ class TestAuditorCoverage:
                 Path("/tmp/test_glass_pipe_r16.db").unlink(missing_ok=True)
         finally:
             database.Database = saved_class
+
+    async def test_R16_text_only_stream_stores_empty_tool_calls(self, app_client: httpx.AsyncClient) -> None:
+        """Stream with content only calls complete_job with empty tool_calls_json."""
+
+        async def _fake_stream(*, payload: dict, **kwargs):
+            yield {"choices": [{"delta": {"content": "hello"}}]}
+
+        proxy.app.state.database.complete_job = AsyncMock(return_value=None)
+        body = {"messages": [{"role": "user", "content": "hello"}]}
+        with patch("routes.stream_llm", side_effect=_fake_stream):
+            response = await app_client.post(
+                "/v1/chat/completions",
+                json=body,
+                headers={"Authorization": "Bearer agent-key"},
+            )
+        assert response.status_code == 200
+        proxy.app.state.database.complete_job.assert_awaited_once()
+        call_kwargs = proxy.app.state.database.complete_job.call_args.kwargs
+        assert call_kwargs.get("tool_calls_json") == ""
 
 
 class TestHarness:

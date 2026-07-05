@@ -160,9 +160,9 @@ async def chat_completions(request: Request) -> StreamingResponse:
 
     requested_model = body.get("model", "auto").lower()
     tools = body.get("tools", None)
-    temperature = body.get("temperature", 0.7)
-    top_p = body.get("top_p", 1.0)
-    max_tokens = body.get("max_tokens", 4096)
+    temperature = body.get("temperature")
+    top_p = body.get("top_p")
+    max_tokens = body.get("max_tokens")
 
     # ---- Discriminate caller type ------------------------------------------
     headers = dict(request.headers)
@@ -460,11 +460,13 @@ async def chat_completions(request: Request) -> StreamingResponse:
     # Glass Pipe exception — intentional: intent defaults only fill gaps
     # left by the client.  Client-sent values win for every parameter.
     thinking_budget_tokens = body.get("thinking_budget_tokens")
-    parameters = {
-        "temperature": temperature,
-        "top_p": top_p,
-        "max_tokens": max_tokens,
-    }
+    parameters: Dict[str, Any] = {}
+    if temperature is not None:
+        parameters["temperature"] = temperature
+    if top_p is not None:
+        parameters["top_p"] = top_p
+    if max_tokens is not None:
+        parameters["max_tokens"] = max_tokens
     if thinking_budget_tokens is not None:
         parameters["thinking_budget_tokens"] = thinking_budget_tokens
 
@@ -491,6 +493,10 @@ async def chat_completions(request: Request) -> StreamingResponse:
         # Glass Pipe fallback — applies only when client omitted the field.
         parameters.setdefault("max_tokens", 2048)
         parameters.setdefault("thinking_budget_tokens", 0)
+
+    # Global defaults for fields the client omitted and no intent default filled.
+    parameters.setdefault("temperature", 0.7)
+    parameters.setdefault("top_p", 1.0)
 
     # ---- Register job in database -------------------------------------------
     job_id = str(uuid.uuid4())

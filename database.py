@@ -396,9 +396,16 @@ class Database:
         )
 
     async def complete_job(
-        self, job_id: str, finish_reason: str, full_content: str = ""
+        self,
+        job_id: str,
+        finish_reason: str,
+        full_content: str = "",
+        tool_calls_json: str = "",
     ) -> None:
         """Mark a job as successfully completed."""
+        partial_content = full_content
+        if tool_calls_json:
+            partial_content += "|||TOOL_CALLS|||" + tool_calls_json
         await self._execute_write(
             """UPDATE jobs
                SET state = 'completed',
@@ -407,9 +414,20 @@ class Database:
                    completed_at = ?,
                    failure_count = 0
                WHERE id = ?""",
-            (finish_reason, full_content, self._now_iso(), job_id),
+            (finish_reason, partial_content, self._now_iso(), job_id),
         )
         logger.info("Job %s completed (finish_reason=%s)", job_id, finish_reason)
+
+    @staticmethod
+    def parse_tool_calls_from_partial(content: str) -> tuple[str, list[dict]]:
+        """Split partial_content into text and accumulated tool_calls."""
+        if "|||TOOL_CALLS|||" not in content:
+            return content, []
+        text, _, tools_json = content.partition("|||TOOL_CALLS|||")
+        try:
+            return text, json.loads(tools_json)
+        except json.JSONDecodeError:
+            return content, []
 
     async def fail_job(self, job_id: str) -> int:
         """

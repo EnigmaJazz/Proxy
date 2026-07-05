@@ -484,6 +484,43 @@ class TestAuditorCoverage:
         ]
         assert tool_chunks, "tool_calls chunk not fed to auditor"
 
+    async def test_R16_db_accumulates_tool_calls(self, app_client: httpx.AsyncClient) -> None:
+        """complete_job stores tool_calls JSON and the helper parses it back."""
+        import database
+        import importlib
+
+        saved_class = database.Database
+        importlib.reload(database)
+        try:
+            db = database.Database(Path("/tmp/test_glass_pipe_r16.db"))
+            await db.initialize()
+            try:
+                job_id = await db.enqueue_job(
+                    messages_json=json.dumps([{"role": "user", "content": "hi"}]),
+                    priority=2,
+                    intent="CHAT",
+                )
+                tool_calls = [{"id": "call_1", "function": {"name": "read_file"}}]
+                await db.complete_job(
+                    job_id,
+                    finish_reason="stop",
+                    full_content="hello",
+                    tool_calls_json=json.dumps(tool_calls),
+                )
+                row = await db.get_job(job_id)
+                assert row is not None
+                assert "|||TOOL_CALLS|||" in row["partial_content"]
+                text, parsed = database.Database.parse_tool_calls_from_partial(
+                    row["partial_content"]
+                )
+                assert text == "hello"
+                assert parsed == tool_calls
+            finally:
+                await db.close()
+                Path("/tmp/test_glass_pipe_r16.db").unlink(missing_ok=True)
+        finally:
+            database.Database = saved_class
+
 
 class TestHarness:
     """R10 — the test harness itself is sane."""

@@ -723,6 +723,7 @@ async def _event_stream(
                 job_id,
                 finish_reason="stop",
                 full_content="".join(full_content),
+                tool_calls_json=json.dumps(full_tool_calls) if full_tool_calls else "",
             )
         yield "data: [DONE]\n\n"
 

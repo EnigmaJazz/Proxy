@@ -160,27 +160,26 @@ class TestPassthrough:
 class TestExceptions:
     """R2, R8, R9 — intentional Glass-Pipe exceptions are documented."""
 
-    async def test_R2_doc_labels_present(self, app_client: httpx.AsyncClient) -> None:
-        """translate_to_deepseek_r1 carries an intentional-exception label."""
-        repo_root = Path(__file__).parent.parent
-        routes_source = (repo_root / "routes.py").read_text()
-        llm_source = (repo_root / "llm.py").read_text()
-        assert "Glass Pipe exception" in routes_source
-        assert "Glass Pipe exception" in llm_source
-
-    async def test_R8_stop_seq_doc_present(self, app_client: httpx.AsyncClient) -> None:
-        """Stop-sequence filter carries an intentional-exception label."""
-        repo_root = Path(__file__).parent.parent
-        routes_source = (repo_root / "routes.py").read_text()
-        assert "Glass Pipe exception" in routes_source
-        assert "ReAct-era stops" in routes_source or "mid-tool-call" in routes_source
-
-    async def test_R9_param_overrides_doc_present(self, app_client: httpx.AsyncClient) -> None:
+    async def test_R2_doc_labels_present_param_overrides(self, app_client: httpx.AsyncClient) -> None:
         """Parameter intent-default block carries an intentional-exception label."""
         repo_root = Path(__file__).parent.parent
         routes_source = (repo_root / "routes.py").read_text()
         assert "Glass Pipe exception" in routes_source
         assert "intent defaults only fill gaps" in routes_source
+
+    async def test_R8_doc_labels_present_translate_to_deepseek_r1(self, app_client: httpx.AsyncClient) -> None:
+        """translate_to_deepseek_r1 carries an intentional-exception label."""
+        repo_root = Path(__file__).parent.parent
+        llm_source = (repo_root / "llm.py").read_text()
+        assert "Glass Pipe exception" in llm_source
+        assert "translate_to_deepseek_r1" in llm_source
+
+    async def test_R9_doc_labels_present_stop_seq_filter(self, app_client: httpx.AsyncClient) -> None:
+        """Stop-sequence filter carries an intentional-exception label."""
+        repo_root = Path(__file__).parent.parent
+        routes_source = (repo_root / "routes.py").read_text()
+        assert "Glass Pipe exception" in routes_source
+        assert "ReAct-era stops" in routes_source or "mid-tool-call" in routes_source
 
 
 class TestStreamIntegrity:

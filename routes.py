@@ -444,11 +444,14 @@ async def chat_completions(request: Request) -> StreamingResponse:
 
     # ---- Build generation parameters ---------------------------------------
     # Glass Pipe: client-sent values win; intent defaults fill only gaps.
+    thinking_budget_tokens = body.get("thinking_budget_tokens")
     parameters = {
         "temperature": temperature,
         "top_p": top_p,
         "max_tokens": max_tokens,
     }
+    if thinking_budget_tokens is not None:
+        parameters["thinking_budget_tokens"] = thinking_budget_tokens
 
     # Set thinking_budget_tokens and other domain-specific params
     if route.intent in ("CODE", "ARCHITECT"):
@@ -456,23 +459,23 @@ async def chat_completions(request: Request) -> StreamingResponse:
         parameters.setdefault("temperature", 0.1)
         parameters.setdefault("top_p", 0.9)
         parameters.setdefault("max_tokens", -1)  # No hard cap for code
-        parameters["thinking_budget_tokens"] = 4096
+        parameters.setdefault("thinking_budget_tokens", 4096)
     elif route.intent in ("CREATIVE", "SCHOLAR"):
         # Glass Pipe fallback — applies only when client omitted the field.
         parameters.setdefault("temperature", 0.4)
         parameters.setdefault("top_p", 0.95)
         parameters.setdefault("max_tokens", 8192)
-        parameters["thinking_budget_tokens"] = 2048
+        parameters.setdefault("thinking_budget_tokens", 2048)
     elif route.intent == "PROFESSIONAL":
         # Glass Pipe fallback — applies only when client omitted the field.
         parameters.setdefault("temperature", 0.3)
         parameters.setdefault("top_p", 0.95)
         parameters.setdefault("max_tokens", 4096)
-        parameters["thinking_budget_tokens"] = 1024
+        parameters.setdefault("thinking_budget_tokens", 1024)
     else:
         # Glass Pipe fallback — applies only when client omitted the field.
         parameters.setdefault("max_tokens", 2048)
-        parameters["thinking_budget_tokens"] = 0
+        parameters.setdefault("thinking_budget_tokens", 0)
 
     # ---- Register job in database -------------------------------------------
     job_id = str(uuid.uuid4())

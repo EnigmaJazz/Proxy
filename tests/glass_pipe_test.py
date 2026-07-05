@@ -81,7 +81,36 @@ class TestPassthrough:
 
     async def test_R7_client_wins_thinking_budget_tokens(self, app_client: httpx.AsyncClient) -> None:
         """Client-sent thinking_budget_tokens survives intent defaults."""
-        pass
+        captured: list[dict] = []
+
+        async def _fake_stream(*, payload: dict, **kwargs):
+            captured.append(payload)
+            if False:
+                yield {}
+
+        classification = {
+            "is_valid": True,
+            "intent": "CODE",
+            "priority": 1,
+            "complexity": "low",
+            "project_name": "general",
+            "is_factual": False,
+            "tools_required": False,
+        }
+        body = {
+            "messages": [{"role": "user", "content": "hello"}],
+            "thinking_budget_tokens": 8192,
+        }
+        with patch("routes.stream_llm", side_effect=_fake_stream):
+            with patch("routes.classify_with_frontdesk", new=AsyncMock(return_value=classification)):
+                response = await app_client.post(
+                    "/v1/chat/completions",
+                    json=body,
+                    headers={"Authorization": "Bearer agent-key"},
+                )
+        assert response.status_code == 200
+        assert captured, "stream_llm was not called"
+        assert captured[0]["thinking_budget_tokens"] == 8192
 
     async def test_R11_full_openai_field_set(self, app_client: httpx.AsyncClient) -> None:
         """Optional OpenAI fields are forwarded when client sends them."""

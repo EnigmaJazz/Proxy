@@ -1,0 +1,20 @@
+name: CI
+
+on:
+  push:
+    branches: [main, feature/glass-pipe-followups]
+  pull_request:
+    branches: [main, feature/glass-pipe-followups]
+
+jobs:
+  drift-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install sync dependencies
+        run: pip install pyyaml httpx
+      - name: Hard-block on profile drift
+        run: python tools/sync_model_profiles.py sync --check

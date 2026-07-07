@@ -1,0 +1,14 @@
+# Curated model_key -> Hugging Face model_id map.
+# The scraper in tools/sync_model_profiles.py reads this list at build time
+# and writes config/model_profiles.yaml.  Runtime never calls HF.
+models:
+  reasoning:    deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
+  coder:        Qwen/Qwen2.5-Coder-32B-Instruct
+  professional: Qwen/Qwen2.5-72B-Instruct
+  architect:    Qwen/Qwen3-32B-Instruct
+  creative:     meta-llama/Llama-3.3-70B-Instruct
+  scholar:      Qwen/Qwen3-30B-A3B-Instruct
+  worker:       Qwen/Qwen2.5-9B-Instruct
+  chatter:      deepseek-ai/DeepSeek-R1-Distill-Qwen-3B
+  frontdesk:    Qwen/Qwen2.5-3B-Instruct
+  lifeboat:     meta-llama/Llama-3.2-3B-Instruct

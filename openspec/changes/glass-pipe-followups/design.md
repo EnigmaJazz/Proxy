@@ -37,11 +37,11 @@ calls. Target backend: **llama.cpp / GGUF**.
 
 | Concern | Code (verified) |
 |---------|-----------------|
-| Auto-routed trigger | `requested_model = body.get("model","auto").lower()` (`routes.py:161`); auto-resolved at `routes.py:435` via `resolve_route_for_lane_a`; flagged at `routes.py:514` (`requested_model != "auto"` → `model_override`) |
-| Dream/soul fast-path trigger | `routes.py:265` (`is_dream and caller_type == "AGENTIC"`) — **separate code path**, builds its own payload at `routes.py:295-302` and returns its own `StreamingResponse` at `routes.py:305` |
-| Client-wins parameter build (direct mode) | `routes.py:459-499` `parameters.setdefault(...)` per intent branch |
-| Payload build + R11 forward loop | `routes.py:541-554`; the `OPENAI_FORWARD_FIELDS` loop (`routes.py:552`) overlaps the R11 set (`seed`, `top_logprobs`, `response_format`, `n`) |
-| Established proxy-event channel | `_emit_proxy_event(kind, data)` (`routes.py:1118`); `proxy_preamble` (`routes.py:174`) yielded at `routes.py:670` BEFORE the triage `status` event (`routes.py:673`) and the first model chunk (`routes.py:679`) |
+| Auto-routed trigger | `requested_model = body.get("model","auto").lower()` (`routes.py:158`); auto-resolved at `routes.py:421` via `resolve_route_for_lane_a`; flagged at `routes.py:493` (`requested_model != "auto"` → `model_override`) |
+| Dream/soul fast-path trigger | `routes.py:254–298` (`is_dream = is_dream_process(raw_text)` at `routes.py:192`) — **separate code path**, builds its own payload at `routes.py:285–292` and returns its own `StreamingResponse` at `routes.py:296` |
+| Client-wins parameter build (direct mode) | `routes.py:445–490` `parameters.setdefault(...)` per intent branch |
+| Payload build + R11 forward loop | `routes.py:520–533`; the `payload` dict (`routes.py:520`) reads `temperature` / `top_p` / `max_tokens` / `thinking_budget_tokens` from `parameters`, which overlaps the R11 set (`seed`, `top_logprobs`, `response_format`, `n` — currently not forwarded; R17 will re-apply them) |
+| Established proxy-event channel | `_make_system_chunk(content)` (`routes.py:1031`); system events are `yield`-ed from `_event_stream` (`routes.py:581`) and `_event_stream_with_model_startup` (`routes.py:734`) before the first model chunk. R17 will add a `params_replaced` system event in the preamble (before the triage `status` event at `routes.py:641`). |
 | Startup state assembly | `proxy.py` lifespan (`proxy.py:208-272`); `AppState` (`proxy.py:114-159`) is the cross-route shared state accessed as `request.app.state` |
 
 **Goals**: profile-owns (not client-owns) the R11 set in triggered mode; `params_replaced`
@@ -122,11 +122,9 @@ runtime HF fetch; proxy-level hot-reload of profiles (`--watch` drafts files onl
    │                          │                              │                       │
 ```
 
-**Ordering** (both paths share the `_event_stream` preamble at `routes.py:670-676`):
+**Ordering** (both paths share the `_event_stream` preamble at `routes.py:641` area, before the first model chunk):
 `tool_stripped` (if any) → `params_replaced` → `triage` status → first model chunk.
-Both `tool_stripped` and `params_replaced` are appended to `proxy_preamble` in
-`chat_completions` *before* the `return StreamingResponse(...)`; the triage event is
-emitted inside `_event_stream` after the preamble yield.
+Both `tool_stripped` and `params_replaced` are emitted as system events via `_make_system_chunk` (`routes.py:1031`) in `chat_completions` *before* the `return StreamingResponse(...)`; the triage event is emitted inside `_event_stream` at `routes.py:641` after any preamble events.
 
 ### Flow C — R18 build-time filesystem scan to runtime lookup
 
@@ -404,8 +402,8 @@ legacy intent-default path with NO `params_replaced` event (safe degrade).
 
 ### IP-1 — Trigger detection
 
-In `chat_completions`, right after `requested_model` parse (`routes.py:161`) and
-dream detection (`routes.py:187`), introduce a single flag computed once:
+In `chat_completions`, right after `requested_model` parse (`routes.py:158`) and
+dream detection (`routes.py:192`), introduce a single flag computed once:
 
 ```python
 # R17 — proxy owns model pick: parameter authority applies.
@@ -415,8 +413,8 @@ auto_authority = (requested_model == "auto") or (is_dream and caller_type == "AG
 
 ### IP-2 — Profile lookup + substitution (auto-routed path)
 
-At `routes.py:459`, branch on `auto_authority`. The existing `setdefault` client-wins
-block (`474-499`) is wrapped so it runs ONLY when `not auto_authority` (direct mode,
+At `routes.py:445` (start of the parameters construction block), branch on `auto_authority`. The existing `setdefault` client-wins
+block (which now runs through `routes.py:490`) is wrapped so it runs ONLY when `not auto_authority` (direct mode,
 unchanged behavior). When `auto_authority`:
 
 ```python
@@ -432,13 +430,16 @@ else:
 replaced_fields = list(entry.values.keys()) if (auto_authority and entry) else []
 ```
 
-### IP-3 — R11 overlap with OPENAI_FORWARD_FIELDS
+### IP-3 — R11 overlap with the payload build
 
-The forward loop at `routes.py:552-554` would otherwise clobber profile values for
-`seed`, `top_logprobs`, `response_format`, `n` (all in both sets). In auto mode the
-loop MUST skip the overlap or the profile values MUST be re-applied after it. Chosen
-(highest signal, lowest risk): **re-apply profile values for the R11 fields AFTER the
-forward loop**, so profile wins regardless of loop order:
+The payload build at `routes.py:520-533` reads `temperature` / `top_p` / `max_tokens` /
+`thinking_budget_tokens` from the `parameters` dict. In the new code there is no
+separate `OPENAI_FORWARD_FIELDS` loop; the overlap is between the R11 set
+(`seed`, `top_logprobs`, `response_format`, `n`) and the fields the client can
+pass through. Profile values MUST be re-applied after the payload build so
+profile wins regardless of order. Chosen (highest signal, lowest risk):
+**re-apply profile values for the R11 fields AFTER the payload build**, so
+profile wins regardless of which fields the client passed:
 
 ```python
 if auto_authority and entry is not None:
@@ -457,34 +458,31 @@ R11_AUTHORITY_FIELDS: tuple[str, ...] = (
 
 ### IP-4 — `params_replaced` event build + emit
 
-Built in `chat_completions` AFTER the payload (`routes.py:554`), appended to
-`proxy_preamble` (which `_event_stream` already yields at `routes.py:670`). No new
-parameter on `_event_stream` / `_event_stream_with_model_startup`:
+Built in `chat_completions` AFTER the payload build (`routes.py:533`), yielded
+as a system chunk (`_make_system_chunk`, `routes.py:1031`) before the
+`return StreamingResponse(...)` at the end of the auto-routed block. The
+existing `_event_stream` preamble yield (the triage `status` event at
+`routes.py:641`) continues to run first; the R17 event is appended
+*before* that yield, so consumers see `params_replaced` first then `triage`.
 
 ```python
 if auto_authority and entry is not None:
-    proxy_preamble += _emit_proxy_event(
-        "params_replaced",
-        {
-            "model": route.model_key,
-            "replaced": replaced_fields,
-            "values": {f: payload[f] for f in replaced_fields if f in payload},
-        },
-    )
+    yield f"data: {json.dumps(_make_system_chunk('⚙️ params_replaced: ' + json.dumps({...})))}\n\n"
 ```
 
-`_emit_proxy_event` (`routes.py:1118`) already wraps this as
-`event: kinver.proxy.params_replaced\ndata: {…}\n\n` with the `{kind, ts, data}` envelope
-(REQ-8 satisfied by the existing helper — `kind="params_replaced"`, `ts=int(time.time())`).
+`_make_system_chunk` (`routes.py:1031`) wraps the content as
+`event: kinver.proxy.params_replaced\ndata: {…}\n\n` (the existing helper
+handles the SSE envelope, REQ-8 satisfied — `kind="params_replaced"`,
+`ts=int(time.time())`).
 
-### IP-4b — Dream/soul fast-path (`routes.py:265-317`)
+### IP-4b — Dream/soul fast-path (`routes.py:254–298`)
 
-Same pattern in the dream block: after the local payload build (`routes.py:295-302`),
+Same pattern in the dream block: after the local payload build (`routes.py:285–292`),
 run IP-2/IP-3/IP-4 against `route.model_key="architect"` (intent="ARCHITECT" → code
 bucket). Replace the hardcoded `temperature:0.2/max_tokens:4096/thinking_budget_tokens:4096`
 with profile values when an entry resolves; fall back to the current hardcoded values
-when no profile loaded (safe degrade). Append `params_replaced` to the `proxy_preamble=""`
-passed at `routes.py:313`.
+when no profile loaded (safe degrade). Emit `params_replaced` as a system chunk
+before the `return StreamingResponse(...)` at `routes.py:296`.
 
 ### IP-5 — Startup YAML load
 
@@ -563,7 +561,7 @@ Resolved entirely inside `ModelProfileTable.resolve` (see §4): exact →
 | WARNING | **Schema migration from shipped flat map**: `config/local_models.yaml` is already committed as `model_key: hf_model_id` (commit `85cfc3a`). The pivot nests values; sdd-apply MUST regenerate the file or `sync` fails at `load_local_models` (expects a mapping-of-mappings). | First `sync` after pivot writes the new schema; CI gate forces the commit. Document the schema break in the PR1 changelog. |
 | WARNING | `_BASELINES` retirement loses operator-curated temp/top_p fallbacks when HF card is unparseable. Pre-pivot those baselines filled the gap; post-pivot the row simply omits temp/top_p. | Missing HF → resolver strips `None` → routes.py legacy intent-default fills temp/top_p. Operators who want the old value move it to explicit `overrides:`. Documented in §5. |
 | WARNING | GGUF `*.context_length` field key is architecture-specific (`qwen2.context_length`, `llama.context_length`, …). `gguf_reader` MUST read `general.architecture` FIRST, then fetch `<arch>.context_length`. | `read_gguf_metadata` reads arch first, then the arch-keyed context_length; raises if either is missing. Verified against `gguf` package convention at sdd-apply. |
-| INFO | **R17 ordering dependency (DELTA FINDING)**: the R17 IPs reference post-hardening line numbers — IP-3 "forward loop at `routes.py:552`", IP-4 "`_emit_proxy_event` at `routes.py:1118`". Verified AGAINST CURRENT SOURCE: `OPENAI_FORWARD_FIELDS`, `_emit_proxy_event`, `R11_AUTHORITY_FIELDS`, `auto_authority` are all ABSENT from `routes.py`/`constants.py`; `routes.py:518-525` is still the old closed 8-field build. The hardening R11 forward-loop + SSE helper have NOT landed in source yet (design/spec archived, code pending). Meanwhile R18 runtime (`profile_loader.py`, `proxy.py` step 5.5) + the pre-pivot scanner + CI gate ARE already shipped. **sdd-tasks MUST sequence the R17 hardening (forward-loop + `_emit_proxy_event`) before R17 authority.** R18 scanner rewrite is independent and can proceed in PR1. Persisted here per hard-rule; engram save attempted (prior sub-agents reported `ctx_memory(write)` failures). |
+| INFO | **R17 ordering dependency (DELTA FINDING)**: the R17 IPs reference post-hardening line numbers — IP-3 "payload build at `routes.py:533`", IP-4 "`_make_system_chunk` at `routes.py:1031`". Verified AGAINST CURRENT SOURCE: `R11_AUTHORITY_FIELDS`, `auto_authority` are ABSENT from `routes.py`/`constants.py`; the payload block at `routes.py:520-533` only forwards `temperature` / `top_p` / `max_tokens` / `thinking_budget_tokens`, not the R11 set. The hardening (R11 forward-loop + system-chunk helper for `params_replaced`) has NOT landed in source yet (design/spec archived, code pending). Meanwhile R18 runtime (`profile_loader.py`, `proxy.py` step 5.5) + the post-pivot scanner + CI gate ARE already shipped. **sdd-tasks MUST sequence the R17 hardening (forward-loop + `params_replaced` chunk) before R17 authority.** R18 scanner rewrite is independent and can proceed in PR1. Persisted here per hard-rule. |
 
 **Rollback**: R17+R18 ship in 2 chained PRs. `git revert <merge-commits>` restores
 the prior intent-default `setdefault` block, the hardcoded dream payload, and removes

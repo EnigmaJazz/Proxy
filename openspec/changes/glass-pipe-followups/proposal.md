@@ -4,7 +4,7 @@
 
 ## Intent (Why)
 
-- **R17**: Today (`routes.py:459–499`) the Glass-Pipe client-wins pattern fills *gaps* the client left. When the proxy picks the model — either via explicit auto-routing (`requested_model == "auto"`, `routes.py:514`) or the dream/soul fast-path (`routes.py:265`) — the proxy owns the model selection, so it should own sampling defaults too; otherwise the client tunes parameters for a model it never selected. R1 client-wins still applies for direct calls.
+- **R17**: Today (`routes.py:445–490`) the Glass-Pipe client-wins pattern fills *gaps* the client left. When the proxy picks the model — either via explicit auto-routing (`requested_model == "auto"`, parsed at `routes.py:158` and resolved at `routes.py:493`) or the dream/soul fast-path (`routes.py:254–298`) — the proxy owns the model selection, so it should own sampling defaults too; otherwise the client tunes parameters for a model it never selected. R1 client-wins still applies for direct calls.
 - **R18**: A speculative HF model_id list leads to confidently wrong profiles for models the operator never installed. Sourcing profiles via a **build-time filesystem scanner** (reads GGUF header metadata from actual files, fetches HF only for operator-declared model_ids) makes parameter authority grounded in reality, deterministic at runtime, and offline-startable. The proxy's target backend is **llama.cpp / GGUF**.
 
 ## Verified Already-Shipped (carry-over 1–3 — NO code work)
@@ -18,7 +18,7 @@
 ## What Changes
 
 ### R17 — Model profile authority (auto-routed mode)
-- **Trigger**: auto-routed mode (`requested_model == "auto"`) OR dream/soul fast-path (`routes.py:265`). Both are cases where the proxy owns the model pick.
+- **Trigger**: auto-routed mode (`requested_model == "auto"`, detected at `routes.py:158` and `routes.py:493`) OR dream/soul fast-path (`routes.py:254–298`). Both are cases where the proxy owns the model pick.
 - When triggered: proxy OWNS the **full R11 field set** — `temperature`, `top_p`, `max_tokens`, `thinking_budget_tokens`, `seed`, `top_logprobs`, `response_format`, `n`. Client values are NOT consulted. No opt-out header, no per-client override.
 - When direct (client picked model): R1/R7 client-wins unchanged.
 - Emit a new top-level `event: kinver.proxy.params_replaced` (the 4th proxy-injected event type, peer to `kinver.proxy.status`, `kinver.proxy.tool_stripped`, `kinver.proxy.audit_halt`) carrying the values actually forwarded so UIs can surface the substitution. Standard OpenAI clients ignore unknown event types.
@@ -53,7 +53,7 @@ Run `review-readability`, `review-reliability`, `review-resilience`, `review-ris
 
 ### Out of Scope
 - Re-implementing carry-over 1–3 (already shipped, see table above).
-- Re-tuning per-intent defaults currently in `routes.py:474–499` (R17 swaps their *source*, not their values).
+- Re-tuning per-intent defaults currently in `routes.py:445–490` (R17 swaps their *source*, not their values).
 - Runtime HF fetch; profile hot-reload at proxy level (`--watch` drafts files only).
 - **Models not on disk** — the scanner requires actual GGUF files; can't synthesize profiles for theoretical models.
 - New public endpoints, DB migrations, GPU/cooling/queue concerns.
@@ -66,7 +66,7 @@ Run `review-readability`, `review-reliability`, `review-resilience`, `review-ris
 - `model-profile-sync`: Build-time **filesystem scanner** that reads GGUF header metadata and per-file Hugging Face sampling recommendations into a committed `config/model_profiles.yaml`; runtime loader; scanner CLI. Covers R18.
 
 ### Modified Capabilities
-- `glass-pipe-passthrough`: R17 introduces an auto-routed exception to REQ-1/REQ-2/REQ-3 client-wins. When `requested_model == "auto"` OR the dream/soul fast-path at `routes.py:265` is active, proxy-sourced profile values replace client values across the full R11 field set; client-wins still holds for direct calls.
+- `glass-pipe-passthrough`: R17 introduces an auto-routed exception to REQ-1/REQ-2/REQ-3 client-wins. When `requested_model == "auto"` (detected at `routes.py:158`/`routes.py:493`) OR the dream/soul fast-path at `routes.py:254–298` is active, proxy-sourced profile values replace client values across the full R11 field set; client-wins still holds for direct calls.
 - `glass-pipe-stream-integrity`: R17 adds a new top-level `event: kinver.proxy.params_replaced` (the 4th proxy-injected event type) carrying the values used. Consistent with the existing three (`status`, `tool_stripped`, `audit_halt`).
 
 ## Approach
@@ -79,7 +79,7 @@ Delivery: 1 chained PR (~300 lines, under the 400 budget). sdd-tasks re-forecast
 
 | Area | Impact | Description |
 |------|--------|-------------|
-| `routes.py:459–499` | Modified | R17 — auto-routed parameter authority path; emits `event: kinver.proxy.params_replaced`. |
+| `routes.py:445–490` | Modified | R17 — auto-routed parameter authority path; emits `event: kinver.proxy.params_replaced`. |
 | `config/local_models.yaml` | New | R18 — operator-declared **path → hf_model_id** mapping. |
 | `config/model_profiles.yaml` | New | R18 — generated by scanner, committed. |
 | `tools/sync_model_profiles.py` | New | R18 — **scanner CLI** (`sync`/`--check`/`--watch`). Reads GGUF metadata, fetches HF per declared model_id. |

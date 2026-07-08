@@ -1,14 +1,17 @@
-# Curated model_key -> Hugging Face model_id map.
-# The scraper in tools/sync_model_profiles.py reads this list at build time
-# and writes config/model_profiles.yaml.  Runtime never calls HF.
+# Maps proxy model_key → operator-declared file (REQUIRED path) + REQUIRED
+# hf_model_id. The scanner VERIFIES each path exists on disk and reads its
+# GGUF header. BOTH `path` and `hf_model_id` are REQUIRED: an entry missing
+# either is a config error → exit 2. Path MUST exist and be readable →
+# exit 3 on miss. Run `tools/sync_model_profiles.py sync` after editing.
+#
+# Schema shift: the shipped flat map (commit 85cfc3a) was `model_key: hf_model_id`.
+# The pivot nests `path` + `hf_model_id` under each entry. `overrides:` here is
+# the PER-ENTRY layer, baked into the row at sync time; the top-level
+# `overrides:` in model_profiles.yaml is the PER-DEPLOYMENT layer applied at load.
 models:
-  reasoning:    deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
-  coder:        Qwen/Qwen2.5-Coder-32B-Instruct
-  professional: Qwen/Qwen2.5-72B-Instruct
-  architect:    Qwen/Qwen3-32B-Instruct
-  creative:     meta-llama/Llama-3.3-70B-Instruct
-  scholar:      Qwen/Qwen3-30B-A3B-Instruct
-  worker:       Qwen/Qwen2.5-9B-Instruct
-  chatter:      deepseek-ai/DeepSeek-R1-Distill-Qwen-3B
-  frontdesk:    Qwen/Qwen2.5-3B-Instruct
-  lifeboat:     meta-llama/Llama-3.2-3B-Instruct
+  reasoning:
+    path: /home/james/kinver-hub/models/Planner-Auditor.gguf
+    hf_model_id: deepseek-ai/DeepSeek-R1-Distill-Llama-8B
+  architect:
+    path: /home/james/kinver-hub/models/Architect.gguf
+    hf_model_id: google/gemma-4-26b-it

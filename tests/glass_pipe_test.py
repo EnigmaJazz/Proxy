@@ -276,40 +276,46 @@ class TestSyncModelProfiles:
 class TestLLMExtractor:
     """LLM extractor fallback when the regex parser doesn't extract params."""
 
-    def _mock_client(self, response_json: dict[str, Any]) -> Any:
-        """Return a mock httpx.Client whose .post() yields *response_json*."""
-        import httpx
+    def _sse_response(self, content_json: dict[str, Any] | str) -> str:
+        """Build an SSE response body for a given JSON content dict or string."""
+        import json
+        if isinstance(content_json, str):
+            content_str = content_json
+        else:
+            content_str = json.dumps(content_json)
+        return (
+            f"data: {json.dumps({'choices': [{'delta': {'content': content_str}}]})}\n\n"
+            "data: [DONE]\n\n"
+        )
+
+    def _mock_client(self, response_body: str) -> Any:
+        """Return a mock httpx.Client whose .post() yields an SSE response body."""
 
         class _Resp:
-            def __init__(self) -> None:
-                self._json = response_json
+            def __init__(self, body: str) -> None:
+                self._body = body
 
             def raise_for_status(self) -> None:
                 pass
 
-            def json(self) -> dict[str, Any]:
-                return self._json
+            def iter_lines(self) -> list[str]:
+                return self._body.splitlines()
 
         class _Client:
             def post(self, url: str, json: dict[str, Any], timeout: float = 0) -> _Resp:
-                return _Resp()
+                return _Resp(response_body)
 
         return _Client()
 
     def test_extract_with_llm_returns_parsed_params(self) -> None:
-        """A well-formed JSON response yields temperature + top_p."""
-        content = "some messy documentation with no clear pattern"
-        client = self._mock_client({
-            "choices": [{"message": {"content": '{"temperature": 0.7, "top_p": 0.9}'}}]
-        })
-        params = sync_profiles.extract_with_llm(content, "https://example.com/x", client, "coder")
+        """A well-formed SSE response with a JSON object yields temperature + top_p."""
+        client = self._mock_client(self._sse_response({"temperature": 0.7, "top_p": 0.9}))
+        params = sync_profiles.extract_with_llm("text", "https://example.com/x", client, "coder")
         assert params == {"temperature": 0.7, "top_p": 0.9}
 
     def test_extract_with_llm_returns_none_for_empty_dict(self) -> None:
         """An empty JSON object means 'no params found' — caller falls back."""
-        client = self._mock_client({
-            "choices": [{"message": {"content": "{}"}}]
-        })
+        client = self._mock_client(self._sse_response({}))
         params = sync_profiles.extract_with_llm("text", "test", client, "coder")
         assert params is None
 

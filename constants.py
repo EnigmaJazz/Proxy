@@ -244,6 +244,38 @@ STOP_SEQS: list[str] = [
     "```output",
 ]
 
+# OpenAI chat-completion fields forwarded verbatim from the client body
+# when present (R11 forwarding / hardening).  These are in addition to the
+# core sampling parameters (temperature, top_p, max_tokens) which are read
+# explicitly in routes.py.
+OPENAI_FORWARD_FIELDS: tuple[str, ...] = (
+    "tool_choice",
+    "parallel_tool_calls",
+    "frequency_penalty",
+    "presence_penalty",
+    "logit_bias",
+    "seed",
+    "user",
+    "response_format",
+    "top_logprobs",
+    "n",
+    "logprobs",
+)
+
+# R17 parameter-authority field set.  When the proxy owns the model pick
+# (auto-routed or dream/soul fast-path), these fields are sourced from the
+# model profile instead of the client request.
+R11_AUTHORITY_FIELDS: tuple[str, ...] = (
+    "temperature",
+    "top_p",
+    "max_tokens",
+    "thinking_budget_tokens",
+    "seed",
+    "top_logprobs",
+    "response_format",
+    "n",
+)
+
 # Retry / timeout settings for LLM HTTP calls
 MAX_RETRIES: int = 3
 # Retry delay bumped from 2.0 to 5.0 seconds to give heavy GPU models

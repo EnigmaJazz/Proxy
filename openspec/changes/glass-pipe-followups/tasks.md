@@ -28,7 +28,7 @@ Chain strategy: pending
 - [x] 1.1 Create `config/local_models.yaml` — model_key→hf_model_id map for all 10 routeable models
 - [x] 1.2 Create `tools/sync_model_profiles.py` — CLI: `sync`, `--check` (exit 0/1/2), `--watch`. Fns: `fetch_model_card`, `parse_sampling_params`, `derive_max_tokens` (ctx×0.9), `build_profile_entry`. Unparseable: WARNING+skip
 - [x] 1.3 Run `sync` to generate `config/model_profiles.yaml` — per-model rows + two `model:"*"` fallback rows (code/chat) + `overrides:`. Commit generated file
-- [x] 1.4 Add CI gate: `python tools/sync_model_profiles.py sync --check` as hard-block step
+- [x] 1.4 Add CI gate: `python tools/sync_model_profiles.py --check` as hard-block step
 
 ## Phase 2: R18 Runtime Loader
 

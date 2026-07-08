@@ -215,29 +215,30 @@ class TestSyncModelProfiles:
         assert sync_profiles.derive_max_tokens(1000) == 900
 
     def test_parse_sampling_params_extracts_temperature_and_top_p(self) -> None:
-        """Temperature and top_p are read from a HF README."""
-        card = {"readme": "we use a temperature of 0.6, top-p value of 0.95"}
-        params = sync_profiles.parse_sampling_params(card, "test")
+        """Temperature and top_p are read from the sampling source content."""
+        content = "we use a temperature of 0.6, top-p value of 0.95"
+        params = sync_profiles.parse_sampling_params(content, "test")
         assert params is not None
         assert params["temperature"] == 0.6
         assert params["top_p"] == 0.95
 
     def test_parse_sampling_params_ignores_context_window(self) -> None:
         """Context window is no longer sourced from HF; only sampling keys matter."""
-        card = {"readme": "max position embeddings is 32768, temperature: 0.5"}
-        params = sync_profiles.parse_sampling_params(card, "test")
+        content = "max position embeddings is 32768, temperature: 0.5"
+        params = sync_profiles.parse_sampling_params(content, "test")
         assert params is not None
         assert "context_window" not in params
         assert params["temperature"] == 0.5
 
     def test_parse_sampling_params_returns_empty_for_no_sampling_keys(self) -> None:
-        """A parseable card with no sampling keys yields an empty direction dict."""
-        card = {"architectures": ["Foo"]}
-        assert sync_profiles.parse_sampling_params(card, "test") == {}
+        """A parseable source with no sampling keys yields an empty dict."""
+        content = "this page has no sampling parameters at all"
+        assert sync_profiles.parse_sampling_params(content, "test") == {}
 
-    def test_parse_sampling_params_returns_none_for_non_object(self) -> None:
-        """A non-dict response is unparseable."""
-        assert sync_profiles.parse_sampling_params(["not", "a", "dict"], "test") is None
+    def test_parse_sampling_params_returns_none_for_empty_content(self) -> None:
+        """An unreadable / empty source returns None so caller falls back."""
+        assert sync_profiles.parse_sampling_params(None, "test") is None
+        assert sync_profiles.parse_sampling_params("", "test") is None
 
     def test_build_profile_entry_uses_hf_sampling(self) -> None:
         """HF temperature/top_p are applied when present."""
@@ -272,6 +273,88 @@ class TestSyncModelProfiles:
         assert row["max_tokens"] == 1234
 
 
+class TestLLMExtractor:
+    """LLM extractor fallback when the regex parser doesn't extract params."""
+
+    def _mock_client(self, response_json: dict[str, Any]) -> Any:
+        """Return a mock httpx.Client whose .post() yields *response_json*."""
+        import httpx
+
+        class _Resp:
+            def __init__(self) -> None:
+                self._json = response_json
+
+            def raise_for_status(self) -> None:
+                pass
+
+            def json(self) -> dict[str, Any]:
+                return self._json
+
+        class _Client:
+            def post(self, url: str, json: dict[str, Any], timeout: float = 0) -> _Resp:
+                return _Resp()
+
+        return _Client()
+
+    def test_extract_with_llm_returns_parsed_params(self) -> None:
+        """A well-formed JSON response yields temperature + top_p."""
+        content = "some messy documentation with no clear pattern"
+        client = self._mock_client({
+            "choices": [{"message": {"content": '{"temperature": 0.7, "top_p": 0.9}'}}]
+        })
+        params = sync_profiles.extract_with_llm(content, "https://example.com/x", client, "coder")
+        assert params == {"temperature": 0.7, "top_p": 0.9}
+
+    def test_extract_with_llm_returns_none_for_empty_dict(self) -> None:
+        """An empty JSON object means 'no params found' — caller falls back."""
+        client = self._mock_client({
+            "choices": [{"message": {"content": "{}"}}]
+        })
+        params = sync_profiles.extract_with_llm("text", "test", client, "coder")
+        assert params is None
+
+    def test_extract_with_llm_returns_none_on_http_failure(self) -> None:
+        """Network errors return None so the caller falls back to intent defaults."""
+        import httpx
+
+        class _FailingClient:
+            def post(self, url: str, json: dict[str, Any], timeout: float = 0) -> None:
+                raise httpx.ConnectError("proxy down")
+
+        params = sync_profiles.extract_with_llm("text", "test", _FailingClient(), "coder")
+        assert params is None
+
+    def test_build_profiles_falls_back_to_llm_when_regex_empty(
+        self, tmp_path: Path
+    ) -> None:
+        """Integration: when the regex returns nothing, the LLM extractor runs."""
+        gguf_path = tmp_path / "test.gguf"
+        _write_synthetic_gguf(gguf_path, context_length=10000)
+
+        models = tmp_path / "local_models.yaml"
+        models.write_text(
+            f"models:\n"
+            f"  coder:\n"
+            f"    path: {gguf_path}\n"
+            f"    sampling_source: https://example.com/coder\n"
+        )
+
+        # Fetcher returns content that the regex won't parse.
+        def _fetch(source: str, client: Any) -> str:
+            return "documentation that mentions nothing about temperature or top_p"
+
+        # Extractor returns clean params.
+        def _extract(content: str, source: str, client: Any, extractor_model: str) -> dict[str, Any]:
+            return {"temperature": 0.3, "top_p": 0.85}
+
+        data = sync_profiles.build_profiles(
+            models, fetcher=_fetch, extractor=_extract, extractor_model="coder"
+        )
+        row = next(r for r in data["profiles"] if r.get("model") == "coder")
+        assert row["temperature"] == 0.3
+        assert row["top_p"] == 0.85
+
+
 class TestScannerSchemaValidation:
     """local_models.yaml schema enforcement."""
 
@@ -282,18 +365,22 @@ class TestScannerSchemaValidation:
         with pytest.raises(ValueError, match="missing required 'path'"):
             sync_profiles.load_local_models(models)
 
-    def test_missing_hf_model_id_is_config_error(self, tmp_path: Path) -> None:
-        """An entry without 'hf_model_id' raises ValueError → exit 2."""
+    def test_sampling_source_is_optional(self, tmp_path: Path) -> None:
+        """An entry without 'sampling_source' loads fine — intent defaults cover the gap."""
+        gguf_path = tmp_path / "model.gguf"
+        _write_synthetic_gguf(gguf_path, context_length=10000)
         models = tmp_path / "local_models.yaml"
-        models.write_text("models:\n  badmodel:\n    path: /tmp/foo.gguf\n")
-        with pytest.raises(ValueError, match="missing required 'hf_model_id'"):
-            sync_profiles.load_local_models(models)
+        models.write_text(f"models:\n  goodmodel:\n    path: {gguf_path}\n")
+        loaded = sync_profiles.load_local_models(models)
+        assert "goodmodel" in loaded
+        assert loaded["goodmodel"]["sampling_source"] is None
+        assert loaded["goodmodel"]["overrides"] == {}
 
     def test_flat_value_is_config_error(self, tmp_path: Path) -> None:
         """The old flat 'model_key: hf_model_id' shape is rejected."""
         models = tmp_path / "local_models.yaml"
         models.write_text("models:\n  badmodel: org/model\n")
-        with pytest.raises(ValueError, match="mapping with 'path' and 'hf_model_id'"):
+        with pytest.raises(ValueError, match="mapping with 'path'"):
             sync_profiles.load_local_models(models)
 
 
@@ -303,9 +390,9 @@ class TestScannerFileErrors:
     def test_missing_file_aborts_sync(self, tmp_path: Path) -> None:
         """A declared path that does not exist raises GGUFReadError."""
         models = tmp_path / "local_models.yaml"
-        models.write_text("models:\n  testmodel:\n    path: /tmp/ghost-file-that-does-not-exist.gguf\n    hf_model_id: org/model\n")
+        models.write_text("models:\n  testmodel:\n    path: /tmp/ghost-file-that-does-not-exist.gguf\n    sampling_source: https://example.com/x\n")
         with pytest.raises(GGUFReadError, match="not found"):
-            sync_profiles.build_profiles(models, fetcher=lambda _h, _c: {})
+            sync_profiles.build_profiles(models, fetcher=lambda _h, _c: "")
 
     def test_missing_critical_field_aborts_sync(self, tmp_path: Path) -> None:
         """Missing context_length raises GGUFReadError."""
@@ -313,30 +400,30 @@ class TestScannerFileErrors:
         _write_synthetic_gguf(gguf_path, arch="llama")
 
         models = tmp_path / "local_models.yaml"
-        models.write_text(f"models:\n  testmodel:\n    path: {gguf_path}\n    hf_model_id: org/model\n")
+        models.write_text(f"models:\n  testmodel:\n    path: {gguf_path}\n    sampling_source: https://example.com/x\n")
 
         with patch("tools.sync_model_profiles.read_gguf_metadata") as mock_read:
             mock_read.side_effect = GGUFReadError("Missing llama.context_length")
             with pytest.raises(GGUFReadError, match="context_length"):
-                sync_profiles.build_profiles(models, fetcher=lambda _h, _c: {})
+                sync_profiles.build_profiles(models, fetcher=lambda _h, _c: "")
 
 
 class TestScannerHFUnparseable:
     """Unparseable HF card handling."""
 
-    def test_unparseable_card_is_skipped_and_logged(
+    def test_unparseable_sampling_source_is_skipped_and_logged(
         self,
         tmp_path: Path,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """A failed HF fetch logs a warning but the row is still emitted."""
+        """A failed sampling-source fetch logs a warning but the row is still emitted."""
         gguf_path = tmp_path / "test.gguf"
         _write_synthetic_gguf(gguf_path, context_length=10000)
 
         models = tmp_path / "local_models.yaml"
-        models.write_text(f"models:\n  testmodel:\n    path: {gguf_path}\n    hf_model_id: org/badmodel\n")
+        models.write_text(f"models:\n  testmodel:\n    path: {gguf_path}\n    sampling_source: https://example.com/bad\n")
 
-        def _bad_fetch(hf_model_id: str, client: Any) -> None:
+        def _bad_fetch(source: str, client: Any) -> None:
             return None
 
         with caplog.at_level(logging.WARNING):
@@ -344,6 +431,28 @@ class TestScannerHFUnparseable:
 
         assert any(r.get("model") == "testmodel" for r in data["profiles"])
         assert "unparseable" in caplog.text.lower() or "could not fetch" in caplog.text.lower()
+
+    def test_missing_sampling_source_uses_intent_defaults(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """An entry with no sampling_source logs an info note and uses intent defaults."""
+        gguf_path = tmp_path / "test.gguf"
+        _write_synthetic_gguf(gguf_path, context_length=10000)
+
+        # Use 'coder' so the model_key maps to intent=code via _MODEL_INTENTS.
+        models = tmp_path / "local_models.yaml"
+        models.write_text(f"models:\n  coder:\n    path: {gguf_path}\n")
+
+        with caplog.at_level(logging.INFO):
+            data = sync_profiles.build_profiles(models, fetcher=lambda _s, _c: "")
+
+        row = next(r for r in data["profiles"] if r.get("model") == "coder")
+        # coder maps to intent=code → intent_defaults
+        assert row["temperature"] == 0.2
+        assert row["top_p"] == 0.95
+        assert "intent defaults" in caplog.text.lower()
 
 
 class TestSyncCheckDrift:
@@ -359,14 +468,14 @@ class TestSyncCheckDrift:
             f"models:\n"
             f"  testmodel:\n"
             f"    path: {gguf_path}\n"
-            f"    hf_model_id: org/testmodel\n"
+            f"    sampling_source: https://example.com/testmodel\n"
         )
         return models
 
     def fake_fetcher(self, context_window: int = 10000) -> Any:
-        """Return a fetcher that serves a synthetic config.json."""
-        def _fetch(hf_model_id: str, client: Any) -> dict[str, Any]:
-            return {"temperature": 0.5, "top_p": 0.9}
+        """Return a fetcher that serves a synthetic sampling-source document."""
+        def _fetch(source: str, client: Any) -> str:
+            return "we recommend temperature: 0.5, top-p: 0.9"
         return _fetch
 
     def test_check_exits_zero_when_in_sync(self, tmp_path: Path, tmp_models: Path) -> None:

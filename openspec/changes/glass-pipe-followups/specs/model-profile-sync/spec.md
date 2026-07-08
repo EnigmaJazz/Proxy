@@ -23,23 +23,34 @@ The scanner SHALL treat the actual GGUF files referenced by `config/local_models
 - WHEN `sync` runs
 - THEN no profile entry is synthesized for that model
 
-### REQ-2: Operator-declared path → hf_model_id mapping (R18)
+### REQ-2: Operator-declared path → optional sampling_source (R18)
 
-`config/local_models.yaml` SHALL map each entry from a filesystem path to a **REQUIRED** `hf_model_id`. Every declared entry MUST have BOTH a real file at the declared path AND an `hf_model_id` field. The scanner SHALL fetch the HF model card per declared `hf_model_id` for recommended sampling parameters — HF is mandatory, not optional. Operator `overrides:` per entry SHALL win over both GGUF-derived and HF-recommended values. Entries missing `hf_model_id` are a configuration error; the scanner SHALL raise a clear ERROR (REQ-7) and abort `sync` non-zero.
+`config/local_models.yaml` SHALL map each entry from a filesystem path to an **OPTIONAL** `sampling_source`. Every declared entry MUST have a real file at the declared path; `sampling_source` is optional. The `sampling_source` MAY be any HTTP(S) URL (HF model card, vendor docs like `https://unsloth.ai/docs/models/...`, blog post) or a local file path. The scanner fetches it and uses a **two-stage extraction** because arbitrary web pages are too format-variable for a single parser:
 
-#### Scenario-1: Entry with full mapping
+1. **Regex fast path** — a tolerant regex on the fetched content; works for the common cases (HF model cards, vendor docs with `temperature: 0.6`-style content).
+2. **LLM extractor fallback** — if the regex doesn't extract `temperature` or `top_p`, the scanner calls the proxy's own `--extractor` model (default: `coder`) via the OpenAI-compatible `/v1/chat/completions` endpoint with `response_format: json_object`. The model is asked to return `{"temperature": ..., "top_p": ...}`. Best-effort: any failure (proxy down, model missing, unparseable response) returns `None` and the row falls through to intent defaults.
 
-- GIVEN `local_models.yaml` maps a path with `hf_model_id: deepseek-ai/DeepSeek-R1` and `overrides: {temperature: 0.3}`
+The GGUF header (`general.name`, `general.architecture`, `*.context_length`) is the source of truth for the model identity — the operator does NOT need to repeat this in the YAML. Operator `overrides:` per entry SHALL win over both the sampling source and intent defaults.
+
+#### Scenario-1: Entry with sampling_source URL — regex parses
+
+- GIVEN `local_models.yaml` maps a path with `sampling_source: https://huggingface.co/.../README.md` and `overrides: {temperature: 0.3}`
 - WHEN `sync` runs
-- THEN the profile combines GGUF metadata + HF sampling recommendations, with `temperature: 0.3` winning
+- THEN the scanner fetches the URL, the regex extracts `temperature` / `top_p`, and `overrides.temperature: 0.3` wins
 
-#### Scenario-2: Entry without hf_model_id is a configuration error
+#### Scenario-2: Entry without sampling_source uses intent defaults
 
-- GIVEN `local_models.yaml` maps a path with no `hf_model_id`
+- GIVEN `local_models.yaml` maps a path with no `sampling_source`
 - WHEN `sync` runs
-- THEN the scanner raises a clear ERROR naming the path and the missing `hf_model_id` field
-- AND `sync` aborts non-zero
-- AND no `config/model_profiles.yaml` is written
+- THEN the scanner emits a profile with GGUF facts and intent defaults for `temperature` / `top_p` (no fetch attempted, no warning)
+- AND `sync` exits zero
+
+#### Scenario-3: Regex fails → LLM extractor runs
+
+- GIVEN `local_models.yaml` maps a path with a `sampling_source` whose content has no regex-matchable `temperature` or `top_p`
+- WHEN `sync` runs
+- THEN the scanner falls back to the LLM extractor (calls the proxy's `--extractor` model with JSON output)
+- AND the extracted params (or intent defaults if the LLM call fails) populate the row
 
 ### REQ-3: Scanner CLI exposes sync, check, and watch (R18)
 

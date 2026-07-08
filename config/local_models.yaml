@@ -1,17 +1,18 @@
-# Maps proxy model_key → operator-declared file (REQUIRED path) + REQUIRED
-# hf_model_id. The scanner VERIFIES each path exists on disk and reads its
-# GGUF header. BOTH `path` and `hf_model_id` are REQUIRED: an entry missing
-# either is a config error → exit 2. Path MUST exist and be readable →
-# exit 3 on miss. Run `tools/sync_model_profiles.py sync` after editing.
+# Maps proxy model_key → operator-declared file (REQUIRED path) +
+# OPTIONAL sampling_source. The scanner reads the GGUF header for technical
+# facts (architecture, context_window) and optionally fetches sampling_source
+# for recommended sampling parameters (temperature, top_p). sampling_source
+# can be any HTTP(S) URL (HF model card, vendor docs, blog post) or a local
+# file path. If omitted or unparseable, intent defaults fill in.
 #
-# Schema shift: the shipped flat map (commit 85cfc3a) was `model_key: hf_model_id`.
-# The pivot nests `path` + `hf_model_id` under each entry. `overrides:` here is
-# the PER-ENTRY layer, baked into the row at sync time; the top-level
-# `overrides:` in model_profiles.yaml is the PER-DEPLOYMENT layer applied at load.
+# This is a worked example of the two paths:
+#   - reasoning:  declares sampling_source (the HF README has usable
+#                 sampling recommendations; the operator opted in).
+#   - architect:  omits sampling_source (the HF model is gated; intent
+#                 defaults cover the row without a wasted 401 fetch).
 models:
   reasoning:
     path: ~/kinver-hub/models/Planner-Auditor.gguf
-    hf_model_id: deepseek-ai/DeepSeek-R1-Distill-Llama-8B
+    sampling_source: https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Llama-8B/raw/main/README.md
   architect:
     path: ~/kinver-hub/models/Architect.gguf
-    hf_model_id: google/gemma-4-26b-it

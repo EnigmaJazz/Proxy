@@ -32,6 +32,8 @@ from constants import (
     IDE_PASSTHROUGH_HEADER,
     STOP_SEQS,
     NATIVE_TOOLS,
+    OPENAI_FORWARD_FIELDS,
+    R11_AUTHORITY_FIELDS,
     CoolingPreset,
     get_logger,
 )
@@ -161,10 +163,18 @@ async def chat_completions(request: Request) -> StreamingResponse:
     top_p = body.get("top_p", 1.0)
     max_tokens = body.get("max_tokens", 4096)
 
+    # R11 fields beyond temperature/top_p/max_tokens — forwarded in direct
+    # mode and overridden by profile values in auto-routed/dream mode.
+    seed = body.get("seed")
+    top_logprobs = body.get("top_logprobs")
+    response_format = body.get("response_format")
+    n = body.get("n", 1)
+
     # ---- Discriminate caller type ------------------------------------------
     headers = dict(request.headers)
     caller_type = discriminate_caller(headers)
     lane_b = is_lane_b(headers)
+    is_dream = False
 
     # ---- Prepare messages (Glass Pipe Rule: NO text alteration) ------------
     processed_messages: list = list(messages)  # Shallow copy
@@ -212,6 +222,10 @@ async def chat_completions(request: Request) -> StreamingResponse:
                 effective_domain, loop_reason,
             )
             tools = None
+
+    # R17 trigger: proxy owns model pick → proxy owns sampling parameters.
+    # Direct calls (client picked the model) keep R1/R7 client-wins.
+    auto_authority = (requested_model == "auto") or (is_dream and caller_type == "AGENTIC")
 
     # ---- Build full conversation context for frontdesk classification ------
     # Uses newest-first truncation: the latest user message is ALWAYS
@@ -269,6 +283,19 @@ async def chat_completions(request: Request) -> StreamingResponse:
             tools_required=False,
         )
         # Jump straight to payload building, skipping frontdesk + cache
+        # R17: dream/soul path is authoritative — use architect profile values
+        # when available, otherwise fall back to the legacy hardcoded defaults.
+        profiles = state.model_profiles
+        entry = profiles.resolve("ARCHITECT", "architect") if profiles else None
+        if entry is not None:
+            parameters = {**entry.values}
+        else:
+            parameters = {
+                "temperature": 0.2,
+                "max_tokens": 4096,
+                "thinking_budget_tokens": 4096,
+            }
+
         job_id = str(uuid.uuid4())
         if db:
             job_id = await db.enqueue_job(
@@ -277,19 +304,37 @@ async def chat_completions(request: Request) -> StreamingResponse:
                 intent="ARCHITECT",
                 project_id="soul",
                 tools_json=None,
-                parameters_json=json.dumps({"temperature": 0.2, "max_tokens": 4096, "thinking_budget_tokens": 4096}),
+                parameters_json=json.dumps(parameters),
                 lane="lane_a",
                 is_lane_b=False,
                 caller_type="AGENTIC",
             )
         payload = {
             "messages": processed_messages,
-            "temperature": 0.2,
-            "max_tokens": 4096,
+            "temperature": parameters["temperature"],
+            "max_tokens": parameters["max_tokens"],
             "stream": True,
             "stop": STOP_SEQS,
-            "thinking_budget_tokens": 4096,
         }
+        if "thinking_budget_tokens" in parameters:
+            payload["thinking_budget_tokens"] = parameters["thinking_budget_tokens"]
+
+        proxy_preamble: list[str] = []
+        if entry is not None:
+            replaced_fields = list(entry.values.keys())
+            params_replaced_payload = {
+                "kind": "params_replaced",
+                "ts": int(time.time()),
+                "data": {
+                    "model": "architect",
+                    "replaced": replaced_fields,
+                    "values": {field: entry.values[field] for field in replaced_fields},
+                },
+            }
+            proxy_preamble.append(
+                _make_proxy_event("kinver.proxy.params_replaced", params_replaced_payload)
+            )
+
         from cooling import CoolingStateMachine
         hardware_path = CoolingStateMachine.hardware_path_for_model("architect")
         return StreamingResponse(
@@ -300,6 +345,7 @@ async def chat_completions(request: Request) -> StreamingResponse:
                 requested_model="architect",
                 hardware_path=hardware_path,
                 auditor_active=False,
+                proxy_preamble=proxy_preamble,
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
@@ -443,39 +489,47 @@ async def chat_completions(request: Request) -> StreamingResponse:
     state.requests_served += 1
 
     # ---- Build generation parameters ---------------------------------------
-    parameters = {
-        "temperature": temperature,
-        "top_p": top_p,
-        "max_tokens": max_tokens,
-    }
+    # R17: when the proxy picked the model, profile values own the full R11
+    # set; otherwise R1/R7 client-wins stays in force.
+    profiles = state.model_profiles
+    entry = profiles.resolve(route.intent, route.model_key) if profiles else None
 
-    # Set thinking_budget_tokens and other domain-specific params
-    if route.intent in ("CODE", "ARCHITECT"):
-        parameters.update({
-            "temperature": 0.1,
-            "top_p": 0.9,
-            "max_tokens": -1,  # No hard cap for code
-            "thinking_budget_tokens": 4096,
-        })
-    elif route.intent in ("CREATIVE", "SCHOLAR"):
-        parameters.update({
-            "temperature": 0.4,
-            "top_p": 0.95,
-            "max_tokens": 8192,
-            "thinking_budget_tokens": 2048,
-        })
-    elif route.intent == "PROFESSIONAL":
-        parameters.update({
-            "temperature": 0.3,
-            "top_p": 0.95,
-            "max_tokens": 4096,
-            "thinking_budget_tokens": 1024,
-        })
+    if auto_authority and entry is not None:
+        parameters = {**entry.values}
     else:
-        parameters.update({
-            "max_tokens": 2048,
-            "thinking_budget_tokens": 0,
-        })
+        parameters = {
+            "temperature": temperature,
+            "top_p": top_p,
+            "max_tokens": max_tokens,
+        }
+
+        # Set thinking_budget_tokens and other domain-specific params
+        if route.intent in ("CODE", "ARCHITECT"):
+            parameters.update({
+                "temperature": 0.1,
+                "top_p": 0.9,
+                "max_tokens": -1,  # No hard cap for code
+                "thinking_budget_tokens": 4096,
+            })
+        elif route.intent in ("CREATIVE", "SCHOLAR"):
+            parameters.update({
+                "temperature": 0.4,
+                "top_p": 0.95,
+                "max_tokens": 8192,
+                "thinking_budget_tokens": 2048,
+            })
+        elif route.intent == "PROFESSIONAL":
+            parameters.update({
+                "temperature": 0.3,
+                "top_p": 0.95,
+                "max_tokens": 4096,
+                "thinking_budget_tokens": 1024,
+            })
+        else:
+            parameters.update({
+                "max_tokens": 2048,
+                "thinking_budget_tokens": 0,
+            })
 
     # ---- Register job in database -------------------------------------------
     job_id = str(uuid.uuid4())
@@ -528,6 +582,18 @@ async def chat_completions(request: Request) -> StreamingResponse:
     if tools:
         payload["tools"] = tools
 
+    # Forward additional OpenAI fields from the client body (R11 hardening).
+    for field in OPENAI_FORWARD_FIELDS:
+        if body.get(field) is not None:
+            payload[field] = body[field]
+
+    # R17: re-apply profile values for the R11 set so profile wins regardless
+    # of any client-forwarded values.
+    if auto_authority and entry is not None:
+        for field in R11_AUTHORITY_FIELDS:
+            if field in entry.values:
+                payload[field] = entry.values[field]
+
     # ---- Forward headers for Lane B ----------------------------------------
     fwd_headers: Dict[str, str] = {}
     if route.is_lane_b:
@@ -541,6 +607,23 @@ async def chat_completions(request: Request) -> StreamingResponse:
     # (worker, chatter) write only to GPU.
     from cooling import CoolingStateMachine
     hardware_path = CoolingStateMachine.hardware_path_for_model(route.model_key)
+
+    # R17: build params_replaced event when authority was applied.
+    proxy_preamble: list[str] = []
+    if auto_authority and entry is not None:
+        replaced_fields = list(entry.values.keys())
+        params_replaced_payload = {
+            "kind": "params_replaced",
+            "ts": int(time.time()),
+            "data": {
+                "model": route.model_key,
+                "replaced": replaced_fields,
+                "values": {field: entry.values[field] for field in replaced_fields},
+            },
+        }
+        proxy_preamble.append(
+            _make_proxy_event("kinver.proxy.params_replaced", params_replaced_payload)
+        )
 
     # ---- Build & return the SSE stream --------------------------------------
     logger.info(
@@ -565,6 +648,7 @@ async def chat_completions(request: Request) -> StreamingResponse:
             requested_model=requested_model,
             hardware_path=hardware_path,
             auditor_active=auditor_active,
+            proxy_preamble=proxy_preamble,
         ),
         media_type="text/event-stream",
         headers={
@@ -589,6 +673,7 @@ async def _event_stream(
     requested_model: str,
     hardware_path: str,
     auditor_active: bool,
+    proxy_preamble: list[str] | None = None,
 ) -> AsyncIterator[str]:
     """
     Core SSE streaming generator.
@@ -632,6 +717,13 @@ async def _event_stream(
     full_content: list[str] = []
     chunk_seq = 0
     accumulated = ""
+
+    # ---- Yield proxy-injected preamble events -----------------------------
+    # These events (e.g. params_replaced) are emitted before the triage
+    # status chunk so consumers see substitution signals first.
+    if proxy_preamble:
+        for event_line in proxy_preamble:
+            yield event_line
 
     # ---- Yield triage metadata as first SSE chunk ---------------------------
     # Let the frontend know which model was selected and why, so users
@@ -742,6 +834,7 @@ async def _event_stream_with_model_startup(
     requested_model: str,
     hardware_path: str,
     auditor_active: bool,
+    proxy_preamble: list[str] | None = None,
 ) -> AsyncIterator[str]:
     """
     Wrapper around ``_event_stream`` that ensures heavy GPU models are
@@ -867,6 +960,7 @@ async def _event_stream_with_model_startup(
         requested_model=requested_model,
         hardware_path=hardware_path,
         auditor_active=auditor_active,
+        proxy_preamble=proxy_preamble,
     ):
         yield chunk
 
@@ -1044,6 +1138,17 @@ def _make_system_chunk(content: str) -> dict:
             "finish_reason": None,
         }],
     }
+
+
+def _make_proxy_event(event: str, payload: dict) -> str:
+    """
+    Build a top-level SSE event line for proxy-injected signals.
+
+    Returns the full ``event:`` + ``data:`` frame so consumers can
+    distinguish params_replaced/status/tool_stripped/audit_halt events
+    from ordinary model chunks.
+    """
+    return f"event: {event}\ndata: {json.dumps(payload)}\n\n"
 
 
 # ---------------------------------------------------------------------------

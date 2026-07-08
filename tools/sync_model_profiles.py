@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import sys
 import time
 from pathlib import Path
@@ -47,8 +48,8 @@ _MODEL_INTENTS: dict[str, str] = {
 }
 
 _INTENT_DEFAULTS: dict[str, dict[str, Any]] = {
-    "code": {"thinking_budget_tokens": 4096},
-    "chat": {"thinking_budget_tokens": 0},
+    "code": {"temperature": 0.2, "top_p": 0.95, "thinking_budget_tokens": 4096},
+    "chat": {"temperature": 0.7, "top_p": 1.0, "thinking_budget_tokens": 0},
 }
 
 _FALLBACK_ROWS: list[dict[str, Any]] = [
@@ -68,36 +69,63 @@ def derive_max_tokens(context_window: int) -> int:
 
 
 def fetch_model_card(hf_model_id: str, client: httpx.Client) -> Optional[dict[str, Any]]:
-    """Fetch ``config.json`` from a HF model repo, or ``None`` on failure."""
-    url = f"https://huggingface.co/{hf_model_id}/resolve/main/config.json"
+    """Fetch the model card (``README.md``) from a HF model repo, or ``None`` on failure.
+
+    Sampling parameters are documented in the README, not in ``config.json``
+    (which carries architecture and tokenizer details).  We return a small
+    wrapper ``{"readme": <text>}`` so the parser has the raw markdown to
+    extract sampling recommendations from.
+    """
+    url = f"https://huggingface.co/{hf_model_id}/resolve/main/README.md"
     try:
         response = client.get(url, follow_redirects=True, timeout=30.0)
         response.raise_for_status()
-        return response.json()
+        return {"readme": response.text}
     except Exception as exc:
         logger.warning("Could not fetch model card for %s: %s", hf_model_id, exc)
         return None
 
 
-def parse_sampling_params(card: dict[str, Any], hf_model_id: str) -> Optional[dict[str, Any]]:
-    """Extract recommended sampling parameters from a HF config.json.
+# Match the first numeric value following a "temperature" mention.  Tolerant of:
+#   "temperature of $0.6$"          → 0.6
+#   "temperature: 0.7"              → 0.7
+#   "temperature = 0.5-0.7 (recommended)"  → 0.5  (first number; closer to model default)
+#   "Set the temperature within 0.5-0.7"   → 0.5
+_TEMP_RE = re.compile(
+    r"temperature[:\s=]+(?:of\s+|within\s+|range\s+of\s+)?\$?(\d+\.?\d*)",
+    re.IGNORECASE,
+)
+# Match the first numeric value following a "top_p" / "top-p" mention.
+_TOP_P_RE = re.compile(
+    r"top[-_\s]?p[:\s=]+(?:of\s+|value\s+of\s+|is\s+)?\$?(\d+\.?\d*)",
+    re.IGNORECASE,
+)
 
-    Returns ``None`` when the card itself is unparseable.  An empty dict is
-    returned for a parseable card that simply carries no temperature/top_p.
+
+def parse_sampling_params(card: dict[str, Any], hf_model_id: str) -> Optional[dict[str, Any]]:
+    """Extract recommended sampling parameters from a HF model card (README).
+
+    Returns a dict of any parameters found, or ``None`` when the card is
+    unparseable / fetchable.  An empty dict means the card was readable but
+    carried no temperature / top_p (caller should fall back to intent defaults).
     """
     if not isinstance(card, dict):
         logger.warning("Unparseable model card for %s: not a JSON object", hf_model_id)
         return None
 
+    readme = card.get("readme", "")
+    if not isinstance(readme, str) or not readme:
+        return {}
+
     params: dict[str, Any] = {}
 
-    card_temperature = card.get("temperature")
-    if isinstance(card_temperature, (int, float)):
-        params["temperature"] = float(card_temperature)
+    temp_match = _TEMP_RE.search(readme)
+    if temp_match:
+        params["temperature"] = float(temp_match.group(1))
 
-    card_top_p = card.get("top_p")
-    if isinstance(card_top_p, (int, float)):
-        params["top_p"] = float(card_top_p)
+    top_p_match = _TOP_P_RE.search(readme)
+    if top_p_match:
+        params["top_p"] = float(top_p_match.group(1))
 
     return params
 
@@ -126,6 +154,9 @@ def build_profile_entry(
         "file_type": meta.file_type,
         "context_window": meta.context_length,
         "max_tokens": overrides.get("max_tokens", derive_max_tokens(meta.context_length)),
+        # Intent defaults are the baseline for creative-direction params.
+        "temperature": intent_defaults.get("temperature"),
+        "top_p": intent_defaults.get("top_p"),
         "thinking_budget_tokens": overrides.get(
             "thinking_budget_tokens", intent_defaults.get("thinking_budget_tokens", 0)
         ),
@@ -135,7 +166,7 @@ def build_profile_entry(
         "n": 1,
     }
 
-    # HF sampling: creative direction only.
+    # HF sampling: creative direction; overrides the intent baseline.
     if hf_params:
         for key in ("temperature", "top_p"):
             if key in hf_params:

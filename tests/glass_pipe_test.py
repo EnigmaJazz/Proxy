@@ -215,8 +215,8 @@ class TestSyncModelProfiles:
         assert sync_profiles.derive_max_tokens(1000) == 900
 
     def test_parse_sampling_params_extracts_temperature_and_top_p(self) -> None:
-        """Temperature and top_p are read from a parseable config.json."""
-        card = {"temperature": 0.6, "top_p": 0.95}
+        """Temperature and top_p are read from a HF README."""
+        card = {"readme": "we use a temperature of 0.6, top-p value of 0.95"}
         params = sync_profiles.parse_sampling_params(card, "test")
         assert params is not None
         assert params["temperature"] == 0.6
@@ -224,7 +224,7 @@ class TestSyncModelProfiles:
 
     def test_parse_sampling_params_ignores_context_window(self) -> None:
         """Context window is no longer sourced from HF; only sampling keys matter."""
-        card = {"max_position_embeddings": 32768, "temperature": 0.5}
+        card = {"readme": "max position embeddings is 32768, temperature: 0.5"}
         params = sync_profiles.parse_sampling_params(card, "test")
         assert params is not None
         assert "context_window" not in params
@@ -251,12 +251,14 @@ class TestSyncModelProfiles:
         assert row["context_window"] == 32768
         assert row["max_tokens"] == sync_profiles.derive_max_tokens(32768)
 
-    def test_build_profile_entry_omits_sampling_when_hf_unparseable(self) -> None:
-        """Unparseable HF card emits GGUF facts but omits temperature/top_p."""
+    def test_build_profile_entry_uses_intent_defaults_when_hf_unparseable(self) -> None:
+        """Unparseable HF card falls back to intent defaults for sampling."""
         meta = GGUFMetadata(architecture="qwen2", context_length=32768, file_type=15, name="Q")
         row = sync_profiles.build_profile_entry("coder", meta, {"overrides": {}}, None)
-        assert "temperature" not in row
-        assert "top_p" not in row
+        # coder maps to intent=code → intent_defaults provides temp/top_p
+        assert row["temperature"] == 0.2
+        assert row["top_p"] == 0.95
+        assert row["thinking_budget_tokens"] == 4096
         assert row["architecture"] == "qwen2"
         assert row["max_tokens"] == sync_profiles.derive_max_tokens(32768)
 

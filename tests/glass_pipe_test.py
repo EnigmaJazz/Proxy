@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import pytest
 import yaml
+from gguf import GGUFWriter
 
 from profile_loader import (
     ModelProfileTable,
@@ -19,7 +20,81 @@ from profile_loader import (
     bucket,
     load_model_profiles,
 )
+from tools.gguf_reader import GGUFMetadata, GGUFReadError, read_gguf_metadata
 import tools.sync_model_profiles as sync_profiles
+
+
+# ---------------------------------------------------------------------------
+# R18 GGUF reader
+# ---------------------------------------------------------------------------
+def _write_synthetic_gguf(
+    path: Path,
+    *,
+    arch: str = "llama",
+    context_length: int | None = 32768,
+    file_type: int = 15,
+    name: str = "Synthetic Model",
+) -> None:
+    """Write a minimal valid GGUF file for testing."""
+    writer = GGUFWriter(path, arch=arch)
+    if context_length is not None:
+        writer.add_context_length(context_length)
+    writer.add_file_type(file_type)
+    writer.add_name(name)
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+
+class TestGGUFReader:
+    """Unit-level behaviour of tools/gguf_reader.py."""
+
+    def test_read_valid_file_returns_metadata(self, tmp_path: Path) -> None:
+        """A valid GGUF file yields a populated GGUFMetadata dataclass."""
+        gguf_path = tmp_path / "valid.gguf"
+        _write_synthetic_gguf(gguf_path, arch="qwen2", context_length=131072, file_type=17)
+
+        meta = read_gguf_metadata(gguf_path)
+        assert meta.architecture == "qwen2"
+        assert meta.context_length == 131072
+        assert meta.file_type == 17
+        assert meta.name == "Synthetic Model"
+
+    def test_missing_file_raises(self, tmp_path: Path) -> None:
+        """A non-existent path raises GGUFReadError naming the file."""
+        missing = tmp_path / "missing.gguf"
+        with pytest.raises(GGUFReadError, match="not found"):
+            read_gguf_metadata(missing)
+
+    def test_missing_architecture_raises(self, tmp_path: Path) -> None:
+        """Missing general.architecture is treated as a critical error."""
+        gguf_path = tmp_path / "no-arch.gguf"
+        _write_synthetic_gguf(gguf_path)
+
+        with patch("tools.gguf_reader._decode_field", side_effect=lambda _r, key: None if key == "general.architecture" else "fallback"):
+            with pytest.raises(GGUFReadError, match="general.architecture"):
+                read_gguf_metadata(gguf_path)
+
+    def test_missing_context_length_raises(self, tmp_path: Path) -> None:
+        """Missing <arch>.context_length is treated as a critical error."""
+        gguf_path = tmp_path / "no-ctx.gguf"
+        _write_synthetic_gguf(gguf_path, arch="llama", context_length=32768)
+
+        def _fake_decode(reader, key):
+            if key == "llama.context_length":
+                return None
+            return read_gguf_metadata.__wrapped__  # not used; fallback below
+
+        with patch("tools.gguf_reader._decode_field") as mock_decode:
+            mock_decode.side_effect = lambda _r, key: {
+                "general.architecture": "llama",
+                "llama.context_length": None,
+                "general.file_type": 15,
+                "general.name": "Synthetic Model",
+            }.get(key)
+            with pytest.raises(GGUFReadError, match="llama.context_length"):
+                read_gguf_metadata(gguf_path)
 
 
 # ---------------------------------------------------------------------------
@@ -132,73 +207,179 @@ class TestProfileFallback:
 # R18 build-time sync
 # ---------------------------------------------------------------------------
 class TestSyncModelProfiles:
-    """Unit-level behaviour of the scraper helpers."""
+    """Unit-level behaviour of the scanner helpers."""
 
     def test_derive_max_tokens_applies_headroom(self) -> None:
         """max_tokens is derived as ``int(context_window * 0.9)``."""
         assert sync_profiles.derive_max_tokens(32768) == 29491
         assert sync_profiles.derive_max_tokens(1000) == 900
 
-    def test_parse_sampling_params_extracts_context_window(self) -> None:
-        """Context window is read from recognised config keys."""
-        card = {"max_position_embeddings": 32768}
+    def test_parse_sampling_params_extracts_temperature_and_top_p(self) -> None:
+        """Temperature and top_p are read from a parseable config.json."""
+        card = {"temperature": 0.6, "top_p": 0.95}
         params = sync_profiles.parse_sampling_params(card, "test")
         assert params is not None
-        assert params["context_window"] == 32768
+        assert params["temperature"] == 0.6
+        assert params["top_p"] == 0.95
 
-    def test_parse_sampling_params_prefers_sliding_window(self) -> None:
-        """When both keys exist, sliding_window wins (larger typical context)."""
-        card = {"max_position_embeddings": 32768, "sliding_window": 131072}
+    def test_parse_sampling_params_ignores_context_window(self) -> None:
+        """Context window is no longer sourced from HF; only sampling keys matter."""
+        card = {"max_position_embeddings": 32768, "temperature": 0.5}
         params = sync_profiles.parse_sampling_params(card, "test")
         assert params is not None
-        assert params["context_window"] == 131072
+        assert "context_window" not in params
+        assert params["temperature"] == 0.5
 
-    def test_parse_sampling_params_returns_none_without_context(self) -> None:
-        """A card with no recognised context key is unparseable."""
+    def test_parse_sampling_params_returns_empty_for_no_sampling_keys(self) -> None:
+        """A parseable card with no sampling keys yields an empty direction dict."""
         card = {"architectures": ["Foo"]}
-        assert sync_profiles.parse_sampling_params(card, "test") is None
+        assert sync_profiles.parse_sampling_params(card, "test") == {}
 
-    def test_build_profile_entry_skips_unparseable_card(self) -> None:
-        """A malformed card causes the model to be skipped, not fatal."""
-        row = sync_profiles.build_profile_entry("coder", "org/model", {"foo": "bar"})
-        assert row is None
+    def test_parse_sampling_params_returns_none_for_non_object(self) -> None:
+        """A non-dict response is unparseable."""
+        assert sync_profiles.parse_sampling_params(["not", "a", "dict"], "test") is None
 
-    def test_build_profile_entry_uses_baseline_when_fetch_fails(self) -> None:
-        """When the HF fetch fails, the operator baseline supplies values."""
-        row = sync_profiles.build_profile_entry("frontdesk", "org/model", None)
-        assert row is not None
-        assert row["model"] == "frontdesk"
-        assert row["intent"] == "chat"
+    def test_build_profile_entry_uses_hf_sampling(self) -> None:
+        """HF temperature/top_p are applied when present."""
+        meta = GGUFMetadata(architecture="qwen2", context_length=32768, file_type=15, name="Q")
+        row = sync_profiles.build_profile_entry(
+            "coder", meta, {"overrides": {}}, {"temperature": 0.1, "top_p": 0.9}
+        )
+        assert row["temperature"] == 0.1
+        assert row["top_p"] == 0.9
+        assert row["architecture"] == "qwen2"
+        assert row["context_window"] == 32768
         assert row["max_tokens"] == sync_profiles.derive_max_tokens(32768)
+
+    def test_build_profile_entry_omits_sampling_when_hf_unparseable(self) -> None:
+        """Unparseable HF card emits GGUF facts but omits temperature/top_p."""
+        meta = GGUFMetadata(architecture="qwen2", context_length=32768, file_type=15, name="Q")
+        row = sync_profiles.build_profile_entry("coder", meta, {"overrides": {}}, None)
+        assert "temperature" not in row
+        assert "top_p" not in row
+        assert row["architecture"] == "qwen2"
+        assert row["max_tokens"] == sync_profiles.derive_max_tokens(32768)
+
+    def test_build_profile_entry_overrides_win(self) -> None:
+        """Per-entry overrides take precedence over HF and GGUF-derived values."""
+        meta = GGUFMetadata(architecture="qwen2", context_length=32768, file_type=15, name="Q")
+        row = sync_profiles.build_profile_entry(
+            "coder", meta, {"overrides": {"temperature": 0.99, "max_tokens": 1234}}, {"temperature": 0.1}
+        )
+        assert row["temperature"] == 0.99
+        assert row["max_tokens"] == 1234
+
+
+class TestScannerSchemaValidation:
+    """local_models.yaml schema enforcement."""
+
+    def test_missing_path_is_config_error(self, tmp_path: Path) -> None:
+        """An entry without 'path' raises ValueError → exit 2."""
+        models = tmp_path / "local_models.yaml"
+        models.write_text("models:\n  badmodel:\n    hf_model_id: org/model\n")
+        with pytest.raises(ValueError, match="missing required 'path'"):
+            sync_profiles.load_local_models(models)
+
+    def test_missing_hf_model_id_is_config_error(self, tmp_path: Path) -> None:
+        """An entry without 'hf_model_id' raises ValueError → exit 2."""
+        models = tmp_path / "local_models.yaml"
+        models.write_text("models:\n  badmodel:\n    path: /tmp/foo.gguf\n")
+        with pytest.raises(ValueError, match="missing required 'hf_model_id'"):
+            sync_profiles.load_local_models(models)
+
+    def test_flat_value_is_config_error(self, tmp_path: Path) -> None:
+        """The old flat 'model_key: hf_model_id' shape is rejected."""
+        models = tmp_path / "local_models.yaml"
+        models.write_text("models:\n  badmodel: org/model\n")
+        with pytest.raises(ValueError, match="mapping with 'path' and 'hf_model_id'"):
+            sync_profiles.load_local_models(models)
+
+
+class TestScannerFileErrors:
+    """Declared file and GGUF critical-field errors."""
+
+    def test_missing_file_aborts_sync(self, tmp_path: Path) -> None:
+        """A declared path that does not exist raises GGUFReadError."""
+        models = tmp_path / "local_models.yaml"
+        models.write_text("models:\n  testmodel:\n    path: /tmp/ghost-file-that-does-not-exist.gguf\n    hf_model_id: org/model\n")
+        with pytest.raises(GGUFReadError, match="not found"):
+            sync_profiles.build_profiles(models, fetcher=lambda _h, _c: {})
+
+    def test_missing_critical_field_aborts_sync(self, tmp_path: Path) -> None:
+        """Missing context_length raises GGUFReadError."""
+        gguf_path = tmp_path / "no-ctx.gguf"
+        _write_synthetic_gguf(gguf_path, arch="llama")
+
+        models = tmp_path / "local_models.yaml"
+        models.write_text(f"models:\n  testmodel:\n    path: {gguf_path}\n    hf_model_id: org/model\n")
+
+        with patch("tools.sync_model_profiles.read_gguf_metadata") as mock_read:
+            mock_read.side_effect = GGUFReadError("Missing llama.context_length")
+            with pytest.raises(GGUFReadError, match="context_length"):
+                sync_profiles.build_profiles(models, fetcher=lambda _h, _c: {})
+
+
+class TestScannerHFUnparseable:
+    """Unparseable HF card handling."""
+
+    def test_unparseable_card_is_skipped_and_logged(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A failed HF fetch logs a warning but the row is still emitted."""
+        gguf_path = tmp_path / "test.gguf"
+        _write_synthetic_gguf(gguf_path, context_length=10000)
+
+        models = tmp_path / "local_models.yaml"
+        models.write_text(f"models:\n  testmodel:\n    path: {gguf_path}\n    hf_model_id: org/badmodel\n")
+
+        def _bad_fetch(hf_model_id: str, client: Any) -> None:
+            return None
+
+        with caplog.at_level(logging.WARNING):
+            data = sync_profiles.build_profiles(models, fetcher=_bad_fetch)
+
+        assert any(r.get("model") == "testmodel" for r in data["profiles"])
+        assert "unparseable" in caplog.text.lower() or "could not fetch" in caplog.text.lower()
 
 
 class TestSyncCheckDrift:
-    """Scraper CLI drift detection and exit-code contract."""
+    """Scanner CLI drift detection and exit-code contract."""
 
     @pytest.fixture
     def tmp_models(self, tmp_path: Path) -> Path:
         """Return a local_models.yaml with one synthetic model."""
+        gguf_path = tmp_path / "test.gguf"
+        _write_synthetic_gguf(gguf_path, context_length=10000)
         models = tmp_path / "local_models.yaml"
-        models.write_text("models:\n  testmodel: org/testmodel\n")
+        models.write_text(
+            f"models:\n"
+            f"  testmodel:\n"
+            f"    path: {gguf_path}\n"
+            f"    hf_model_id: org/testmodel\n"
+        )
         return models
 
     def fake_fetcher(self, context_window: int = 10000) -> Any:
         """Return a fetcher that serves a synthetic config.json."""
         def _fetch(hf_model_id: str, client: Any) -> dict[str, Any]:
-            return {"max_position_embeddings": context_window}
+            return {"temperature": 0.5, "top_p": 0.9}
         return _fetch
 
     def test_check_exits_zero_when_in_sync(self, tmp_path: Path, tmp_models: Path) -> None:
         """sync --check returns 0 when the committed file matches generated data."""
         profiles = tmp_path / "model_profiles.yaml"
-        data = sync_profiles.build_profiles(tmp_models, fetcher=self.fake_fetcher())
+        fetcher = self.fake_fetcher()
+        data = sync_profiles.build_profiles(tmp_models, fetcher=fetcher)
         sync_profiles.write_profiles(profiles, data)
-        assert sync_profiles.check_profiles(tmp_models, profiles) == 0
+        assert sync_profiles.check_profiles(tmp_models, profiles, fetcher=fetcher) == 0
 
     def test_check_exits_one_on_drift(self, tmp_path: Path, tmp_models: Path) -> None:
         """sync --check returns 1 when the committed file is stale."""
         profiles = tmp_path / "model_profiles.yaml"
-        data = sync_profiles.build_profiles(tmp_models, fetcher=self.fake_fetcher())
+        fetcher = self.fake_fetcher()
+        data = sync_profiles.build_profiles(tmp_models, fetcher=fetcher)
         sync_profiles.write_profiles(profiles, data)
 
         # Introduce drift.
@@ -206,7 +387,7 @@ class TestSyncCheckDrift:
         committed["profiles"][0]["max_tokens"] = 12345
         profiles.write_text(yaml.safe_dump(committed))
 
-        assert sync_profiles.check_profiles(tmp_models, profiles) == 1
+        assert sync_profiles.check_profiles(tmp_models, profiles, fetcher=fetcher) == 1
 
     def test_check_exits_two_on_malformed_config(self, tmp_path: Path) -> None:
         """sync --check returns 2 when local_models.yaml is invalid."""
@@ -216,23 +397,18 @@ class TestSyncCheckDrift:
         profiles.write_text("profiles: []\noverrides: {}\n")
         assert sync_profiles.check_profiles(bad_models, profiles) == 2
 
-    def test_unparseable_card_is_skipped_and_logged(
-        self,
-        tmp_path: Path,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """A card with no context_window is skipped with a warning."""
+    def test_check_exits_three_on_missing_file(self, tmp_path: Path) -> None:
+        """sync --check returns 3 when a declared GGUF file is missing."""
         models = tmp_path / "local_models.yaml"
-        models.write_text("models:\n  badmodel: org/badmodel\n")
-
-        def _bad_fetch(hf_model_id: str, client: Any) -> dict[str, Any]:
-            return {"architectures": ["Unknown"]}
-
-        with caplog.at_level(logging.WARNING):
-            data = sync_profiles.build_profiles(models, fetcher=_bad_fetch)
-
-        assert not any(r.get("model") == "badmodel" for r in data["profiles"])
-        assert "skipped" in caplog.text.lower() or "unparseable" in caplog.text.lower()
+        models.write_text(
+            "models:\n"
+            "  testmodel:\n"
+            "    path: /tmp/ghost-file-that-does-not-exist.gguf\n"
+            "    hf_model_id: org/testmodel\n"
+        )
+        profiles = tmp_path / "model_profiles.yaml"
+        profiles.write_text("profiles: []\noverrides: {}\n")
+        assert sync_profiles.check_profiles(models, profiles) == 3
 
 
 class TestCommittedProfiles:

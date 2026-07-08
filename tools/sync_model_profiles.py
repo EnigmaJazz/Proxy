@@ -325,11 +325,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         description="Sync model profiles into config/model_profiles.yaml",
     )
     parser.add_argument(
-        "command",
-        choices=["sync"],
-        help="Subcommand (only 'sync' is supported)",
-    )
-    parser.add_argument(
         "--check",
         action="store_true",
         help="Drift detection mode: exit 0 in sync, 1 on drift, 2 on config error, 3 on file/metadata error",

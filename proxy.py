@@ -98,6 +98,7 @@ from llm import (
 )
 from auditing import ShadowAuditor
 from routing import RouteDecision
+from profile_loader import load_model_profiles, ModelProfileTable
 
 # Route handlers (imported from routes.py)
 from routes import (
@@ -136,6 +137,8 @@ class AppState:
         Domain name of the currently active heavy GPU model.
     requests_served : int
         Total number of requests processed since startup.
+    model_profiles : ModelProfileTable or None
+        Build-time-synced HF model profile table (R18).
     pause_task : asyncio.Task or None
         Active queue-pause timer task.
     transition_pause : asyncio.Event
@@ -154,6 +157,7 @@ class AppState:
         self.active_priority: int = 3  # IDLE
         self.active_heavy_model: Optional[str] = None
         self.requests_served: int = 0
+        self.model_profiles: Optional[ModelProfileTable] = None
         self.pause_task: Optional[asyncio.Task] = None
         self.transition_pause: asyncio.Event = asyncio.Event()
         self.thermal_halt: asyncio.Event = asyncio.Event()
@@ -253,6 +257,11 @@ async def lifespan(app: FastAPI):
         hardware_governor=hw,
     )
     state.auditor = auditor
+
+    # ---- 5.5 Model profiles (R18) ------------------------------------------
+    state.model_profiles = load_model_profiles(
+        PROJECT_ROOT / "config" / "model_profiles.yaml"
+    )
 
     # ---- 6. Background tasks -----------------------------------------------
     # Thermal monitor (reads sensors, enforces shutdown thresholds)

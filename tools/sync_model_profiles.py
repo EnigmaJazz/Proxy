@@ -188,6 +188,10 @@ def extract_with_llm(
     expected to be running on the same machine.  The call is best-effort;
     on any failure (proxy down, model missing, response unparseable) we
     return ``None`` so the caller can fall through to intent defaults.
+
+    The proxy always returns Server-Sent Events (SSE) regardless of the
+    ``stream`` parameter on the request, so we parse the SSE stream and
+    accumulate the ``delta.content`` chunks from chat-completion events.
     """
     system_prompt = (
         "You are an expert at extracting sampling parameters from model "
@@ -202,6 +206,8 @@ def extract_with_llm(
         f"---\n{content}\n---"
     )
     try:
+        # The proxy always returns SSE regardless of the ``stream`` parameter,
+        # so we read the response line-by-line and accumulate content.
         response = client.post(
             extractor_url,
             json={
@@ -217,9 +223,32 @@ def extract_with_llm(
             timeout=EXTRACTOR_TIMEOUT,
         )
         response.raise_for_status()
-        body = response.json()
-        message = body["choices"][0]["message"]["content"]
-        parsed = json.loads(message) if isinstance(message, str) else message
+        accumulated: list[str] = []
+        for line in response.iter_lines():
+            if not line or not line.startswith("data:"):
+                continue
+            payload = line[len("data:"):].strip()
+            if payload == "[DONE]":
+                break
+            try:
+                event = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            choices = event.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            # Reasoning models put output in `reasoning_content`; chat models
+            # in `content`. Check both so the extractor works regardless of
+            # which model the proxy routes to.
+            chunk = delta.get("content") or delta.get("reasoning_content")
+            if isinstance(chunk, str) and chunk:
+                accumulated.append(chunk)
+        message = "".join(accumulated)
+        if not message:
+            logger.warning("Extractor returned no content for %s", source)
+            return None
+        parsed = json.loads(message)
         if not isinstance(parsed, dict):
             logger.warning("Extractor returned non-dict for %s: %r", source, parsed)
             return None

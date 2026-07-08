@@ -10,7 +10,9 @@ Runtime never calls Hugging Face; the committed YAML is the source of truth.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import os
 import re
 import sys
 import time
@@ -68,21 +70,87 @@ def derive_max_tokens(context_window: int) -> int:
     return int(context_window * 0.9)
 
 
-def fetch_model_card(hf_model_id: str, client: httpx.Client) -> Optional[dict[str, Any]]:
-    """Fetch the model card (``README.md``) from a HF model repo, or ``None`` on failure.
+def discover_models(models_dir: Path) -> int:
+    """Walk *models_dir* for ``.gguf`` files and print a YAML template for ``local_models.yaml``.
 
-    Sampling parameters are documented in the README, not in ``config.json``
-    (which carries architecture and tokenizer details).  We return a small
-    wrapper ``{"readme": <text>}`` so the parser has the raw markdown to
-    extract sampling recommendations from.
+    The operator reviews the output, fills in the actual ``hf_model_id`` for each
+    model (the scanner cannot guess the HF repo from a filename — that was the
+    hallucination problem this R18 design deliberately avoids), and pastes the
+    entries into ``config/local_models.yaml`` under the top-level ``models:`` key.
+
+    Exit codes:
+      0 - template printed (or no GGUF files found; logged as a warning)
+      1 - models_dir is not a directory
     """
-    url = f"https://huggingface.co/{hf_model_id}/resolve/main/README.md"
+    if not models_dir.exists():
+        logger.error("Directory not found: %s", models_dir)
+        return 1
+    if not models_dir.is_dir():
+        logger.error("Not a directory: %s", models_dir)
+        return 1
+
+    gguf_files = sorted(models_dir.glob("*.gguf"))
+    if not gguf_files:
+        logger.warning("No GGUF files found in %s", models_dir)
+        return 0
+
+    print(f"# Discovered GGUF files in {models_dir}")
+    print("# Add the entries you want to config/local_models.yaml under `models:`")
+    print("# `sampling_source` is OPTIONAL — point it at any URL (vendor docs, HF")
+    print("# model card, GitHub README, blog post) or local file path that carries")
+    print("# the model's recommended sampling parameters. The scanner parses it")
+    print("# with a tolerant regex; if it can't extract anything, intent defaults")
+    print("# fill in.  See https://huggingface.co/<org>/<model>/raw/main/README.md")
+    print("# for the HF model-card URL shape.")
+    print("models:")
+    seen_keys: set[str] = set()
+    for path in gguf_files:
+        model_key = _filename_to_model_key(path.stem)
+        if model_key in seen_keys:
+            logger.warning("Duplicate model_key %r from %s — rename one before pasting", model_key, path)
+        seen_keys.add(model_key)
+        print(f"  {model_key}:")
+        print(f"    path: {path}")
+        print(f"    sampling_source: <URL or local path to the model's recommended sampling params>")
+    return 0
+
+
+def _filename_to_model_key(stem: str) -> str:
+    """Convert a GGUF filename stem to a ``model_key``.
+
+    Lowercase and replace ``.`` and ``_`` with ``-``.  The operator can rename
+    any collisions or shorten long quantized names (``Qwen3.6-35B-A3B-UD-Q4_K_XL``
+    becomes ``qwen3-6-35b-a3b-ud-q4-k-xl``); the goal here is just a starting
+    point, not a canonical mapping.
+    """
+    return stem.lower().replace("_", "-").replace(".", "-")
+
+
+def fetch_sampling_source(source: str, client: httpx.Client) -> Optional[str]:
+    """Fetch the operator-declared sampling source: an HTTP(S) URL or a local file path.
+
+    Returns the raw text content, or ``None`` on failure.  ``file://`` URLs
+    are also accepted.
+    """
+    if source.startswith(("http://", "https://")):
+        try:
+            response = client.get(source, follow_redirects=True, timeout=30.0)
+            response.raise_for_status()
+            return response.text
+        except Exception as exc:
+            logger.warning("Could not fetch %s: %s", source, exc)
+            return None
+    if source.startswith("file://"):
+        path = Path(source[len("file://"):])
+    else:
+        path = Path(source)
+    if not path.exists():
+        logger.warning("Sampling source not found: %s", path)
+        return None
     try:
-        response = client.get(url, follow_redirects=True, timeout=30.0)
-        response.raise_for_status()
-        return {"readme": response.text}
+        return path.read_text(encoding="utf-8")
     except Exception as exc:
-        logger.warning("Could not fetch model card for %s: %s", hf_model_id, exc)
+        logger.warning("Could not read %s: %s", path, exc)
         return None
 
 
@@ -102,28 +170,89 @@ _TOP_P_RE = re.compile(
 )
 
 
-def parse_sampling_params(card: dict[str, Any], hf_model_id: str) -> Optional[dict[str, Any]]:
-    """Extract recommended sampling parameters from a HF model card (README).
+EXTRACTOR_MODEL_DEFAULT = "coder"
+EXTRACTOR_URL_DEFAULT = os.environ.get("PROXY_EXTRACTOR_URL", "http://localhost:13000/v1/chat/completions")
+EXTRACTOR_TIMEOUT = float(os.environ.get("PROXY_EXTRACTOR_TIMEOUT", "60"))
 
-    Returns a dict of any parameters found, or ``None`` when the card is
-    unparseable / fetchable.  An empty dict means the card was readable but
-    carried no temperature / top_p (caller should fall back to intent defaults).
+
+def extract_with_llm(
+    content: str,
+    source: str,
+    client: httpx.Client,
+    extractor_model: str = EXTRACTOR_MODEL_DEFAULT,
+    extractor_url: str = EXTRACTOR_URL_DEFAULT,
+) -> Optional[dict[str, Any]]:
+    """Ask the proxy's own model to extract sampling parameters from *content*.
+
+    The proxy serves a local GGUF model (default: ``coder``) and is
+    expected to be running on the same machine.  The call is best-effort;
+    on any failure (proxy down, model missing, response unparseable) we
+    return ``None`` so the caller can fall through to intent defaults.
     """
-    if not isinstance(card, dict):
-        logger.warning("Unparseable model card for %s: not a JSON object", hf_model_id)
+    system_prompt = (
+        "You are an expert at extracting sampling parameters from model "
+        "documentation. Respond with a JSON object containing 'temperature' "
+        "and/or 'top_p' fields with numeric values. If no recommendations "
+        "are found, respond with an empty JSON object. Do not include any "
+        "other text."
+    )
+    user_prompt = (
+        f"Extract the recommended sampling parameters (temperature, top_p) "
+        f"from this documentation for the model. Return ONLY a JSON object.\n\n"
+        f"---\n{content}\n---"
+    )
+    try:
+        response = client.post(
+            extractor_url,
+            json={
+                "model": extractor_model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "response_format": {"type": "json_object"},
+                "temperature": 0.2,
+                "top_p": 0.95,
+            },
+            timeout=EXTRACTOR_TIMEOUT,
+        )
+        response.raise_for_status()
+        body = response.json()
+        message = body["choices"][0]["message"]["content"]
+        parsed = json.loads(message) if isinstance(message, str) else message
+        if not isinstance(parsed, dict):
+            logger.warning("Extractor returned non-dict for %s: %r", source, parsed)
+            return None
+        params: dict[str, Any] = {}
+        if isinstance(parsed.get("temperature"), (int, float)):
+            params["temperature"] = float(parsed["temperature"])
+        if isinstance(parsed.get("top_p"), (int, float)):
+            params["top_p"] = float(parsed["top_p"])
+        if params:
+            logger.info("LLM extractor returned %s for %s", params, source)
+        return params or None
+    except Exception as exc:
+        logger.warning("LLM extraction failed for %s: %s", source, exc)
         return None
 
-    readme = card.get("readme", "")
-    if not isinstance(readme, str) or not readme:
-        return {}
+
+def parse_sampling_params(content: str, source: str) -> dict[str, Any]:
+    """Extract recommended sampling parameters from a sampling source.
+
+    Returns a dict of any parameters found.  An empty dict means the content
+    was readable but carried no temperature / top_p (caller should fall back
+    to intent defaults).  Returns ``None`` when the content is empty/unreadable.
+    """
+    if not isinstance(content, str) or not content:
+        return None
 
     params: dict[str, Any] = {}
 
-    temp_match = _TEMP_RE.search(readme)
+    temp_match = _TEMP_RE.search(content)
     if temp_match:
         params["temperature"] = float(temp_match.group(1))
 
-    top_p_match = _TOP_P_RE.search(readme)
+    top_p_match = _TOP_P_RE.search(content)
     if top_p_match:
         params["top_p"] = float(top_p_match.group(1))
 
@@ -181,11 +310,15 @@ def build_profile_entry(
 
 
 def load_local_models(path: Path) -> dict[str, dict[str, Any]]:
-    """Read ``local_models.yaml`` into ``{model_key: {path, hf_model_id, overrides?}}``.
+    """Read ``local_models.yaml`` into ``{model_key: {path, sampling_source?, overrides?}}``.
+
+    ``path`` is required.  ``sampling_source`` is optional — when omitted, the
+    scanner uses the intent defaults for sampling parameters without trying
+    to fetch a source.  ``overrides`` is optional per-entry tuning.
 
     Raises:
         ValueError: if the YAML is malformed or any entry is missing the
-            required ``path`` or ``hf_model_id`` field.
+            required ``path`` field.
     """
     with path.open("r", encoding="utf-8") as handle:
         data = yaml.safe_load(handle)
@@ -200,15 +333,13 @@ def load_local_models(path: Path) -> dict[str, dict[str, Any]]:
     for model_key, raw_entry in models.items():
         if not isinstance(raw_entry, dict):
             raise ValueError(
-                f"Entry '{model_key}' must be a mapping with 'path' and 'hf_model_id'"
+                f"Entry '{model_key}' must be a mapping with 'path'"
             )
         if "path" not in raw_entry:
             raise ValueError(f"Entry '{model_key}' is missing required 'path'")
-        if "hf_model_id" not in raw_entry:
-            raise ValueError(f"Entry '{model_key}' is missing required 'hf_model_id'")
         result[str(model_key)] = {
             "path": Path(raw_entry["path"]),
-            "hf_model_id": str(raw_entry["hf_model_id"]),
+            "sampling_source": raw_entry.get("sampling_source"),
             "overrides": raw_entry.get("overrides", {}),
         }
     return result
@@ -216,41 +347,60 @@ def load_local_models(path: Path) -> dict[str, dict[str, Any]]:
 
 def build_profiles(
     local_models_path: Path,
-    fetcher: Optional[Callable[[str, httpx.Client], Optional[dict[str, Any]]]] = None,
+    fetcher: Optional[Callable[[str, httpx.Client], Optional[str]]] = None,
+    extractor: Optional[Callable[[str, str, httpx.Client], Optional[dict[str, Any]]]] = None,
+    extractor_model: str = EXTRACTOR_MODEL_DEFAULT,
 ) -> dict[str, Any]:
     """Generate the full profile YAML structure from ``local_models.yaml``.
+
+    For each entry with a ``sampling_source``:
+      1. Fetch the source content
+      2. Try the regex parser (fast, deterministic)
+      3. If the regex didn't extract anything, fall back to the LLM extractor
+         (the proxy's own model, default ``coder``)
+      4. If both fail, the row uses intent defaults for sampling parameters
 
     Raises:
         ValueError: malformed ``local_models.yaml`` or missing required fields.
         GGUFReadError: declared file missing or missing critical GGUF fields.
     """
-    fetcher = fetcher or fetch_model_card
+    fetcher = fetcher or fetch_sampling_source
+    extractor = extractor or extract_with_llm
     models = load_local_models(local_models_path)
 
     rows: list[dict[str, Any]] = []
     with httpx.Client() as client:
         for model_key, entry in models.items():
             path = entry["path"]
-            hf_model_id = entry["hf_model_id"]
+            sampling_source = entry.get("sampling_source")
 
             logger.info("Reading GGUF metadata for %s from %s", model_key, path)
             meta = read_gguf_metadata(path)
 
-            logger.info("Fetching HF card for %s (%s)", model_key, hf_model_id)
-            card = fetcher(hf_model_id, client)
-            if card is None:
-                logger.warning(
-                    "Unparseable HF card for %s (%s) — emitting GGUF facts only",
-                    model_key, hf_model_id,
-                )
-                hf_params: Optional[dict[str, Any]] = None
-            else:
-                hf_params = parse_sampling_params(card, hf_model_id)
-                if hf_params is None:
+            hf_params: Optional[dict[str, Any]] = None
+            if sampling_source:
+                logger.info("Fetching sampling source for %s (%s)", model_key, sampling_source)
+                content = fetcher(sampling_source, client)
+                if content is None:
                     logger.warning(
-                        "Unparseable HF card for %s (%s) — emitting GGUF facts only",
-                        model_key, hf_model_id,
+                        "Unparseable sampling source for %s (%s) — emitting GGUF facts only",
+                        model_key, sampling_source,
                     )
+                else:
+                    hf_params = parse_sampling_params(content, sampling_source)
+                    if not hf_params:
+                        logger.info(
+                            "Regex didn't extract params from %s — falling back to LLM extractor",
+                            sampling_source,
+                        )
+                        hf_params = extractor(content, sampling_source, client, extractor_model)
+                        if not hf_params:
+                            logger.warning(
+                                "LLM extractor returned no params for %s — using intent defaults",
+                                sampling_source,
+                            )
+            else:
+                logger.info("No sampling_source for %s — using intent defaults", model_key)
 
             row = build_profile_entry(model_key, meta, entry, hf_params)
             rows.append(row)
@@ -288,7 +438,9 @@ def profiles_equal(left: dict[str, Any], right: dict[str, Any]) -> bool:
 def check_profiles(
     local_models_path: Path,
     profiles_path: Path,
-    fetcher: Optional[Callable[[str, httpx.Client], Optional[dict[str, Any]]]] = None,
+    fetcher: Optional[Callable[[str, httpx.Client], Optional[str]]] = None,
+    extractor: Optional[Callable[[str, str, httpx.Client], Optional[dict[str, Any]]]] = None,
+    extractor_model: str = EXTRACTOR_MODEL_DEFAULT,
 ) -> int:
     """
     Regenerate profiles and compare with the committed file.
@@ -300,7 +452,9 @@ def check_profiles(
       3 - declared file missing or GGUF critical fields missing
     """
     try:
-        generated = build_profiles(local_models_path, fetcher=fetcher)
+        generated = build_profiles(
+            local_models_path, fetcher=fetcher, extractor=extractor, extractor_model=extractor_model
+        )
     except (FileNotFoundError, ValueError, yaml.YAMLError) as exc:
         logger.error("Invalid local_models.yaml: %s", exc)
         return 2
@@ -377,6 +531,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         default=DEFAULT_PROFILES_PATH,
         help=f"Path to model_profiles.yaml (default: {DEFAULT_PROFILES_PATH})",
     )
+    parser.add_argument(
+        "--extractor",
+        default=EXTRACTOR_MODEL_DEFAULT,
+        help=f"Model name to use as the LLM extractor fallback (default: {EXTRACTOR_MODEL_DEFAULT})",
+    )
     args = parser.parse_args(argv)
 
     if args.check and args.watch:
@@ -390,10 +549,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     if args.check:
-        return check_profiles(args.models, args.profiles)
+        return check_profiles(args.models, args.profiles, extractor_model=args.extractor)
 
     try:
-        data = build_profiles(args.models)
+        data = build_profiles(args.models, extractor_model=args.extractor)
     except (FileNotFoundError, ValueError, yaml.YAMLError) as exc:
         logger.error("Invalid local_models.yaml: %s", exc)
         return 2

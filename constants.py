@@ -249,7 +249,6 @@ STOP_SEQS: list[str] = [
 # core sampling parameters (temperature, top_p, max_tokens) which are read
 # explicitly in routes.py.
 OPENAI_FORWARD_FIELDS: tuple[str, ...] = (
-    "tool_choice",
     "parallel_tool_calls",
     "frequency_penalty",
     "presence_penalty",

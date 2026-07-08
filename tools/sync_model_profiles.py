@@ -1,13 +1,15 @@
 """
-tools/sync_model_profiles.py - Build-time sync of HF model profiles.
+tools/sync_model_profiles.py - Build-time sync of model profiles.
 
 Generates ``config/model_profiles.yaml`` from ``config/local_models.yaml``.
+The scanner treats actual GGUF files on disk as the source of truth for
+architecture, context window, and quantization.  Hugging Face is consulted
+per declared ``hf_model_id`` for recommended sampling parameters only.
 Runtime never calls Hugging Face; the committed YAML is the source of truth.
 """
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import sys
 import time
@@ -20,6 +22,7 @@ import yaml
 # Make constants importable whether this script is run from repo root or tools/.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from constants import get_logger  # noqa: E402
+from tools.gguf_reader import GGUFMetadata, GGUFReadError, read_gguf_metadata  # noqa: E402
 
 logger = get_logger("proxy.sync_model_profiles")
 
@@ -27,21 +30,25 @@ CONFIG_ROOT = Path(__file__).resolve().parent.parent / "config"
 DEFAULT_MODELS_PATH = CONFIG_ROOT / "local_models.yaml"
 DEFAULT_PROFILES_PATH = CONFIG_ROOT / "model_profiles.yaml"
 
-HF_API_ROOT = "https://huggingface.co/api/models"
+# Model keys map to a single intent bucket used in the generated YAML.
+# This is the only remaining model_key→intent mapping; numeric baselines
+# were retired when GGUF became the ground-truth source of context_window.
+_MODEL_INTENTS: dict[str, str] = {
+    "reasoning": "code",
+    "coder": "code",
+    "professional": "code",
+    "architect": "code",
+    "creative": "chat",
+    "scholar": "chat",
+    "worker": "code",
+    "chatter": "chat",
+    "frontdesk": "chat",
+    "lifeboat": "chat",
+}
 
-# Fallback values used when a model is gated / unreachable at build time.
-# These are the operator-curated baselines; per-deployment overrides win.
-_BASELINES: dict[str, dict[str, Any]] = {
-    "reasoning":    {"intent": "code", "context_window": 131072, "temperature": 0.6, "top_p": 0.95, "thinking_budget_tokens": 4096},
-    "coder":        {"intent": "code", "context_window": 131072, "temperature": 0.1, "top_p": 0.90, "thinking_budget_tokens": 4096},
-    "professional": {"intent": "code", "context_window": 131072, "temperature": 0.3, "top_p": 0.95, "thinking_budget_tokens": 1024},
-    "architect":    {"intent": "code", "context_window": 131072, "temperature": 0.2, "top_p": 0.95, "thinking_budget_tokens": 4096},
-    "creative":     {"intent": "chat", "context_window": 131072, "temperature": 0.7, "top_p": 1.00, "thinking_budget_tokens": 2048},
-    "scholar":      {"intent": "chat", "context_window": 131072, "temperature": 0.4, "top_p": 0.95, "thinking_budget_tokens": 2048},
-    "worker":       {"intent": "code", "context_window": 131072, "temperature": 0.2, "top_p": 0.95, "thinking_budget_tokens": 2048},
-    "chatter":      {"intent": "chat", "context_window": 32768,  "temperature": 0.7, "top_p": 1.00, "thinking_budget_tokens": 0},
-    "frontdesk":    {"intent": "chat", "context_window": 32768,  "temperature": 0.3, "top_p": 1.00, "thinking_budget_tokens": 0},
-    "lifeboat":     {"intent": "chat", "context_window": 131072, "temperature": 0.7, "top_p": 1.00, "thinking_budget_tokens": 0},
+_INTENT_DEFAULTS: dict[str, dict[str, Any]] = {
+    "code": {"thinking_budget_tokens": 4096},
+    "chat": {"thinking_budget_tokens": 0},
 }
 
 _FALLBACK_ROWS: list[dict[str, Any]] = [
@@ -73,23 +80,16 @@ def fetch_model_card(hf_model_id: str, client: httpx.Client) -> Optional[dict[st
 
 
 def parse_sampling_params(card: dict[str, Any], hf_model_id: str) -> Optional[dict[str, Any]]:
-    """Extract context_window (and optional temperature/top_p) from config.json."""
+    """Extract recommended sampling parameters from a HF config.json.
+
+    Returns ``None`` when the card itself is unparseable.  An empty dict is
+    returned for a parseable card that simply carries no temperature/top_p.
+    """
     if not isinstance(card, dict):
         logger.warning("Unparseable model card for %s: not a JSON object", hf_model_id)
         return None
 
-    context_window = None
-    for key in ("sliding_window", "max_position_embeddings", "max_sequence_length", "n_positions"):
-        value = card.get(key)
-        if isinstance(value, int) and value > 0:
-            context_window = value
-            break
-
-    if context_window is None:
-        logger.warning("Unparseable model card for %s: no context_window found", hf_model_id)
-        return None
-
-    params: dict[str, Any] = {"context_window": context_window}
+    params: dict[str, Any] = {}
 
     card_temperature = card.get("temperature")
     if isinstance(card_temperature, (int, float)):
@@ -104,68 +104,125 @@ def parse_sampling_params(card: dict[str, Any], hf_model_id: str) -> Optional[di
 
 def build_profile_entry(
     model_key: str,
-    hf_model_id: str,
-    card: Optional[dict[str, Any]],
-) -> Optional[dict[str, Any]]:
-    """Compose one ``model_profiles.yaml`` row; returns ``None`` to skip."""
-    baseline = _BASELINES.get(model_key)
-    if baseline is None:
-        logger.warning("No baseline for model_key '%s' — skipping", model_key)
-        return None
+    meta: GGUFMetadata,
+    entry: dict[str, Any],
+    hf_params: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    """Compose one ``model_profiles.yaml`` row.
 
-    if card is None:
-        params: dict[str, Any] = {}
-    else:
-        params = parse_sampling_params(card, hf_model_id)
-        if params is None:
-            return None
+    Precedence: operator ``overrides:`` > HF sampling > GGUF-derived defaults.
+    When *hf_params* is ``None`` (unparseable HF card) the row still carries
+    GGUF facts and max_tokens; temperature/top_p are omitted so the runtime
+    resolver falls back to legacy intent defaults.
+    """
+    overrides = entry.get("overrides", {}) if isinstance(entry, dict) else {}
+    intent = _MODEL_INTENTS.get(model_key, "chat")
+    intent_defaults = _INTENT_DEFAULTS.get(intent, {})
 
-    context_window = params.get("context_window", baseline["context_window"])
     row: dict[str, Any] = {
         "model": model_key,
-        "intent": baseline["intent"],
-        "context_window": context_window,
-        "max_tokens": derive_max_tokens(context_window),
-        "temperature": params.get("temperature", baseline["temperature"]),
-        "top_p": params.get("top_p", baseline["top_p"]),
-        "thinking_budget_tokens": baseline["thinking_budget_tokens"],
+        "intent": intent,
+        "architecture": meta.architecture,
+        "file_type": meta.file_type,
+        "context_window": meta.context_length,
+        "max_tokens": overrides.get("max_tokens", derive_max_tokens(meta.context_length)),
+        "thinking_budget_tokens": overrides.get(
+            "thinking_budget_tokens", intent_defaults.get("thinking_budget_tokens", 0)
+        ),
         "seed": None,
         "top_logprobs": None,
         "response_format": None,
         "n": 1,
     }
+
+    # HF sampling: creative direction only.
+    if hf_params:
+        for key in ("temperature", "top_p"):
+            if key in hf_params:
+                row[key] = hf_params[key]
+
+    # Per-entry overrides win over everything.
+    for key, value in overrides.items():
+        if key in _R11_KEYS or key in ("temperature", "top_p", "max_tokens", "thinking_budget_tokens"):
+            row[key] = value
+
     return row
 
 
-def load_local_models(path: Path) -> dict[str, str]:
-    """Load ``local_models.yaml`` and return the ``model_key -> hf_model_id`` map."""
+def load_local_models(path: Path) -> dict[str, dict[str, Any]]:
+    """Read ``local_models.yaml`` into ``{model_key: {path, hf_model_id, overrides?}}``.
+
+    Raises:
+        ValueError: if the YAML is malformed or any entry is missing the
+            required ``path`` or ``hf_model_id`` field.
+    """
     with path.open("r", encoding="utf-8") as handle:
         data = yaml.safe_load(handle)
+
     if not isinstance(data, dict):
         raise ValueError("local_models.yaml must contain a top-level mapping")
     models = data.get("models")
     if not isinstance(models, dict):
         raise ValueError("local_models.yaml must contain a 'models' mapping")
-    return {str(k): str(v) for k, v in models.items()}
+
+    result: dict[str, dict[str, Any]] = {}
+    for model_key, raw_entry in models.items():
+        if not isinstance(raw_entry, dict):
+            raise ValueError(
+                f"Entry '{model_key}' must be a mapping with 'path' and 'hf_model_id'"
+            )
+        if "path" not in raw_entry:
+            raise ValueError(f"Entry '{model_key}' is missing required 'path'")
+        if "hf_model_id" not in raw_entry:
+            raise ValueError(f"Entry '{model_key}' is missing required 'hf_model_id'")
+        result[str(model_key)] = {
+            "path": Path(raw_entry["path"]),
+            "hf_model_id": str(raw_entry["hf_model_id"]),
+            "overrides": raw_entry.get("overrides", {}),
+        }
+    return result
 
 
 def build_profiles(
     local_models_path: Path,
     fetcher: Optional[Callable[[str, httpx.Client], Optional[dict[str, Any]]]] = None,
 ) -> dict[str, Any]:
-    """Generate the full profile YAML structure from ``local_models.yaml``."""
+    """Generate the full profile YAML structure from ``local_models.yaml``.
+
+    Raises:
+        ValueError: malformed ``local_models.yaml`` or missing required fields.
+        GGUFReadError: declared file missing or missing critical GGUF fields.
+    """
     fetcher = fetcher or fetch_model_card
     models = load_local_models(local_models_path)
 
     rows: list[dict[str, Any]] = []
     with httpx.Client() as client:
-        for model_key, hf_model_id in models.items():
+        for model_key, entry in models.items():
+            path = entry["path"]
+            hf_model_id = entry["hf_model_id"]
+
+            logger.info("Reading GGUF metadata for %s from %s", model_key, path)
+            meta = read_gguf_metadata(path)
+
+            logger.info("Fetching HF card for %s (%s)", model_key, hf_model_id)
             card = fetcher(hf_model_id, client)
-            row = build_profile_entry(model_key, hf_model_id, card)
-            if row:
-                rows.append(row)
+            if card is None:
+                logger.warning(
+                    "Unparseable HF card for %s (%s) — emitting GGUF facts only",
+                    model_key, hf_model_id,
+                )
+                hf_params: Optional[dict[str, Any]] = None
             else:
-                logger.warning("Skipped model '%s' (%s)", model_key, hf_model_id)
+                hf_params = parse_sampling_params(card, hf_model_id)
+                if hf_params is None:
+                    logger.warning(
+                        "Unparseable HF card for %s (%s) — emitting GGUF facts only",
+                        model_key, hf_model_id,
+                    )
+
+            row = build_profile_entry(model_key, meta, entry, hf_params)
+            rows.append(row)
 
     rows.extend(_FALLBACK_ROWS)
 
@@ -197,20 +254,28 @@ def profiles_equal(left: dict[str, Any], right: dict[str, Any]) -> bool:
     )
 
 
-def check_profiles(local_models_path: Path, profiles_path: Path) -> int:
+def check_profiles(
+    local_models_path: Path,
+    profiles_path: Path,
+    fetcher: Optional[Callable[[str, httpx.Client], Optional[dict[str, Any]]]] = None,
+) -> int:
     """
     Regenerate profiles and compare with the committed file.
 
     Exit codes:
       0 - in sync
-      1 - drift detected
+      1 - drift detected (filesystem change or HF card update)
       2 - missing/malformed local_models.yaml
+      3 - declared file missing or GGUF critical fields missing
     """
     try:
-        generated = build_profiles(local_models_path)
+        generated = build_profiles(local_models_path, fetcher=fetcher)
     except (FileNotFoundError, ValueError, yaml.YAMLError) as exc:
         logger.error("Invalid local_models.yaml: %s", exc)
         return 2
+    except GGUFReadError as exc:
+        logger.error("GGUF read error: %s", exc)
+        return 3
 
     try:
         with profiles_path.open("r", encoding="utf-8") as handle:
@@ -257,7 +322,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
 
     parser = argparse.ArgumentParser(
-        description="Sync HF model profiles into config/model_profiles.yaml",
+        description="Sync model profiles into config/model_profiles.yaml",
     )
     parser.add_argument(
         "command",
@@ -267,7 +332,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="Drift detection mode: exit 0 in sync, 1 on drift, 2 on config error",
+        help="Drift detection mode: exit 0 in sync, 1 on drift, 2 on config error, 3 on file/metadata error",
     )
     parser.add_argument(
         "--watch",
@@ -301,7 +366,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.check:
         return check_profiles(args.models, args.profiles)
 
-    data = build_profiles(args.models)
+    try:
+        data = build_profiles(args.models)
+    except (FileNotFoundError, ValueError, yaml.YAMLError) as exc:
+        logger.error("Invalid local_models.yaml: %s", exc)
+        return 2
+    except GGUFReadError as exc:
+        logger.error("GGUF read error: %s", exc)
+        return 3
+
     write_profiles(args.profiles, data)
     logger.info("Wrote %d profile rows to %s", len(data["profiles"]), args.profiles)
     return 0

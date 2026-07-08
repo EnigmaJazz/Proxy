@@ -1,0 +1,17 @@
+# Maps proxy model_key → operator-declared file (REQUIRED path) + REQUIRED
+# hf_model_id. The scanner VERIFIES each path exists on disk and reads its
+# GGUF header. BOTH `path` and `hf_model_id` are REQUIRED: an entry missing
+# either is a config error → exit 2. Path MUST exist and be readable →
+# exit 3 on miss. Run `tools/sync_model_profiles.py sync` after editing.
+#
+# Schema shift: the shipped flat map (commit 85cfc3a) was `model_key: hf_model_id`.
+# The pivot nests `path` + `hf_model_id` under each entry. `overrides:` here is
+# the PER-ENTRY layer, baked into the row at sync time; the top-level
+# `overrides:` in model_profiles.yaml is the PER-DEPLOYMENT layer applied at load.
+models:
+  reasoning:
+    path: /home/james/kinver-hub/models/Planner-Auditor.gguf
+    hf_model_id: deepseek-ai/DeepSeek-R1-Distill-Llama-8B
+  architect:
+    path: /home/james/kinver-hub/models/Architect.gguf
+    hf_model_id: google/gemma-4-26b-it

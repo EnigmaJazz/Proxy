@@ -821,7 +821,7 @@ async def _event_stream(
 # ---------------------------------------------------------------------------
 
 # Heavy GPU models that may need cold-starting before streaming
-_HEAVY_MODEL_KEYS = {"professional", "coder", "creative", "scholar", "architect"}
+_HEAVY_MODEL_KEYS = {"professional", "coder", "creative", "scholar", "architect", "chatter"}
 
 async def _event_stream_with_model_startup(
     state,

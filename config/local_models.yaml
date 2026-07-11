@@ -5,14 +5,30 @@
 # can be any HTTP(S) URL (HF model card, vendor docs, blog post) or a local
 # file path. If omitted or unparseable, intent defaults fill in.
 #
-# This is a worked example of the two paths:
-#   - reasoning:  declares sampling_source (the HF README has usable
-#                 sampling recommendations; the operator opted in).
-#   - architect:  omits sampling_source (the HF model is gated; intent
-#                 defaults cover the row without a wasted 401 fetch).
+# model_keys MUST match the proxy's ROUTE_MAP in routing.py:
+#   CHAT→chatter, TOOL→worker, CODE→professional, SCHOLAR→scholar,
+#   CREATIVE→creative, ARCHITECT→architect
+#   (lifeboat, frontdesk, reasoning are CPU/agent roles, not in ROUTE_MAP
+#    but still need entries for R17 profile resolution)
 models:
   reasoning:
     path: ~/kinver-hub/models/Planner-Auditor.gguf
     sampling_source: https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Llama-8B/raw/main/README.md
   architect:
     path: ~/kinver-hub/models/Architect.gguf
+  worker:
+    path: ~/kinver-hub/models/Worker.gguf
+  coder:
+    path: ~/kinver-hub/models/Coder.gguf
+  professional:
+    path: ~/kinver-hub/models/Professional.gguf
+  creative:
+    path: ~/kinver-hub/models/Creative.gguf
+  scholar:
+    path: ~/kinver-hub/models/Scholar.gguf
+  chatter:
+    path: ~/kinver-hub/models/Lifeboat.gguf
+  frontdesk:
+    path: ~/kinver-hub/models/Front-Desk.gguf
+  lifeboat:
+    path: ~/kinver-hub/models/Lifeboat.gguf

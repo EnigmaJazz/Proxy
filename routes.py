@@ -357,12 +357,17 @@ async def chat_completions(request: Request) -> StreamingResponse:
     # classification entirely and keep Worker — reclassifying mid-tool-flow
     # causes wrongful model switches (CODE → Professional, TOOL → Lifeboat)
     # that break the tool execution chain.
-    has_tool_calls = any(
-        m.get("role") == "assistant" and "tool_calls" in m
-        for m in processed_messages
-    ) or any(
-        m.get("role") == "tool"
-        for m in processed_messages
+    # Check if the LAST message in the conversation is a tool_call or tool
+    # result (mid-tool-flow).  Only skip frontdesk when the model is actively
+    # executing tools — NOT when the user sends a new message after a
+    # previous tool-calling interaction.  This prevents "Tell me a joke"
+    # from being misclassified as TOOL simply because the conversation
+    # history contains old tool_calls.
+    last_msg = processed_messages[-1] if processed_messages else {}
+    has_tool_calls = (
+        last_msg.get("role") == "assistant" and "tool_calls" in last_msg
+    ) or (
+        last_msg.get("role") == "tool"
     )
 
     classification: dict = {

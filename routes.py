@@ -164,6 +164,7 @@ async def chat_completions(request: Request) -> StreamingResponse:
     temperature = body.get("temperature", 0.7)
     top_p = body.get("top_p", 1.0)
     max_tokens = body.get("max_tokens", 4096)
+    thinking_budget_tokens = body.get("thinking_budget_tokens")
 
     # R11 fields beyond temperature/top_p/max_tokens — forwarded in direct
     # mode and overridden by profile values in auto-routed/dream mode.
@@ -526,8 +527,9 @@ async def chat_completions(request: Request) -> StreamingResponse:
         parameters = {**entry.values}
     else:
         # R1/R7 client-wins: when the client picked the model, the client's
-        # temperature/top_p/max_tokens are authoritative. We only fill in
-        # model-specific defaults (thinking_budget_tokens) from the profile.
+        # sampling parameters are authoritative. We only fill in a
+        # model-specific default for thinking_budget_tokens when the client
+        # omitted it.
         parameters = {
             "temperature": temperature,
             "top_p": top_p,
@@ -535,6 +537,8 @@ async def chat_completions(request: Request) -> StreamingResponse:
         }
         if entry is not None and "thinking_budget_tokens" in entry.values:
             parameters["thinking_budget_tokens"] = entry.values["thinking_budget_tokens"]
+        if thinking_budget_tokens is not None:
+            parameters["thinking_budget_tokens"] = thinking_budget_tokens
 
     # ---- Register job in database -------------------------------------------
     job_id = str(uuid.uuid4())

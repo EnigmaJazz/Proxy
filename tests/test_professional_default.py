@@ -5,8 +5,9 @@ Covers REQ-1 through REQ-8 from the Professional Default Routing spec.
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 import pytest_asyncio
 
@@ -230,6 +231,256 @@ class TestProfiles:
             assert entry.values["top_p"] == 0.95
             assert entry.values["max_tokens"] == 235929
             assert entry.values["thinking_budget_tokens"] == 4096
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Integration / payload tests
+# ---------------------------------------------------------------------------
+class _StreamCapture:
+    """Async-generator stand-in for ``stream_llm`` that records its arguments."""
+
+    def __init__(self) -> None:
+        self.endpoint: str | None = None
+        self.payload: dict[str, Any] | None = None
+        self.port: int | None = None
+        self.headers: dict[str, str] | None = None
+
+    async def __call__(self, *, endpoint, payload, port=0, headers=None, **kwargs):
+        self.endpoint = endpoint
+        self.payload = payload
+        self.port = port
+        self.headers = headers
+        yield {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": "ok"},
+                    "finish_reason": "stop",
+                },
+            ],
+        }
+
+
+@pytest_asyncio.fixture
+async def pd_client() -> Any:
+    """Yield an httpx async client against the real app with state stubbed."""
+    from tests.conftest import (
+        _NoOpAuditor,
+        _NoOpCooling,
+        _NoOpDatabase,
+        _NoOpSystemd,
+    )
+
+    proxy.app.state.database = _NoOpDatabase()
+    proxy.app.state.systemd = _NoOpSystemd()
+    proxy.app.state.cooler = _NoOpCooling()
+    proxy.app.state.hardware = None
+    proxy.app.state.auditor = _NoOpAuditor()
+    proxy.app.state.active_heavy_model = None
+    proxy.app.state.active_priority = 3
+    proxy.app.state.requests_served = 0
+    proxy.app.state.model_profiles = _make_profile_table()
+
+    transport = httpx.ASGITransport(app=proxy.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        yield client
+
+
+class TestIntegration:
+    """End-to-end payload and regression tests for Scenarios 1-6."""
+
+    @pytest.mark.asyncio
+    async def test_auto_chat_applies_professional_chat_profile(self, pd_client) -> None:
+        """Scenario-1: auto CHAT → Professional with chat profile values."""
+        capture = _StreamCapture()
+        with patch("routes.stream_llm", new=capture), \
+             patch(
+                 "routes.classify_with_frontdesk",
+                 new=AsyncMock(return_value=_classification("CHAT")),
+             ):
+            response = await pd_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "auto",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "temperature": 0.5,
+                    "top_p": 0.7,
+                    "max_tokens": 1234,
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            await response.aread()
+
+        assert response.status_code == 200, response.text
+        assert capture.endpoint == "professional"
+        assert capture.payload["temperature"] == 0.7
+        assert capture.payload["top_p"] == 1.0
+        assert capture.payload["max_tokens"] == 235929
+        assert capture.payload["thinking_budget_tokens"] == 0
+
+    @pytest.mark.asyncio
+    async def test_auto_tool_applies_professional_code_profile(self, pd_client) -> None:
+        """Scenario-2: auto TOOL → Professional with code profile values."""
+        capture = _StreamCapture()
+        with patch("routes.stream_llm", new=capture), \
+             patch(
+                 "routes.classify_with_frontdesk",
+                 new=AsyncMock(return_value=_classification("TOOL", tools_required=True)),
+             ):
+            response = await pd_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "auto",
+                    "messages": [{"role": "user", "content": "search the web"}],
+                    "tools": [{"type": "function", "function": {"name": "web_search"}}],
+                    "temperature": 0.5,
+                    "top_p": 0.7,
+                    "max_tokens": 1234,
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            await response.aread()
+
+        assert response.status_code == 200, response.text
+        assert capture.endpoint == "professional"
+        assert capture.payload["temperature"] == 0.2
+        assert capture.payload["top_p"] == 0.95
+        assert capture.payload["max_tokens"] == 235929
+        assert capture.payload["thinking_budget_tokens"] == 4096
+
+    @pytest.mark.asyncio
+    async def test_auto_code_applies_professional_code_profile(self, pd_client) -> None:
+        """Scenario-3: auto CODE → Professional with code profile values."""
+        capture = _StreamCapture()
+        with patch("routes.stream_llm", new=capture), \
+             patch(
+                 "routes.classify_with_frontdesk",
+                 new=AsyncMock(return_value=_classification("CODE")),
+             ):
+            response = await pd_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "auto",
+                    "messages": [{"role": "user", "content": "write a python function"}],
+                    "temperature": 0.5,
+                    "top_p": 0.7,
+                    "max_tokens": 1234,
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            await response.aread()
+
+        assert response.status_code == 200, response.text
+        assert capture.endpoint == "professional"
+        assert capture.payload["temperature"] == 0.2
+        assert capture.payload["top_p"] == 0.95
+        assert capture.payload["max_tokens"] == 235929
+        assert capture.payload["thinking_budget_tokens"] == 4096
+
+    @pytest.mark.asyncio
+    async def test_explicit_professional_client_wins(self, pd_client) -> None:
+        """Scenario-4: client names Professional and supplies sampling values."""
+        capture = _StreamCapture()
+        with patch("routes.stream_llm", new=capture), \
+             patch(
+                 "routes.classify_with_frontdesk",
+                 new=AsyncMock(return_value=_classification("CHAT")),
+             ):
+            response = await pd_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "professional",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "temperature": 0.11,
+                    "top_p": 0.22,
+                    "max_tokens": 3333,
+                    "thinking_budget_tokens": 4444,
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            await response.aread()
+
+        assert response.status_code == 200, response.text
+        assert capture.endpoint == "professional"
+        assert capture.payload["temperature"] == 0.11
+        assert capture.payload["top_p"] == 0.22
+        assert capture.payload["max_tokens"] == 3333
+        assert capture.payload["thinking_budget_tokens"] == 4444
+
+    @pytest.mark.asyncio
+    async def test_explicit_chatter_opt_in(self, pd_client) -> None:
+        """Scenario-5: client names chatter → chatter is used."""
+        capture = _StreamCapture()
+        with patch("routes.stream_llm", new=capture), \
+             patch(
+                 "routes.classify_with_frontdesk",
+                 new=AsyncMock(return_value=_classification("CHAT")),
+             ):
+            response = await pd_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "chatter",
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            await response.aread()
+
+        assert response.status_code == 200, response.text
+        assert capture.endpoint == "chatter"
+
+    @pytest.mark.asyncio
+    async def test_explicit_worker_opt_in(self, pd_client) -> None:
+        """Scenario-5: client names worker → worker is used."""
+        capture = _StreamCapture()
+        with patch("routes.stream_llm", new=capture), \
+             patch(
+                 "routes.classify_with_frontdesk",
+                 new=AsyncMock(return_value=_classification("TOOL", tools_required=True)),
+             ):
+            response = await pd_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "worker",
+                    "messages": [{"role": "user", "content": "run a tool"}],
+                    "tools": [{"type": "function", "function": {"name": "web_search"}}],
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            await response.aread()
+
+        assert response.status_code == 200, response.text
+        assert capture.endpoint == "worker"
+
+    @pytest.mark.asyncio
+    async def test_explicit_specialist_opt_in(self, pd_client) -> None:
+        """Scenario-6: client names coder with sampling values."""
+        capture = _StreamCapture()
+        with patch("routes.stream_llm", new=capture), \
+             patch(
+                 "routes.classify_with_frontdesk",
+                 new=AsyncMock(return_value=_classification("CODE")),
+             ):
+            response = await pd_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "coder",
+                    "messages": [{"role": "user", "content": "refactor"}],
+                    "temperature": 0.33,
+                    "top_p": 0.66,
+                    "max_tokens": 5555,
+                    "thinking_budget_tokens": 6666,
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            await response.aread()
+
+        assert response.status_code == 200, response.text
+        assert capture.endpoint == "coder"
+        assert capture.payload["temperature"] == 0.33
+        assert capture.payload["top_p"] == 0.66
+        assert capture.payload["max_tokens"] == 5555
+        assert capture.payload["thinking_budget_tokens"] == 6666
 
 
 # ---------------------------------------------------------------------------

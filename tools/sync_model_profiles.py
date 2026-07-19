@@ -33,20 +33,21 @@ CONFIG_ROOT = Path(__file__).resolve().parent.parent / "config"
 DEFAULT_MODELS_PATH = CONFIG_ROOT / "local_models.yaml"
 DEFAULT_PROFILES_PATH = CONFIG_ROOT / "model_profiles.yaml"
 
-# Model keys map to a single intent bucket used in the generated YAML.
-# This is the only remaining model_key→intent mapping; numeric baselines
-# were retired when GGUF became the ground-truth source of context_window.
-_MODEL_INTENTS: dict[str, str] = {
-    "reasoning": "code",
-    "coder": "code",
-    "professional": "code",
-    "architect": "code",
-    "creative": "chat",
-    "scholar": "chat",
-    "worker": "code",
-    "chatter": "chat",
-    "frontdesk": "chat",
-    "lifeboat": "chat",
+# Model keys map to deterministic intent tuples used in the generated YAML.
+# A model may emit multiple rows (e.g. Professional has both chat and code
+# profiles). Numeric baselines were retired when GGUF became the ground-truth
+# source of context_window.
+_MODEL_INTENTS: dict[str, tuple[str, ...]] = {
+    "reasoning": ("code",),
+    "coder": ("code",),
+    "professional": ("chat", "code"),
+    "architect": ("code",),
+    "creative": ("chat",),
+    "scholar": ("chat",),
+    "worker": ("code",),
+    "chatter": ("chat",),
+    "frontdesk": ("chat",),
+    "lifeboat": ("chat",),
 }
 
 _INTENT_DEFAULTS: dict[str, dict[str, Any]] = {
@@ -290,11 +291,12 @@ def parse_sampling_params(content: str, source: str) -> dict[str, Any]:
 
 def build_profile_entry(
     model_key: str,
+    intent: str,
     meta: GGUFMetadata,
     entry: dict[str, Any],
     hf_params: Optional[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Compose one ``model_profiles.yaml`` row.
+    """Compose one ``model_profiles.yaml`` row for a specific intent.
 
     Precedence: operator ``overrides:`` > HF sampling > GGUF-derived defaults.
     When *hf_params* is ``None`` (unparseable HF card) the row still carries
@@ -302,7 +304,6 @@ def build_profile_entry(
     resolver falls back to legacy intent defaults.
     """
     overrides = entry.get("overrides", {}) if isinstance(entry, dict) else {}
-    intent = _MODEL_INTENTS.get(model_key, "chat")
     intent_defaults = _INTENT_DEFAULTS.get(intent, {})
 
     row: dict[str, Any] = {
@@ -431,8 +432,9 @@ def build_profiles(
             else:
                 logger.info("No sampling_source for %s — using intent defaults", model_key)
 
-            row = build_profile_entry(model_key, meta, entry, hf_params)
-            rows.append(row)
+            for intent in _MODEL_INTENTS.get(model_key, ("chat",)):
+                row = build_profile_entry(model_key, intent, meta, entry, hf_params)
+                rows.append(row)
 
     rows.extend(_FALLBACK_ROWS)
 

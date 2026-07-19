@@ -244,7 +244,7 @@ class TestSyncModelProfiles:
         """HF temperature/top_p are applied when present."""
         meta = GGUFMetadata(architecture="qwen2", context_length=32768, file_type=15, name="Q")
         row = sync_profiles.build_profile_entry(
-            "coder", meta, {"overrides": {}}, {"temperature": 0.1, "top_p": 0.9}
+            "coder", "code", meta, {"overrides": {}}, {"temperature": 0.1, "top_p": 0.9}
         )
         assert row["temperature"] == 0.1
         assert row["top_p"] == 0.9
@@ -255,7 +255,7 @@ class TestSyncModelProfiles:
     def test_build_profile_entry_uses_intent_defaults_when_hf_unparseable(self) -> None:
         """Unparseable HF card falls back to intent defaults for sampling."""
         meta = GGUFMetadata(architecture="qwen2", context_length=32768, file_type=15, name="Q")
-        row = sync_profiles.build_profile_entry("coder", meta, {"overrides": {}}, None)
+        row = sync_profiles.build_profile_entry("coder", "code", meta, {"overrides": {}}, None)
         # coder maps to intent=code → intent_defaults provides temp/top_p
         assert row["temperature"] == 0.2
         assert row["top_p"] == 0.95
@@ -267,10 +267,24 @@ class TestSyncModelProfiles:
         """Per-entry overrides take precedence over HF and GGUF-derived values."""
         meta = GGUFMetadata(architecture="qwen2", context_length=32768, file_type=15, name="Q")
         row = sync_profiles.build_profile_entry(
-            "coder", meta, {"overrides": {"temperature": 0.99, "max_tokens": 1234}}, {"temperature": 0.1}
+            "coder", "code", meta, {"overrides": {"temperature": 0.99, "max_tokens": 1234}}, {"temperature": 0.1}
         )
         assert row["temperature"] == 0.99
         assert row["max_tokens"] == 1234
+
+    def test_build_profile_entry_emits_multiple_intents(self) -> None:
+        """Professional emits both chat and code rows deterministically."""
+        meta = GGUFMetadata(architecture="qwen35moe", context_length=262144, file_type=15, name="P")
+        rows = [
+            sync_profiles.build_profile_entry("professional", "chat", meta, {"overrides": {}}, None),
+            sync_profiles.build_profile_entry("professional", "code", meta, {"overrides": {}}, None),
+        ]
+        assert rows[0]["intent"] == "chat"
+        assert rows[0]["temperature"] == 0.7
+        assert rows[0]["thinking_budget_tokens"] == 0
+        assert rows[1]["intent"] == "code"
+        assert rows[1]["temperature"] == 0.2
+        assert rows[1]["thinking_budget_tokens"] == 4096
 
 
 class TestLLMExtractor:

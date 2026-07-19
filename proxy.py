@@ -449,8 +449,42 @@ async def queue_worker(state: AppState) -> None:
             if db:
                 pending = await db.get_pending_jobs()
                 if not pending and systemd:
-                    await systemd.unload_all_heavy()
-                    state.active_heavy_model = None
+                    await _cleanup_idle_heavy(systemd, state)
+
+
+async def _cleanup_idle_heavy(
+    systemd: SystemdController,
+    state: AppState,
+) -> None:
+    """
+    Idle-queue cleanup for heavy GPU models.
+
+    Professional is the resident default; when it is active we keep it
+    loaded to avoid 30–120 second cold starts on the next default request.
+    Specialists are unloaded normally.  If the controller has lost track of
+    an externally started Professional, we reconcile by probing systemd and
+    keep it resident.  Fail-safe: any probe error skips destructive cleanup.
+    """
+    active = systemd.active_heavy_model
+    if active is None:
+        try:
+            if await systemd.is_active("professional"):
+                active = "professional"
+                systemd.active_heavy_model = active
+        except OSError:
+            logger.warning(
+                "Failed to probe professional service during idle cleanup; "
+                "skipping destructive unload as a fail-safe"
+            )
+            return
+
+    if active == "professional":
+        logger.info("Queue empty — Professional remains resident")
+        state.active_heavy_model = "professional"
+        return
+
+    await systemd.unload_all_heavy()
+    state.active_heavy_model = None
 
 
 # ---------------------------------------------------------------------------

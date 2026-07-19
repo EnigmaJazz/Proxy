@@ -238,7 +238,6 @@ class TestProfiles:
 class TestQueueLifecycle:
     """REQ-7/8: Professional resident preservation and specialist cleanup."""
 
-    @pytest.mark.xfail(reason="pending queue gate implementation")
     @pytest.mark.asyncio
     async def test_cleanup_preserves_professional(self) -> None:
         """Scenario-7: empty queue with Professional active skips unload."""
@@ -251,7 +250,6 @@ class TestQueueLifecycle:
         assert systemd.unloads == 0
         assert state.active_heavy_model == "professional"
 
-    @pytest.mark.xfail(reason="pending queue gate implementation")
     @pytest.mark.asyncio
     async def test_cleanup_unloads_specialist(self) -> None:
         """Specialist active when queue empties → unload and clear state."""
@@ -264,7 +262,6 @@ class TestQueueLifecycle:
         assert systemd.unloads == 1
         assert state.active_heavy_model is None
 
-    @pytest.mark.xfail(reason="pending queue gate implementation")
     @pytest.mark.asyncio
     async def test_cleanup_reconciles_externally_active_professional(self) -> None:
         """Controller state stale; probe finds Professional active."""
@@ -278,7 +275,6 @@ class TestQueueLifecycle:
         assert state.active_heavy_model == "professional"
         assert systemd.unloads == 0
 
-    @pytest.mark.xfail(reason="pending queue gate implementation")
     @pytest.mark.asyncio
     async def test_cleanup_failsafe_on_probe_error(self) -> None:
         """OSError probing Professional is logged; destructive cleanup skipped."""

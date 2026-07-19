@@ -1,0 +1,301 @@
+"""Professional-as-default routing, profiles, and queue lifecycle tests.
+
+Covers REQ-1 through REQ-8 from the Professional Default Routing spec.
+"""
+from __future__ import annotations
+
+from typing import Any
+from unittest.mock import AsyncMock
+
+import pytest
+import pytest_asyncio
+
+import proxy
+from profile_loader import ModelProfileTable
+from routing import RouteDecision, resolve_route_for_lane_a
+
+
+# ---------------------------------------------------------------------------
+# Test helpers
+# ---------------------------------------------------------------------------
+class _FakeSystemd:
+    """Configurable fake systemd for routing tests."""
+
+    def __init__(
+        self,
+        *,
+        occupied: bool = False,
+        active: str | None = None,
+        port: int = 13001,
+    ) -> None:
+        self._occupied = occupied
+        self.active_heavy_model = active
+        self._port = port
+        self.ports_requested: list[str] = []
+        self.unloads: int = 0
+        self.hotswaps: list[tuple[str, str]] = []
+
+    async def get_port(self, domain: str) -> int:
+        self.ports_requested.append(domain)
+        return self._port
+
+    async def is_active(self, domain: str) -> bool:
+        return self.active_heavy_model == domain
+
+    async def unload_all_heavy(self) -> None:
+        self.unloads += 1
+        self.active_heavy_model = None
+
+    async def hot_swap(self, from_domain: str, to_domain: str) -> int:
+        self.hotswaps.append((from_domain, to_domain))
+        self.active_heavy_model = to_domain
+        return self._port
+
+    def is_gpu_occupied(self) -> bool:
+        return self._occupied
+
+
+def _classification(
+    intent: str = "CHAT",
+    *,
+    complexity: str = "low",
+    tools_required: bool = False,
+) -> dict[str, Any]:
+    return {
+        "is_valid": True,
+        "intent": intent,
+        "priority": 2,
+        "complexity": complexity,
+        "project_name": "general",
+        "is_factual": False,
+        "tools_required": tools_required,
+    }
+
+
+def _make_profile_table() -> ModelProfileTable:
+    """Deterministic profile table covering all scenarios."""
+    return ModelProfileTable([
+        {
+            "model": "professional",
+            "intent": "chat",
+            "temperature": 0.7,
+            "top_p": 1.0,
+            "max_tokens": 235929,
+            "thinking_budget_tokens": 0,
+        },
+        {
+            "model": "professional",
+            "intent": "code",
+            "temperature": 0.2,
+            "top_p": 0.95,
+            "max_tokens": 235929,
+            "thinking_budget_tokens": 4096,
+        },
+        {
+            "model": "chatter",
+            "intent": "chat",
+            "temperature": 0.7,
+            "top_p": 1.0,
+            "max_tokens": 235929,
+            "thinking_budget_tokens": 0,
+        },
+        {
+            "model": "worker",
+            "intent": "code",
+            "temperature": 0.2,
+            "top_p": 0.95,
+            "max_tokens": 235929,
+            "thinking_budget_tokens": 4096,
+        },
+    ])
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: Routing
+# ---------------------------------------------------------------------------
+class TestRouting:
+    """REQ-1/2/3: auto CHAT/TOOL/CODE route to Professional."""
+
+    @pytest.mark.asyncio
+    async def test_auto_chat_free_gpu_routes_to_professional(self) -> None:
+        """Scenario-1: CHAT + free GPU → Professional."""
+        systemd = _FakeSystemd(occupied=False)
+        decision = await resolve_route_for_lane_a(
+            _classification("CHAT"), systemd, has_tool_history=False,
+        )
+        assert decision.model_key == "professional"
+        assert decision.is_cpu_fallback is False
+        assert decision.hardware_path == "gpu"
+        assert "professional" in decision.model_key
+
+    @pytest.mark.asyncio
+    async def test_auto_chat_occupied_gpu_lifeboat(self) -> None:
+        """CHAT + GPU occupied by specialist → Lifeboat contention fallback."""
+        systemd = _FakeSystemd(occupied=True, active="coder")
+        decision = await resolve_route_for_lane_a(
+            _classification("CHAT"), systemd, has_tool_history=False,
+        )
+        assert decision.model_key == "lifeboat"
+        assert decision.is_cpu_fallback is True
+        assert decision.hardware_path == "cpu"
+
+    @pytest.mark.asyncio
+    async def test_auto_chat_resident_professional_stays(self) -> None:
+        """CHAT + GPU occupied by resident Professional → Professional."""
+        systemd = _FakeSystemd(occupied=True, active="professional")
+        decision = await resolve_route_for_lane_a(
+            _classification("CHAT"), systemd, has_tool_history=False,
+        )
+        assert decision.model_key == "professional"
+        assert decision.is_cpu_fallback is False
+
+    @pytest.mark.asyncio
+    async def test_auto_tool_free_gpu_routes_to_professional(self) -> None:
+        """Scenario-2: TOOL + free GPU → Professional."""
+        systemd = _FakeSystemd(occupied=False)
+        decision = await resolve_route_for_lane_a(
+            _classification("TOOL", tools_required=True), systemd, has_tool_history=False,
+        )
+        assert decision.model_key == "professional"
+        assert decision.is_cpu_fallback is False
+
+    @pytest.mark.asyncio
+    async def test_auto_tool_mid_flow_forces_professional(self) -> None:
+        """Mid-tool-flow TOOL with specialist active → Professional (Lifeboat rejects history)."""
+        systemd = _FakeSystemd(occupied=True, active="coder")
+        decision = await resolve_route_for_lane_a(
+            _classification("TOOL", tools_required=True), systemd, has_tool_history=True,
+        )
+        assert decision.model_key == "professional"
+        assert decision.tools_required is True
+
+    @pytest.mark.asyncio
+    async def test_auto_tool_occupied_no_history_lifeboat(self) -> None:
+        """TOOL + GPU occupied by specialist, no history → Lifeboat."""
+        systemd = _FakeSystemd(occupied=True, active="coder")
+        decision = await resolve_route_for_lane_a(
+            _classification("TOOL", tools_required=True), systemd, has_tool_history=False,
+        )
+        assert decision.model_key == "lifeboat"
+        assert decision.is_cpu_fallback is True
+
+    @pytest.mark.asyncio
+    async def test_auto_code_routes_to_professional(self) -> None:
+        """Scenario-3: CODE → Professional."""
+        systemd = _FakeSystemd(occupied=False)
+        decision = await resolve_route_for_lane_a(
+            _classification("CODE"), systemd, has_tool_history=False,
+        )
+        assert decision.model_key == "professional"
+        assert decision.is_cpu_fallback is False
+
+    @pytest.mark.asyncio
+    async def test_specialist_intents_unchanged(self) -> None:
+        """SCHOLAR/CREATIVE/ARCHITECT keep their specialist destinations."""
+        for intent, expected in (
+            ("SCHOLAR", "scholar"),
+            ("CREATIVE", "creative"),
+            ("ARCHITECT", "architect"),
+        ):
+            systemd = _FakeSystemd(occupied=False)
+            decision = await resolve_route_for_lane_a(
+                _classification(intent), systemd, has_tool_history=False,
+            )
+            assert decision.model_key == expected, f"{intent} should route to {expected}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Profiles
+# ---------------------------------------------------------------------------
+class TestProfiles:
+    """REQ-4: exact professional/chat and professional/code rows."""
+
+    def test_professional_chat_values(self) -> None:
+        table = _make_profile_table()
+        entry = table.resolve("CHAT", "professional")
+        assert entry is not None
+        assert entry.source == "exact"
+        assert entry.values["temperature"] == 0.7
+        assert entry.values["top_p"] == 1.0
+        assert entry.values["max_tokens"] == 235929
+        assert entry.values["thinking_budget_tokens"] == 0
+
+    def test_professional_code_values(self) -> None:
+        table = _make_profile_table()
+        for intent in ("CODE", "TOOL"):
+            entry = table.resolve(intent, "professional")
+            assert entry is not None
+            assert entry.source == "exact"
+            assert entry.values["temperature"] == 0.2
+            assert entry.values["top_p"] == 0.95
+            assert entry.values["max_tokens"] == 235929
+            assert entry.values["thinking_budget_tokens"] == 4096
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Queue lifecycle
+# ---------------------------------------------------------------------------
+class TestQueueLifecycle:
+    """REQ-7/8: Professional resident preservation and specialist cleanup."""
+
+    @pytest.mark.xfail(reason="pending queue gate implementation")
+    @pytest.mark.asyncio
+    async def test_cleanup_preserves_professional(self) -> None:
+        """Scenario-7: empty queue with Professional active skips unload."""
+        from proxy import _cleanup_idle_heavy
+
+        systemd = _FakeSystemd(active="professional")
+        state = proxy.AppState()
+        state.active_heavy_model = None
+        await _cleanup_idle_heavy(systemd, state)
+        assert systemd.unloads == 0
+        assert state.active_heavy_model == "professional"
+
+    @pytest.mark.xfail(reason="pending queue gate implementation")
+    @pytest.mark.asyncio
+    async def test_cleanup_unloads_specialist(self) -> None:
+        """Specialist active when queue empties → unload and clear state."""
+        from proxy import _cleanup_idle_heavy
+
+        systemd = _FakeSystemd(active="coder")
+        state = proxy.AppState()
+        state.active_heavy_model = "coder"
+        await _cleanup_idle_heavy(systemd, state)
+        assert systemd.unloads == 1
+        assert state.active_heavy_model is None
+
+    @pytest.mark.xfail(reason="pending queue gate implementation")
+    @pytest.mark.asyncio
+    async def test_cleanup_reconciles_externally_active_professional(self) -> None:
+        """Controller state stale; probe finds Professional active."""
+        from proxy import _cleanup_idle_heavy
+
+        systemd = _FakeSystemd(active=None)
+        systemd.is_active = AsyncMock(return_value=True)
+        state = proxy.AppState()
+        state.active_heavy_model = None
+        await _cleanup_idle_heavy(systemd, state)
+        assert state.active_heavy_model == "professional"
+        assert systemd.unloads == 0
+
+    @pytest.mark.xfail(reason="pending queue gate implementation")
+    @pytest.mark.asyncio
+    async def test_cleanup_failsafe_on_probe_error(self) -> None:
+        """OSError probing Professional is logged; destructive cleanup skipped."""
+        from proxy import _cleanup_idle_heavy
+
+        systemd = _FakeSystemd(active=None)
+        systemd.is_active = AsyncMock(side_effect=OSError("probe failed"))
+        state = proxy.AppState()
+        state.active_heavy_model = None
+        await _cleanup_idle_heavy(systemd, state)
+        assert state.active_heavy_model is None
+        assert systemd.unloads == 0
+
+    @pytest.mark.asyncio
+    async def test_specialist_hotswap_not_blocked(self) -> None:
+        """Scenario-8: hotswap from Professional to coder still works."""
+        systemd = _FakeSystemd(active="professional")
+        await systemd.hot_swap("professional", "coder")
+        assert systemd.hotswaps == [("professional", "coder")]
+        assert systemd.active_heavy_model == "coder"

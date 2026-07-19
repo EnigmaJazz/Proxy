@@ -211,8 +211,8 @@ TOOL_KEYWORDS: FrozenSet[str] = frozenset({
 #   of intent — the frontdesk is bypassed entirely.
 # ---------------------------------------------------------------------------
 ROUTE_MAP: Dict[str, str] = {
-    "CHAT":         "chatter",
-    "TOOL":         "worker",
+    "CHAT":         "professional",
+    "TOOL":         "professional",
     "CODE":         "professional",  # 35B MoE
     "SCHOLAR":      "scholar",
     "PROFESSIONAL": "professional",
@@ -517,7 +517,7 @@ def resolve_model(intent: str, is_lane_b: bool = False) -> str:
     """
     if is_lane_b:
         return "professional"
-    return ROUTE_MAP.get(intent, "chatter")
+    return ROUTE_MAP.get(intent, "professional")
 
 
 # ---------------------------------------------------------------------------
@@ -560,103 +560,50 @@ async def resolve_route_for_lane_a(
     is_factual = classification.get("is_factual", False)
     complexity = classification.get("complexity", "low")
 
-    model_key = ROUTE_MAP.get(intent, "chatter")
+    model_key = ROUTE_MAP.get(intent, "professional")
 
-    # ---- Low-complexity CHAT — try Chatter first, fallback to Lifeboat ----
+    # ---- CHAT / TOOL — route to resident Professional when available ----
+    professional_available = (
+        not systemd.is_gpu_occupied()
+        or systemd.active_heavy_model == "professional"
+    )
     if intent == "CHAT" and complexity == "low":
-        if not systemd.is_gpu_occupied():
-            port = await systemd.get_port("chatter")
-            logger.info("Routing CHAT → chatter (GPU free, port %d)", port)
-            return RouteDecision(
-                model_key="chatter",
-                port=port,
-                is_cpu_fallback=False,
-                hardware_path="gpu",
-                priority=priority,
-                intent=intent,
-                project_id=_slugify(project_name),
-                is_factual=is_factual,
-                tools_required=tools_required,
+        model_key = "professional" if professional_available else "lifeboat"
+    elif intent == "TOOL":
+        model_key = (
+            "professional"
+            if professional_available or has_tool_history
+            else "lifeboat"
+        )
+    else:
+        model_key = ROUTE_MAP.get(intent, "professional")
+    port = await systemd.get_port(model_key)
+    is_cpu_fallback = model_key == "lifeboat"
+    hardware_path = "cpu" if is_cpu_fallback else "gpu"
+    tools_required = tools_required or (intent == "TOOL" and has_tool_history)
+
+    if intent in ("CHAT", "TOOL"):
+        if is_cpu_fallback:
+            logger.info(
+                "Routing %s → lifeboat (GPU occupied by %s, port %d)",
+                intent, systemd.active_heavy_model, port,
             )
         else:
-            # GPU is busy with a heavy model → immediate CPU Lifeboat
-            port = await systemd.get_port("lifeboat")
             logger.info(
-                "Routing CHAT → lifeboat (GPU occupied by %s, port %d)",
-                systemd.active_heavy_model, port,
+                "Routing %s → professional (GPU free/resident, port %d)",
+                intent, port,
             )
-            return RouteDecision(
-                model_key="lifeboat",
-                port=port,
-                is_cpu_fallback=True,
-                hardware_path="cpu",
-                priority=priority,
-                intent=intent,
-                project_id=_slugify(project_name),
-                is_factual=is_factual,
-                tools_required=tools_required,
-            )
-
-    # ---- TOOL execution — try Worker first, fallback to Lifeboat ----
-    if intent == "TOOL":
-        if not systemd.is_gpu_occupied():
-            port = await systemd.get_port("worker")
-            logger.info("Routing TOOL → worker (GPU free, port %d)", port)
-            return RouteDecision(
-                model_key="worker",
-                port=port,
-                is_cpu_fallback=False,
-                hardware_path="gpu",
-                priority=priority,
-                intent=intent,
-                project_id=_slugify(project_name),
-                is_factual=is_factual,
-                tools_required=tools_required,
-            )
-        else:
-            # GPU is occupied by a heavy model.  If the conversation already
-            # has tool_call history, we CANNOT fall back to Lifeboat — its
-            # chat template (Jinja) rejects messages with tool_calls/tool_call_id
-            # fields, producing "Only text chunks are supported" errors.
-            # Instead, keep Worker on GPU by using its port directly (Worker
-            # is always running alongside heavy models as a lightweight service).
-            if has_tool_history:
-                port = await systemd.get_port("worker")
-                logger.info(
-                    "Routing TOOL → worker (GPU occupied by %s, but has tool "
-                    "history — Lifeboat template would reject tool_calls, "
-                    "so staying on Worker, port %d)",
-                    systemd.active_heavy_model, port,
-                )
-                return RouteDecision(
-                    model_key="worker",
-                    port=port,
-                    is_cpu_fallback=False,
-                    hardware_path="gpu",
-                    priority=priority,
-                    intent=intent,
-                    project_id=_slugify(project_name),
-                    is_factual=is_factual,
-                    tools_required=True,
-                )
-
-            # No tool history — safe to use Lifeboat
-            port = await systemd.get_port("lifeboat")
-            logger.info(
-                "Routing TOOL → lifeboat (GPU occupied by %s, port %d)",
-                systemd.active_heavy_model, port,
-            )
-            return RouteDecision(
-                model_key="lifeboat",
-                port=port,
-                is_cpu_fallback=True,
-                hardware_path="cpu",
-                priority=priority,
-                intent=intent,
-                project_id=_slugify(project_name),
-                is_factual=is_factual,
-                tools_required=tools_required,
-            )
+        return RouteDecision(
+            model_key=model_key,
+            port=port,
+            is_cpu_fallback=is_cpu_fallback,
+            hardware_path=hardware_path,
+            priority=priority,
+            intent=intent,
+            project_id=_slugify(project_name),
+            is_factual=is_factual,
+            tools_required=tools_required,
+        )
 
     # ---- Heavy intents — route to GPU model, enqueue ----
     port = await systemd.get_port(model_key)

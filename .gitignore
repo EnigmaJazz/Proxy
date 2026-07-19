@@ -230,3 +230,19 @@ ai_queue.db-wal
 
 # Backup directories kept as "snapshots" inside the repo (defeats git history)
 backup_*/
+
+# ---------------------------------------------------------------------------
+# Tooling / IDE / agent transient state — never source code
+# ---------------------------------------------------------------------------
+node_modules/
+.cortexkit/
+.windsurf/
+
+# SDD/openspec transient working state (live changes live under
+# openspec/changes/<name>/, completed work goes to openspec/changes/archive/
+# and is tracked explicitly). The sdd/ mirror is agent scratch space.
+sdd/
+
+# Local brainstorms and design scratch (kept in the working tree for
+# in-progress capture; tracked copies live in openspec/ as needed)
+docs/

@@ -248,3 +248,75 @@ class TestClientNamedModel:
         assert capture.payload["temperature"] == 0.7
         assert capture.payload["top_p"] == 1.0
         assert capture.payload["max_tokens"] == 235929
+
+
+# ---------------------------------------------------------------------------
+# Triage message contract — R19 follow-up
+# ---------------------------------------------------------------------------
+
+class TestTriageMessage:
+    """Triage message must reflect the actual destination, not the
+    (overridden) classifier intent.  The R19 override silently broke
+    the user-facing message: it said 'classified as CHAT' while routing
+    to Professional.
+    """
+
+    def _route(self, model_key: str, intent: str, port: int = 13109) -> Any:
+        from routing import RouteDecision
+        return RouteDecision(
+            model_key=model_key,
+            port=port,
+            is_cpu_fallback=False,
+            hardware_path="gpu",
+            priority=2,
+            intent=intent,
+            project_id="general",
+            is_factual=False,
+            is_lane_b=False,
+        )
+
+    def test_auto_routed_keeps_classifier_intent_in_message(self) -> None:
+        """Standard auto path: message says 'classified as X'."""
+        from routes import _build_triage_message
+        msg = _build_triage_message(
+            self._route(model_key="professional", intent="CODE"),
+            client_named_model=False,
+        )
+        assert "classified as CODE" in msg
+        assert "Professional" in msg
+        assert "Client specified" not in msg
+
+    def test_client_override_message_does_not_lie_about_intent(self) -> None:
+        """R19 override: message must NOT say 'classified as CHAT' when
+        routing to Professional — that was the user-visible bug."""
+        from routes import _build_triage_message
+        msg = _build_triage_message(
+            self._route(model_key="professional", intent="CHAT"),
+            client_named_model=True,
+        )
+        # The misleading "classified as CHAT" must be gone.
+        assert "classified as CHAT" not in msg
+        # The client-specified framing must be present.
+        assert "Client specified" in msg
+        # The model label and port must still be shown.
+        assert "Professional" in msg
+        assert "13109" in msg
+        # The classifier's suggestion is preserved as context, not the
+        # primary classification claim.
+        assert "frontdesk suggested CHAT" in msg
+
+    def test_client_override_mentions_correct_intent(self) -> None:
+        """The classifier's intent is shown for context, regardless of
+        what the classifier actually said."""
+        from routes import _build_triage_message
+        for classified_intent in ("CHAT", "CODE", "CREATIVE", "TOOL"):
+            msg = _build_triage_message(
+                self._route(model_key="professional", intent=classified_intent),
+                client_named_model=True,
+            )
+            assert f"frontdesk suggested {classified_intent}" in msg, (
+                f"expected 'frontdesk suggested {classified_intent}' in {msg!r}"
+            )
+            assert "classified as" not in msg, (
+                f"override message must not say 'classified as': {msg!r}"
+            )

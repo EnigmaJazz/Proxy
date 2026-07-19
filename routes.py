@@ -481,6 +481,7 @@ async def chat_completions(request: Request) -> StreamingResponse:
     # instead of the frontdesk-classified one. Lane B / IDE passthrough is
     # exempt — it always pins "professional" by design.  intent is preserved
     # so the profile lookup for thinking_budget_tokens still works.
+    client_named_model = False
     if (
         not route.is_lane_b
         and requested_model != "auto"
@@ -490,6 +491,7 @@ async def chat_completions(request: Request) -> StreamingResponse:
         route.model_key = requested_model
         route.port = await systemd.get_port(requested_model)
         route.hardware_path = "cpu" if requested_model in CPU_MODELS else "gpu"
+        client_named_model = True
         logger.info(
             "Client-named model override: %s → %s",
             route.model_key, requested_model,
@@ -652,6 +654,7 @@ async def chat_completions(request: Request) -> StreamingResponse:
             hardware_path=hardware_path,
             auditor_active=auditor_active,
             proxy_preamble=proxy_preamble,
+            client_named_model=client_named_model,
         ),
         media_type="text/event-stream",
         headers={
@@ -677,6 +680,7 @@ async def _event_stream(
     hardware_path: str,
     auditor_active: bool,
     proxy_preamble: list[str] | None = None,
+    client_named_model: bool = False,
 ) -> AsyncIterator[str]:
     """
     Core SSE streaming generator.
@@ -732,7 +736,7 @@ async def _event_stream(
     # Let the frontend know which model was selected and why, so users
     # understand the routing decision.  This is informational only and
     # does not affect the conversation content (Glass Pipe Rule).
-    triage_msg = _build_triage_message(route)
+    triage_msg = _build_triage_message(route, client_named_model=client_named_model)
     yield f"data: {json.dumps(_make_system_chunk(triage_msg))}\n\n"
 
     try:
@@ -838,6 +842,7 @@ async def _event_stream_with_model_startup(
     hardware_path: str,
     auditor_active: bool,
     proxy_preamble: list[str] | None = None,
+    client_named_model: bool = False,
 ) -> AsyncIterator[str]:
     """
     Wrapper around ``_event_stream`` that ensures heavy GPU models are
@@ -964,6 +969,7 @@ async def _event_stream_with_model_startup(
         hardware_path=hardware_path,
         auditor_active=auditor_active,
         proxy_preamble=proxy_preamble,
+        client_named_model=client_named_model,
     ):
         yield chunk
 
@@ -1158,19 +1164,32 @@ def _make_proxy_event(event: str, payload: dict) -> str:
 # Triage message builder — transparent first SSE chunk
 # ---------------------------------------------------------------------------
 
-def _build_triage_message(route: RouteDecision) -> str:
+def _build_triage_message(
+    route: RouteDecision,
+    client_named_model: bool = False,
+) -> str:
     """
     Build a human-readable triage message that informs the user which
     model was selected and why, without altering the conversation.
 
-    Example output:
+    Example output (auto-routed, classifier picked the model):
         🔍 Proxy triage: classified as CODE (priority 1).
         Routing to professional on port 13103.
+
+    Example output (R19 client override — client specified the model):
+        🔀 Client specified Professional (35B MoE). Routing on port 13103.
+        (frontdesk suggested CHAT, client model wins.)
 
     Parameters
     ----------
     route : RouteDecision
         The resolved routing decision.
+    client_named_model : bool
+        True when the R19 client-named-model override actually changed
+        the route (classifier and client disagreed).  When True the
+        message is rewritten to reflect that the client picked the model
+        rather than the classifier, since reporting "classified as CHAT"
+        while routing to Professional is actively misleading.
 
     Returns
     -------
@@ -1195,7 +1214,20 @@ def _build_triage_message(route: RouteDecision) -> str:
         route.model_key.capitalize(),
     )
 
-    # Build the triage line
+    # R19 client override path: rewrite the message so the "classified
+    # as X" line doesn't lie about the destination.  The classifier's
+    # intent is preserved as context (in parens) so the user can see
+    # what the frontdesk would have picked.
+    if client_named_model:
+        parts = [
+            f"🔀 Client specified {model_label}.",
+            f"Routing on port {route.port}.",
+        ]
+        if route.intent:
+            parts.append(f"(frontdesk suggested {route.intent}, client model wins.)")
+        return " ".join(parts)
+
+    # Standard auto-routed path
     parts = [
         f"🔍 Proxy triage: classified as {route.intent}",
         f"(priority {route.priority}).",

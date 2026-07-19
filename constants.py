@@ -108,6 +108,14 @@ LLAMA_ENDPOINTS: dict[str, str] = {
     "cloud":        "https://openrouter.ai/api/v1/chat/completions",
 }
 
+# All client-pickable model keys. Derived from LLAMA_ENDPOINTS (excluding
+# "cloud" which has no local systemd unit). Used by routes.py to validate
+# client-named model requests before overriding the frontdesk-classified
+# route (R19 client-named-model override).
+ALL_MODEL_KEYS: tuple[str, ...] = tuple(
+    key for key in LLAMA_ENDPOINTS if key != "cloud"
+)
+
 # ---------------------------------------------------------------------------
 # Systemd service discovery
 # ---------------------------------------------------------------------------

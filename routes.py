@@ -34,6 +34,7 @@ from constants import (
     NATIVE_TOOLS,
     OPENAI_FORWARD_FIELDS,
     R11_AUTHORITY_FIELDS,
+    ALL_MODEL_KEYS,
     CoolingPreset,
     get_logger,
 )
@@ -57,6 +58,7 @@ from routing import (
     extract_project_context,
     is_dream_process,
     TOOL_KEYWORDS,
+    CPU_MODELS,
 )
 from auditing import ShadowAuditor
 
@@ -474,6 +476,25 @@ async def chat_completions(request: Request) -> StreamingResponse:
             has_tool_history=has_tool_calls,
         )
 
+    # ---- Client-named-model override (R19) ---------------------------------
+    # When the client picks a specific model (not "auto"), use it directly
+    # instead of the frontdesk-classified one. Lane B / IDE passthrough is
+    # exempt — it always pins "professional" by design.  intent is preserved
+    # so the profile lookup for thinking_budget_tokens still works.
+    if (
+        not route.is_lane_b
+        and requested_model != "auto"
+        and requested_model in ALL_MODEL_KEYS
+        and route.model_key != requested_model
+    ):
+        route.model_key = requested_model
+        route.port = await systemd.get_port(requested_model)
+        route.hardware_path = "cpu" if requested_model in CPU_MODELS else "gpu"
+        logger.info(
+            "Client-named model override: %s → %s",
+            route.model_key, requested_model,
+        )
+
     # ---- Extract project context for database ---------------------------------
     ctx = extract_project_context(user_text)
     project_name = ctx["project"] if ctx["project"] != "default" else classification.get("project", "general")
@@ -502,39 +523,16 @@ async def chat_completions(request: Request) -> StreamingResponse:
     if auto_authority and entry is not None:
         parameters = {**entry.values}
     else:
+        # R1/R7 client-wins: when the client picked the model, the client's
+        # temperature/top_p/max_tokens are authoritative. We only fill in
+        # model-specific defaults (thinking_budget_tokens) from the profile.
         parameters = {
             "temperature": temperature,
             "top_p": top_p,
             "max_tokens": max_tokens,
         }
-
-        # Set thinking_budget_tokens and other domain-specific params
-        if route.intent in ("CODE", "ARCHITECT"):
-            parameters.update({
-                "temperature": 0.1,
-                "top_p": 0.9,
-                "max_tokens": -1,  # No hard cap for code
-                "thinking_budget_tokens": 4096,
-            })
-        elif route.intent in ("CREATIVE", "SCHOLAR"):
-            parameters.update({
-                "temperature": 0.4,
-                "top_p": 0.95,
-                "max_tokens": 8192,
-                "thinking_budget_tokens": 2048,
-            })
-        elif route.intent == "PROFESSIONAL":
-            parameters.update({
-                "temperature": 0.3,
-                "top_p": 0.95,
-                "max_tokens": 4096,
-                "thinking_budget_tokens": 1024,
-            })
-        else:
-            parameters.update({
-                "max_tokens": 2048,
-                "thinking_budget_tokens": 0,
-            })
+        if entry is not None and "thinking_budget_tokens" in entry.values:
+            parameters["thinking_budget_tokens"] = entry.values["thinking_budget_tokens"]
 
     # ---- Register job in database -------------------------------------------
     job_id = str(uuid.uuid4())

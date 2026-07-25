@@ -744,12 +744,17 @@ async def _event_stream(
         for event_line in proxy_preamble:
             yield event_line
 
-    # ---- Yield triage metadata as first SSE chunk ---------------------------
-    # Let the frontend know which model was selected and why, so users
-    # understand the routing decision.  This is informational only and
-    # does not affect the conversation content (Glass Pipe Rule).
+    # ---- Yield triage metadata as first SSE event ---------------------------
+    # Let the frontend know which model was selected and why.  Emitted as
+    # a custom SSE event (kinver.proxy.triage) so OpenAI-compatible clients
+    # do not render it as an assistant content delta.  Previously this
+    # used _make_system_chunk (delta.content) which caused nanobot-ai and
+    # similar clients to display the triage message inline in the chat,
+    # polluting the conversation and confusing the model in tool-calling
+    # flows (it would re-call the same tool because the proxy's injection
+    # appeared as if it were a prior tool result).
     triage_msg = _build_triage_message(route, client_named_model=client_named_model)
-    yield f"data: {json.dumps(_make_system_chunk(triage_msg))}\n\n"
+    yield _make_proxy_event("kinver.proxy.triage", {"message": triage_msg})
 
     try:
         async for chunk in stream_llm(
@@ -889,12 +894,15 @@ async def _event_stream_with_model_startup(
             }
             label = model_labels.get(model_key, model_key)
 
-            # Send loading feedback so the frontend doesn't timeout
+            # Send loading feedback so the frontend doesn't timeout.
+            # Emitted as a custom SSE event (kinver.proxy.loading) so the
+            # message does not appear in the model's conversation context
+            # and is not rendered as a content delta by OpenAI clients.
             loading_msg = (
                 f"🔃 [Proxy: Loading {label}, please wait..."
                 f"(cold start may take 30-120 seconds)]"
             )
-            yield f"data: {json.dumps(_make_system_chunk(loading_msg))}\n\n"
+            yield _make_proxy_event("kinver.proxy.loading", {"message": loading_msg, "model": model_key})
 
             try:
                 # Before loading a heavy GPU model, stop any lightweight
@@ -961,7 +969,10 @@ async def _event_stream_with_model_startup(
                         f"💾 [Proxy: Restored project cache "
                         f"'{project_id}' for {label}]"
                     )
-                    yield f"data: {json.dumps(_make_system_chunk(cache_msg))}\n\n"
+                    yield _make_proxy_event(
+                        "kinver.proxy.cache",
+                        {"message": cache_msg, "project_id": project_id, "model": model_key},
+                    )
                 except Exception:
                     logger.debug(
                         "Cache restore skipped for %s (non-critical)",
@@ -1005,31 +1016,35 @@ async def _graceful_guillotine_chunk(
     reason: str,
 ) -> str:
     """
-    Generate the final SSE chunk that cleanly terminates a stream after
+    Generate the final SSE events that cleanly terminate a stream after
     a confirmed audit failure.
 
-    Balances trailing JSON/Markdown syntax and appends the proxy audit
-    override message before closing.
+    Emits a standards-compliant finish: a custom ``kinver.proxy.audit_halt``
+    event with the reason (so clients can surface it in a system UI), then
+    a final model chunk with ``finish_reason: "stop"`` and no synthetic
+    ``delta.content`` injection.  This complies with the OpenAI streaming
+    contract and with the Glass Pipe Rule: the proxy never mutates
+    in-flight tool_calls JSON or terminates with a non-standard finish
+    reason.
     """
-    # The override message informs the client that the proxy halted the
-    # stream due to a quality/safety concern.
-    override_msg = (
-        f"\n\n[PROXY AUDIT OVERRIDE: Error detected. Stream halted. "
-        f"Reason: {reason}]"
-    )
-
-    chunk = {
+    # Final model chunk: empty content delta, standard finish_reason.
+    # This is the only way to close the stream without violating R1.
+    stop_chunk = {
         "id": f"chatcmpl-{job_id[:8]}",
         "object": "chat.completion.chunk",
         "created": int(time.time()),
-        "model": "proxy-audit-override",
+        "model": "proxy-audit-halt",
         "choices": [{
             "index": 0,
-            "delta": {"content": override_msg},
-            "finish_reason": "audit_override",
+            "delta": {},
+            "finish_reason": "stop",
         }],
     }
-    return f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n"
+    audit_event = _make_proxy_event(
+        "kinver.proxy.audit_halt",
+        {"reason": reason, "job_id": job_id, "ts": int(time.time())},
+    )
+    return f"{audit_event}data: {json.dumps(stop_chunk)}\n\ndata: [DONE]\n\n"
 
 
 # ---------------------------------------------------------------------------

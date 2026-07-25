@@ -598,6 +598,18 @@ async def chat_completions(request: Request) -> StreamingResponse:
         payload["thinking_budget_tokens"] = parameters["thinking_budget_tokens"]
     if tools:
         payload["tools"] = tools
+        # Disable Qwen 3.5's extended-thinking mode for tool-calling requests.
+        # When the model is in thinking mode it produces a long reasoning_content
+        # stream BEFORE the tool call, which (a) wastes tokens, (b) confuses
+        # llama.cpp's tool-call parser because the reasoning preamble is
+        # adjacent to the tool-call XML in the same content stream, and (c)
+        # surfaces raw model reasoning to OpenAI-compatible clients that
+        # render it inline. Disabling thinking here makes the model emit
+        # the tool call directly. Clients can opt back in with the
+        # `X-Proxy-Thinking: true` request header.
+        opt_in_thinking = headers.get("x-proxy-thinking", "").lower() == "true"
+        if not opt_in_thinking:
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
 
     # Forward additional OpenAI fields from the client body (R11 hardening).
     for field in OPENAI_FORWARD_FIELDS:
@@ -800,6 +812,14 @@ async def _event_stream(
                 )
 
             # ---- Emit SSE line ------------------------------------------------
+            # Pass the chunk through verbatim.  OpenAI's standard chunks carry
+            # ``delta.content`` (final answer), ``delta.reasoning_content``
+            # (model thinking for a toggleable thinking tab), and
+            # ``delta.tool_calls`` (structured tool invocations).  The proxy
+            # does not rewrite any of these — clients parse and present each
+            # field in its own UI surface.  The proxy's own status messages
+            # (triage, loading, cache, audit_halt) are emitted as custom SSE
+            # events so they never appear as content deltas.
             yield f"data: {json.dumps(chunk)}\n\n"
 
         # ---- Stream completed successfully ----------------------------------

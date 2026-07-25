@@ -252,3 +252,123 @@ class TestProxyEventsAreNotContent:
         assert not out.startswith("data: "), (
             "_make_proxy_event must not produce a data: chunk"
         )
+
+
+# ---------------------------------------------------------------------------
+# Tool-call defaults: disable thinking when tools are present
+# ---------------------------------------------------------------------------
+
+class TestToolCallThinkingDefault:
+    """When the request includes tools, the proxy must disable Qwen 3.5's
+    extended-thinking mode by default.  The thinking preamble was producing
+    ~60-100 chunks of reasoning_content before any tool call, which (a)
+    wastes tokens, (b) confuses llama.cpp's tool-call parser, and (c)
+    surfaces raw reasoning to OpenAI clients that render it inline.
+
+    The ``X-Proxy-Thinking: true`` header re-enables thinking.
+    """
+
+    def _capture_request_payload(self) -> dict[str, Any]:
+        """Build a chat_completions request and capture the payload sent
+        to ``stream_llm``.  Returns the captured ``payload`` dict.
+        """
+        capture = _StreamCapture()
+        return capture
+
+    @pytest.mark.asyncio
+    async def test_tools_request_disables_thinking_by_default(
+        self, r1_client,
+    ) -> None:
+        capture = self._capture_request_payload()
+        with patch("routes.stream_llm", new=capture), \
+             patch(
+                 "routes.classify_with_frontdesk",
+                 new=AsyncMock(return_value=_classification()),
+             ):
+            response = await r1_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "professional",
+                    "messages": [{"role": "user", "content": "what is the cpu temperature"}],
+                    "tools": [{
+                        "type": "function",
+                        "function": {
+                            "name": "exec_shell",
+                            "description": "Run a shell command",
+                            "parameters": {"type": "object"},
+                        },
+                    }],
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            await response.aread()
+
+        assert response.status_code == 200, response.text
+        assert capture.payload is not None
+        assert "chat_template_kwargs" in capture.payload, (
+            "tools-present request must include chat_template_kwargs"
+        )
+        assert capture.payload["chat_template_kwargs"] == {"enable_thinking": False}
+
+    @pytest.mark.asyncio
+    async def test_tools_request_with_opt_in_header_keeps_thinking(
+        self, r1_client,
+    ) -> None:
+        capture = self._capture_request_payload()
+        with patch("routes.stream_llm", new=capture), \
+             patch(
+                 "routes.classify_with_frontdesk",
+                 new=AsyncMock(return_value=_classification()),
+             ):
+            response = await r1_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "professional",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": [{
+                        "type": "function",
+                        "function": {
+                            "name": "exec_shell",
+                            "description": "Run a shell command",
+                            "parameters": {"type": "object"},
+                        },
+                    }],
+                },
+                headers={
+                    "Authorization": "Bearer agent-key",
+                    "X-Proxy-Thinking": "true",
+                },
+            )
+            await response.aread()
+
+        assert response.status_code == 200, response.text
+        assert capture.payload is not None
+        # With the opt-in header, the proxy must NOT inject
+        # chat_template_kwargs; the model keeps its default thinking mode.
+        assert "chat_template_kwargs" not in capture.payload, (
+            f"opt-in header must suppress the default; got {capture.payload!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_tools_request_does_not_inject_template_kwargs(
+        self, r1_client,
+    ) -> None:
+        capture = self._capture_request_payload()
+        with patch("routes.stream_llm", new=capture), \
+             patch(
+                 "routes.classify_with_frontdesk",
+                 new=AsyncMock(return_value=_classification()),
+             ):
+            response = await r1_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "professional",
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            await response.aread()
+
+        assert response.status_code == 200, response.text
+        assert capture.payload is not None
+        assert "chat_template_kwargs" not in capture.payload

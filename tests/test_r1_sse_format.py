@@ -1,14 +1,23 @@
-"""R1 Glass Pipe — SSE format contract for proxy-injected events.
+"""R1 Glass Pipe — SSE format contract for proxy-injected messages.
 
-The proxy never mutates in-flight tool_calls JSON or terminates with a
-non-standard finish_reason.  Triage, loading, and audit-halt messages
-are emitted as **custom SSE events** (``kinver.proxy.<name>``) so
-OpenAI-compatible clients do not render them as model content deltas.
+The proxy's behavior is a balance between two concerns:
 
-This is the regression test for the bug pattern where nanobot-ai was
-showing the triage and audit-override messages inline in the chat,
-corrupting the model's tool-calling flow (it would re-call the same
-tool because the proxy's injection appeared as a prior tool result).
+1. **User feedback during long delays** (cold starts, hotswaps): the user
+   wants to see what's happening.  Triage and loading messages are
+   emitted as ``delta.content`` chunks so nanobot-ai and similar clients
+   render them inline in the chat.
+
+2. **Glass Pipe compliance** (AGENTS.md Rule 1, memory #3): the proxy
+   never mutates in-flight ``tool_calls`` JSON or terminates with a
+   non-standard ``finish_reason``.  The Graceful Guillotine (audit
+   halt) emits a custom SSE event + a standards-compliant finish.
+
+The original concern that ``delta.content`` proxy messages would corrupt
+tool-calling was a red herring — the actual cause of the tool-call
+XML-in-chat bug was Qwen 3.5's extended-thinking mode (60-100 chunks
+of ``reasoning_content`` adjacent to the tool call).  The thinking
+disable is the actual fix; the triage/loading messages are now back
+as content for user feedback.
 """
 from __future__ import annotations
 
@@ -140,20 +149,23 @@ def _parse_sse_events(response_text: str) -> list[tuple[str, dict[str, Any]]]:
 
 
 # ---------------------------------------------------------------------------
-# R1 contract: proxy messages are custom events, not content deltas
+# Contract: triage/loading as content (user feedback)
 # ---------------------------------------------------------------------------
 
-class TestProxyEventsAreNotContent:
-    """The proxy must not inject ``delta.content`` for in-flight proxy
-    messages (triage, loading, audit-halt).  Those are emitted as custom
-    SSE events so OpenAI-compatible clients do not render them inline.
+class TestProxyMessagesAsContent:
+    """Triage and loading messages are emitted as ``delta.content`` so the
+    user sees feedback during the long model-loading delay.  The Glass
+    Pipe rule about not injecting content applies to in-flight payloads
+    (audit halts, tool_calls mutation); user-facing status messages are
+    the proxy's legitimate response to the user.
     """
 
     @pytest.mark.asyncio
-    async def test_triage_emitted_as_custom_event_not_content(self, r1_client) -> None:
-        """The first SSE event after the model starts should be
-        ``kinver.proxy.triage`` with the message in the event payload,
-        not as a ``data: {delta.content: "..."}`` chunk.
+    async def test_triage_emitted_as_content_delta(self, r1_client) -> None:
+        """The first SSE chunk after the model starts should be a
+        ``data: {delta.content: "🔍 Proxy triage: ..."}`` chunk that
+        nanobot-ai renders inline.  This gives the user feedback
+        during the long routing/hotswap delay.
         """
         capture = _StreamCapture()
         with patch("routes.stream_llm", new=capture), \
@@ -174,31 +186,39 @@ class TestProxyEventsAreNotContent:
         assert response.status_code == 200, text
         events = _parse_sse_events(text)
 
-        # Find the triage event
-        triage_events = [e for e in events if e[0] == "kinver.proxy.triage"]
-        assert triage_events, f"expected kinver.proxy.triage event in {events!r}"
-        triage_name, triage_data = triage_events[0]
-        assert triage_data.get("message", "").startswith("🔍")
-
-        # CRITICAL: no data: chunk should carry the triage message as
-        # delta.content.  OpenAI clients render those as model messages.
+        # The triage message must appear as a data: chunk (delta.content),
+        # not as a custom event.  The triage is the first non-empty data:
+        # chunk and uses ``model: "proxy-system"`` to mark its origin.
+        triage_found = False
         for event_name, event_data in events:
-            if event_name:  # skip the custom event itself
+            if event_name:  # skip custom events
                 continue
             choices = event_data.get("choices", [])
             for ch in choices:
                 delta = ch.get("delta", {})
-                content = delta.get("content") or ""
-                assert "🔍 Proxy triage" not in content, (
-                    f"triage must not be rendered as content delta; "
-                    f"found {content!r} in {event_name!r} event"
-                )
+                content = delta.get("content", "")
+                if "🔍 Proxy triage" in content:
+                    triage_found = True
+                    assert event_data.get("model") == "proxy-system", (
+                        f"triage should be marked as proxy-system, "
+                        f"got {event_data.get('model')!r}"
+                    )
+                    break
+            if triage_found:
+                break
+        assert triage_found, (
+            f"expected triage to be emitted as a data: chunk with "
+            f"delta.content; events: {events!r}"
+        )
 
     @pytest.mark.asyncio
     async def test_no_audit_override_finish_reason(self) -> None:
         """The Graceful Guillotine must terminate with ``finish_reason: "stop"``,
         not the non-standard ``"audit_override"``.  OpenAI clients treat
         unknown finish reasons as errors.
+
+        This is the R1 violation that is still in scope after the
+        triage/loading revert.
         """
         from routes import _graceful_guillotine_chunk
 
@@ -232,27 +252,6 @@ class TestProxyEventsAreNotContent:
                 f"got {delta!r}"
             )
 
-    @pytest.mark.asyncio
-    async def test_loading_emitted_as_custom_event(self, r1_client) -> None:
-        """When a heavy model is loading, the message goes in a
-        ``kinver.proxy.loading`` event, not as a content delta.
-
-        This is tested indirectly: if the model is already loaded (the
-        common case), the loading event is not emitted.  The contract
-        is that whenever it IS emitted, it uses the custom event format.
-        We verify the helper directly.
-        """
-        from routes import _make_proxy_event
-
-        # Confirm _make_proxy_event produces the event: ... format
-        out = _make_proxy_event("kinver.proxy.loading", {"message": "Loading X", "model": "x"})
-        assert out.startswith("event: kinver.proxy.loading\n")
-        assert "Loading X" in out
-        # Must not be a data: chunk (which clients would render as content)
-        assert not out.startswith("data: "), (
-            "_make_proxy_event must not produce a data: chunk"
-        )
-
 
 # ---------------------------------------------------------------------------
 # Tool-call defaults: disable thinking when tools are present
@@ -263,23 +262,21 @@ class TestToolCallThinkingDefault:
     extended-thinking mode by default.  The thinking preamble was producing
     ~60-100 chunks of reasoning_content before any tool call, which (a)
     wastes tokens, (b) confuses llama.cpp's tool-call parser, and (c)
-    surfaces raw reasoning to OpenAI clients that render it inline.
+    surfaces raw reasoning to OpenAI-compatible clients that render it inline.
 
     The ``X-Proxy-Thinking: true`` header re-enables thinking.
-    """
 
-    def _capture_request_payload(self) -> dict[str, Any]:
-        """Build a chat_completions request and capture the payload sent
-        to ``stream_llm``.  Returns the captured ``payload`` dict.
-        """
-        capture = _StreamCapture()
-        return capture
+    The proxy applies this disable on every request — the model still
+    occasionally re-enables thinking after a few turns (a chat-template
+    behavior outside the proxy's control); the fix for that is at the
+    model/service level, not the proxy.
+    """
 
     @pytest.mark.asyncio
     async def test_tools_request_disables_thinking_by_default(
         self, r1_client,
     ) -> None:
-        capture = self._capture_request_payload()
+        capture = _StreamCapture()
         with patch("routes.stream_llm", new=capture), \
              patch(
                  "routes.classify_with_frontdesk",
@@ -314,7 +311,7 @@ class TestToolCallThinkingDefault:
     async def test_tools_request_with_opt_in_header_keeps_thinking(
         self, r1_client,
     ) -> None:
-        capture = self._capture_request_payload()
+        capture = _StreamCapture()
         with patch("routes.stream_llm", new=capture), \
              patch(
                  "routes.classify_with_frontdesk",
@@ -353,7 +350,7 @@ class TestToolCallThinkingDefault:
     async def test_non_tools_request_does_not_inject_template_kwargs(
         self, r1_client,
     ) -> None:
-        capture = self._capture_request_payload()
+        capture = _StreamCapture()
         with patch("routes.stream_llm", new=capture), \
              patch(
                  "routes.classify_with_frontdesk",
@@ -372,3 +369,80 @@ class TestToolCallThinkingDefault:
         assert response.status_code == 200, response.text
         assert capture.payload is not None
         assert "chat_template_kwargs" not in capture.payload
+
+    @pytest.mark.asyncio
+    async def test_thinking_disable_persists_across_multi_turn(
+        self, r1_client,
+    ) -> None:
+        """The proxy must apply ``chat_template_kwargs: {enable_thinking: false}``
+        on every tool-calling request, not just the first.  Note: the model
+        may still re-enable thinking after a few turns (a chat-template
+        behavior); the proxy's contract is to send the disable on every
+        request, not to suppress the model from re-enabling it.
+        """
+        # First turn
+        capture_1 = _StreamCapture()
+        with patch("routes.stream_llm", new=capture_1), \
+             patch(
+                 "routes.classify_with_frontdesk",
+                 new=AsyncMock(return_value=_classification()),
+             ):
+            response = await r1_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "professional",
+                    "messages": [
+                        {"role": "user", "content": "first question"},
+                    ],
+                    "tools": [{
+                        "type": "function",
+                        "function": {
+                            "name": "exec_shell",
+                            "description": "Run a shell command",
+                            "parameters": {"type": "object"},
+                        },
+                    }],
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            await response.aread()
+        assert response.status_code == 200
+        assert capture_1.payload is not None
+        assert capture_1.payload.get("chat_template_kwargs") == {"enable_thinking": False}
+
+        # Second turn (multi-turn — same conversation, more messages)
+        capture_2 = _StreamCapture()
+        with patch("routes.stream_llm", new=capture_2), \
+             patch(
+                 "routes.classify_with_frontdesk",
+                 new=AsyncMock(return_value=_classification()),
+             ):
+            response = await r1_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "professional",
+                    "messages": [
+                        {"role": "user", "content": "first question"},
+                        {"role": "assistant", "content": "first answer"},
+                        {"role": "user", "content": "second question"},
+                    ],
+                    "tools": [{
+                        "type": "function",
+                        "function": {
+                            "name": "exec_shell",
+                            "description": "Run a shell command",
+                            "parameters": {"type": "object"},
+                        },
+                    }],
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            await response.aread()
+        assert response.status_code == 200
+        assert capture_2.payload is not None
+        # The proxy MUST still inject chat_template_kwargs on turn 2.
+        # Whether the model respects it is a model-level concern.
+        assert capture_2.payload.get("chat_template_kwargs") == {"enable_thinking": False}, (
+            f"thinking disable must persist across multi-turn; turn 2 "
+            f"payload was {capture_2.payload!r}"
+        )

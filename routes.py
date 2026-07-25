@@ -756,17 +756,19 @@ async def _event_stream(
         for event_line in proxy_preamble:
             yield event_line
 
-    # ---- Yield triage metadata as first SSE event ---------------------------
-    # Let the frontend know which model was selected and why.  Emitted as
-    # a custom SSE event (kinver.proxy.triage) so OpenAI-compatible clients
-    # do not render it as an assistant content delta.  Previously this
-    # used _make_system_chunk (delta.content) which caused nanobot-ai and
-    # similar clients to display the triage message inline in the chat,
-    # polluting the conversation and confusing the model in tool-calling
-    # flows (it would re-call the same tool because the proxy's injection
-    # appeared as if it were a prior tool result).
+    # ---- Yield triage metadata as first SSE chunk ---------------------------
+    # Let the frontend know which model was selected and why, so users
+    # understand the routing decision.  This is informational only and
+    # does not affect the conversation content (Glass Pipe Rule).
+    # Emitted as delta.content via _make_system_chunk so nanobot-ai and
+    # similar clients display it in the chat — this gives the user
+    # feedback during the long model-loading delay.  The original
+    # concern that this would corrupt tool-calling was a red herring;
+    # the actual cause of the tool-call XML-in-chat bug was Qwen 3.5's
+    # thinking mode emitting reasoning_content adjacent to the tool
+    # call, which the proxy now disables via chat_template_kwargs.
     triage_msg = _build_triage_message(route, client_named_model=client_named_model)
-    yield _make_proxy_event("kinver.proxy.triage", {"message": triage_msg})
+    yield f"data: {json.dumps(_make_system_chunk(triage_msg))}\n\n"
 
     try:
         async for chunk in stream_llm(
@@ -915,14 +917,15 @@ async def _event_stream_with_model_startup(
             label = model_labels.get(model_key, model_key)
 
             # Send loading feedback so the frontend doesn't timeout.
-            # Emitted as a custom SSE event (kinver.proxy.loading) so the
-            # message does not appear in the model's conversation context
-            # and is not rendered as a content delta by OpenAI clients.
+            # Emitted as delta.content via _make_system_chunk so the user
+            # sees a status message while waiting for the heavy model to
+            # cold-start (30-120s).  Originally emitted as a custom SSE
+            # event but the user wanted the status visible in the chat.
             loading_msg = (
                 f"🔃 [Proxy: Loading {label}, please wait..."
                 f"(cold start may take 30-120 seconds)]"
             )
-            yield _make_proxy_event("kinver.proxy.loading", {"message": loading_msg, "model": model_key})
+            yield f"data: {json.dumps(_make_system_chunk(loading_msg))}\n\n"
 
             try:
                 # Before loading a heavy GPU model, stop any lightweight
@@ -989,10 +992,7 @@ async def _event_stream_with_model_startup(
                         f"💾 [Proxy: Restored project cache "
                         f"'{project_id}' for {label}]"
                     )
-                    yield _make_proxy_event(
-                        "kinver.proxy.cache",
-                        {"message": cache_msg, "project_id": project_id, "model": model_key},
-                    )
+                    yield f"data: {json.dumps(_make_system_chunk(cache_msg))}\n\n"
                 except Exception:
                     logger.debug(
                         "Cache restore skipped for %s (non-critical)",

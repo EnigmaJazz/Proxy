@@ -1,10 +1,12 @@
-# Specs Index — glass-pipe-hardening
+# Specs Index
+
+## glass-pipe-hardening (archived)
 
 > Delta spec index for change `glass-pipe-hardening`. All capabilities are NEW
-> (`openspec/specs/` is empty — full specs, not deltas). One spec per capability,
+> (initially `openspec/specs/` was empty — full specs, not deltas). One spec per capability,
 > one or more scenarios per requirement; CRITICAL fixes carry happy + edge scenarios.
 
-## Capability → R coverage
+### Capability → R coverage
 
 | # | Capability | Spec path | R coverage | Reqs | Scenarios |
 |---|-------------|-----------|------------|------|-----------|
@@ -13,7 +15,20 @@
 | 3 | glass-pipe-auditor-coverage | `glass-pipe-auditor-coverage/spec.md` | R12, R15, R16 | 3 | 6 |
 | 4 | glass-pipe-exceptions | `glass-pipe-exceptions/spec.md` | R2, R8, R9 | 3 | 3 |
 | 5 | test-infrastructure | `test-infrastructure/spec.md` | R10 | 1 | 3 |
-| | **Total** | | **R1–R16 (all 16)** | **18** | **32** |
+| | **Subtotal** | | **R1–R16 (all 16)** | **18** | **32** |
+
+## professional-default-routing (NEW)
+
+> Full spec for change `professional-as-default`. Professional becomes the resident
+> default for auto-routed CHAT, TOOL, and CODE while preserving explicit model
+> choice, profile authority, and specialist hotswaps.
+
+### Capability → REQ coverage
+
+| # | Capability | Spec path | REQ coverage | Reqs | Scenarios |
+|---|-------------|-----------|--------------|------|-----------|
+| 6 | professional-default-routing | `professional-default-routing/spec.md` | REQ-1 through REQ-8 | 8 | 8 |
+| | **Total** | | **R1–R16 + REQ-1–REQ-8** | **26** | **40** |
 
 ## R → Capability cross-reference
 

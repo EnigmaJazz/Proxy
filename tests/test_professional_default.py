@@ -541,8 +541,88 @@ class TestQueueLifecycle:
 
     @pytest.mark.asyncio
     async def test_specialist_hotswap_not_blocked(self) -> None:
-        """Scenario-8: hotswap from Professional to coder still works."""
+        """Scenario-8 (unit): hotswap from Professional to coder via the fake.
+
+        This unit test only exercises the fake's own method.  The real
+        production-path regression test is below (test_specialist_override_clears_cpu_fallback).
+        """
         systemd = _FakeSystemd(active="professional")
         await systemd.hot_swap("professional", "coder")
         assert systemd.hotswaps == [("professional", "coder")]
         assert systemd.active_heavy_model == "coder"
+
+    @pytest.mark.asyncio
+    async def test_specialist_override_clears_cpu_fallback(self, pd_client) -> None:
+        """Scenario-8 (production path): the R19 client override must clear
+        ``is_cpu_fallback`` so the hotswap wrapper at routes.py:871 fires.
+
+        Without this clear, a request that initially resolves to Lifeboat
+        (because another specialist occupies the GPU) followed by a
+        client-named specialist (e.g. Scholar) would inherit
+        ``is_cpu_fallback=True`` and the hotswap wrapper would suppress
+        the cold-start.  The specialist port is never started and the
+        stream ends in 'All connection attempts failed'.  This is the
+        live bug the verify report caught (2026-07-19, REQ-8).
+        """
+        # Classifier returns a Lifeboat fallback because another specialist
+        # is on the GPU.  This is the path that previously inherited
+        # is_cpu_fallback=True into the override.
+        lifeboat_route = RouteDecision(
+            model_key="lifeboat",
+            port=13090,
+            is_cpu_fallback=True,
+            hardware_path="cpu",
+            priority=2,
+            intent="CHAT",
+            project_id="general",
+            is_factual=False,
+            is_lane_b=False,
+        )
+        captured: dict[str, Any] = {}
+
+        async def _capture_hotswap_entry(*args: Any, **kwargs: Any) -> Any:
+            """Stand-in for ``_event_stream_with_model_startup`` that
+            records the route state and yields minimal SSE chunks.
+
+            Yields properly-formatted SSE strings so StreamingResponse
+            can encode them; the test only inspects the captured route
+            state, not the streamed body.
+            """
+            route: RouteDecision = kwargs["route"]
+            captured["model_key"] = route.model_key
+            captured["is_cpu_fallback"] = route.is_cpu_fallback
+            captured["is_lane_b"] = route.is_lane_b
+            yield "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n"
+            yield "data: [DONE]\n\n"
+
+        with patch(
+            "routes.classify_with_frontdesk",
+            new=AsyncMock(return_value=_classification("CHAT")),
+        ), patch(
+            "routes.resolve_route_for_lane_a",
+            new=AsyncMock(return_value=lifeboat_route),
+        ), patch(
+            "routes._event_stream_with_model_startup",
+            side_effect=_capture_hotswap_entry,
+        ):
+            response = await pd_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "scholar",
+                    "messages": [{"role": "user", "content": "research this"}],
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            await response.aread()
+
+        assert response.status_code == 200, response.text
+        # The override should have redirected to scholar (client's choice).
+        assert captured["model_key"] == "scholar"
+        # CRITICAL: the override must have cleared the inherited
+        # is_cpu_fallback so the hotswap wrapper actually fires.
+        assert captured["is_cpu_fallback"] is False, (
+            "R19 override must clear is_cpu_fallback; otherwise the "
+            "hotswap wrapper at routes.py:871 skips the cold-start "
+            "and the stream ends in 'All connection attempts failed'."
+        )
+        assert captured["is_lane_b"] is False

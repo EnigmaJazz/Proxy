@@ -482,6 +482,13 @@ async def chat_completions(request: Request) -> StreamingResponse:
     # instead of the frontdesk-classified one. Lane B / IDE passthrough is
     # exempt — it always pins "professional" by design.  intent is preserved
     # so the profile lookup for thinking_budget_tokens still works.
+    #
+    # Also clears route.is_cpu_fallback: the override is an explicit client
+    # request, not a fallback — the hotswap wrapper at routes.py:871
+    # suppresses the cold-start when this flag is True, which would break
+    # transitions like "Lifeboat fallback (GPU busy with coder) → explicit
+    # Scholar request".  Without this line, the specialist port is never
+    # started and the stream ends in 'All connection attempts failed'.
     client_named_model = False
     if (
         not route.is_lane_b
@@ -492,6 +499,7 @@ async def chat_completions(request: Request) -> StreamingResponse:
         route.model_key = requested_model
         route.port = await systemd.get_port(requested_model)
         route.hardware_path = "cpu" if requested_model in CPU_MODELS else "gpu"
+        route.is_cpu_fallback = False
         client_named_model = True
         logger.info(
             "Client-named model override: %s → %s",

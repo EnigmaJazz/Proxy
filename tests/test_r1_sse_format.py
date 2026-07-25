@@ -258,24 +258,34 @@ class TestProxyMessagesAsContent:
 # ---------------------------------------------------------------------------
 
 class TestToolCallThinkingDefault:
-    """When the request includes tools, the proxy must disable Qwen 3.5's
-    extended-thinking mode by default.  The thinking preamble was producing
-    ~60-100 chunks of reasoning_content before any tool call, which (a)
-    wastes tokens, (b) confuses llama.cpp's tool-call parser, and (c)
-    surfaces raw reasoning to OpenAI-compatible clients that render it inline.
+    """Architecture: the service file sets ``enable_thinking: false`` as
+    the safe default (so thinking never leaks into tool-calling flows).
+    The proxy is the "intelligence" layer that opts INTO thinking for
+    non-tool tasks where reasoning actually helps.
 
-    The ``X-Proxy-Thinking: true`` header re-enables thinking.
+    Decision matrix:
+      - tools + no header            → no chat_template_kwargs (service default off)
+      - tools + X-Proxy-Thinking: true  → enable_thinking: True (override on)
+      - tools + X-Proxy-Thinking: false → enable_thinking: False (explicit off)
+      - no tools + no header        → enable_thinking: True (proxy opts in)
+      - no tools + X-Proxy-Thinking: true  → enable_thinking: True (explicit on)
+      - no tools + X-Proxy-Thinking: false → enable_thinking: False (opt out)
 
-    The proxy applies this disable on every request — the model still
-    occasionally re-enables thinking after a few turns (a chat-template
-    behavior outside the proxy's control); the fix for that is at the
-    model/service level, not the proxy.
+    The header overrides the default in either direction.  The proxy
+    applies this on every request — the model may still re-enable
+    thinking after a few turns (a chat-template behavior); the fix
+    for that is at the model/service level, not the proxy.
     """
 
     @pytest.mark.asyncio
-    async def test_tools_request_disables_thinking_by_default(
+    async def test_tools_request_lets_service_default_apply(
         self, r1_client,
     ) -> None:
+        """Tools present, no header: the proxy MUST NOT inject
+        ``chat_template_kwargs``.  The service default (off) wins.
+        This is the bug-class the user originally hit — the model
+        was emitting 60-100 reasoning chunks before tool calls.
+        """
         capture = _StreamCapture()
         with patch("routes.stream_llm", new=capture), \
              patch(
@@ -302,15 +312,19 @@ class TestToolCallThinkingDefault:
 
         assert response.status_code == 200, response.text
         assert capture.payload is not None
-        assert "chat_template_kwargs" in capture.payload, (
-            "tools-present request must include chat_template_kwargs"
+        assert "chat_template_kwargs" not in capture.payload, (
+            f"tools-request must let service default (off) apply; "
+            f"got {capture.payload!r}"
         )
-        assert capture.payload["chat_template_kwargs"] == {"enable_thinking": False}
 
     @pytest.mark.asyncio
-    async def test_tools_request_with_opt_in_header_keeps_thinking(
+    async def test_tools_request_with_opt_in_header_enables_thinking(
         self, r1_client,
     ) -> None:
+        """Tools present + ``X-Proxy-Thinking: true``: the proxy MUST
+        inject ``chat_template_kwargs: {enable_thinking: True}`` to
+        override the service default.
+        """
         capture = _StreamCapture()
         with patch("routes.stream_llm", new=capture), \
              patch(
@@ -340,16 +354,19 @@ class TestToolCallThinkingDefault:
 
         assert response.status_code == 200, response.text
         assert capture.payload is not None
-        # With the opt-in header, the proxy must NOT inject
-        # chat_template_kwargs; the model keeps its default thinking mode.
-        assert "chat_template_kwargs" not in capture.payload, (
-            f"opt-in header must suppress the default; got {capture.payload!r}"
+        assert capture.payload.get("chat_template_kwargs") == {"enable_thinking": True}, (
+            f"opt-in header must force thinking on even for tool requests; "
+            f"got {capture.payload!r}"
         )
 
     @pytest.mark.asyncio
-    async def test_non_tools_request_does_not_inject_template_kwargs(
+    async def test_tools_request_with_opt_out_header_disables_thinking(
         self, r1_client,
     ) -> None:
+        """Tools present + ``X-Proxy-Thinking: false``: explicit
+        ``enable_thinking: False`` (same effect as service default
+        but stated explicitly for documentation).
+        """
         capture = _StreamCapture()
         with patch("routes.stream_llm", new=capture), \
              patch(
@@ -360,7 +377,46 @@ class TestToolCallThinkingDefault:
                 "/v1/chat/completions",
                 json={
                     "model": "professional",
-                    "messages": [{"role": "user", "content": "hello"}],
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": [{
+                        "type": "function",
+                        "function": {
+                            "name": "exec_shell",
+                            "description": "Run a shell command",
+                            "parameters": {"type": "object"},
+                        },
+                    }],
+                },
+                headers={
+                    "Authorization": "Bearer agent-key",
+                    "X-Proxy-Thinking": "false",
+                },
+            )
+            await response.aread()
+
+        assert response.status_code == 200, response.text
+        assert capture.payload is not None
+        assert capture.payload.get("chat_template_kwargs") == {"enable_thinking": False}
+
+    @pytest.mark.asyncio
+    async def test_non_tools_request_enables_thinking_by_default(
+        self, r1_client,
+    ) -> None:
+        """No tools, no header: the proxy opts into thinking because
+        reasoning helps for non-tool tasks (multi-step chat, planning,
+        code, etc.).  This is the proxy's intelligence layer.
+        """
+        capture = _StreamCapture()
+        with patch("routes.stream_llm", new=capture), \
+             patch(
+                 "routes.classify_with_frontdesk",
+                 new=AsyncMock(return_value=_classification()),
+             ):
+            response = await r1_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "professional",
+                    "messages": [{"role": "user", "content": "explain the proxy architecture"}],
                 },
                 headers={"Authorization": "Bearer agent-key"},
             )
@@ -368,19 +424,49 @@ class TestToolCallThinkingDefault:
 
         assert response.status_code == 200, response.text
         assert capture.payload is not None
-        assert "chat_template_kwargs" not in capture.payload
+        assert capture.payload.get("chat_template_kwargs") == {"enable_thinking": True}, (
+            f"non-tool request must opt into thinking; got {capture.payload!r}"
+        )
 
     @pytest.mark.asyncio
-    async def test_thinking_disable_persists_across_multi_turn(
+    async def test_non_tools_request_with_opt_out_header_disables_thinking(
         self, r1_client,
     ) -> None:
-        """The proxy must apply ``chat_template_kwargs: {enable_thinking: false}``
-        on every tool-calling request, not just the first.  Note: the model
-        may still re-enable thinking after a few turns (a chat-template
-        behavior); the proxy's contract is to send the disable on every
-        request, not to suppress the model from re-enabling it.
+        """No tools + ``X-Proxy-Thinking: false``: client can opt out
+        of thinking even for non-tool tasks.
         """
-        # First turn
+        capture = _StreamCapture()
+        with patch("routes.stream_llm", new=capture), \
+             patch(
+                 "routes.classify_with_frontdesk",
+                 new=AsyncMock(return_value=_classification()),
+             ):
+            response = await r1_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "professional",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                headers={
+                    "Authorization": "Bearer agent-key",
+                    "X-Proxy-Thinking": "false",
+                },
+            )
+            await response.aread()
+
+        assert response.status_code == 200, response.text
+        assert capture.payload is not None
+        assert capture.payload.get("chat_template_kwargs") == {"enable_thinking": False}
+
+    @pytest.mark.asyncio
+    async def test_thinking_default_persists_across_multi_turn(
+        self, r1_client,
+    ) -> None:
+        """The proxy must apply the same thinking default on every
+        turn, not just the first.  Whether the model respects it is
+        a model-level concern.
+        """
+        # Turn 1: non-tool request, opt-in
         capture_1 = _StreamCapture()
         with patch("routes.stream_llm", new=capture_1), \
              patch(
@@ -394,23 +480,15 @@ class TestToolCallThinkingDefault:
                     "messages": [
                         {"role": "user", "content": "first question"},
                     ],
-                    "tools": [{
-                        "type": "function",
-                        "function": {
-                            "name": "exec_shell",
-                            "description": "Run a shell command",
-                            "parameters": {"type": "object"},
-                        },
-                    }],
                 },
                 headers={"Authorization": "Bearer agent-key"},
             )
             await response.aread()
         assert response.status_code == 200
         assert capture_1.payload is not None
-        assert capture_1.payload.get("chat_template_kwargs") == {"enable_thinking": False}
+        assert capture_1.payload.get("chat_template_kwargs") == {"enable_thinking": True}
 
-        # Second turn (multi-turn — same conversation, more messages)
+        # Turn 2: tool request in same conversation, service default
         capture_2 = _StreamCapture()
         with patch("routes.stream_llm", new=capture_2), \
              patch(
@@ -424,7 +502,7 @@ class TestToolCallThinkingDefault:
                     "messages": [
                         {"role": "user", "content": "first question"},
                         {"role": "assistant", "content": "first answer"},
-                        {"role": "user", "content": "second question"},
+                        {"role": "user", "content": "now run a command"},
                     ],
                     "tools": [{
                         "type": "function",
@@ -440,9 +518,9 @@ class TestToolCallThinkingDefault:
             await response.aread()
         assert response.status_code == 200
         assert capture_2.payload is not None
-        # The proxy MUST still inject chat_template_kwargs on turn 2.
-        # Whether the model respects it is a model-level concern.
-        assert capture_2.payload.get("chat_template_kwargs") == {"enable_thinking": False}, (
-            f"thinking disable must persist across multi-turn; turn 2 "
-            f"payload was {capture_2.payload!r}"
+        # Turn 2 with tools: service default (off) wins; proxy MUST
+        # NOT inject chat_template_kwargs.
+        assert "chat_template_kwargs" not in capture_2.payload, (
+            f"tool request on turn 2 must let service default apply; "
+            f"got {capture_2.payload!r}"
         )

@@ -598,18 +598,26 @@ async def chat_completions(request: Request) -> StreamingResponse:
         payload["thinking_budget_tokens"] = parameters["thinking_budget_tokens"]
     if tools:
         payload["tools"] = tools
-        # Disable Qwen 3.5's extended-thinking mode for tool-calling requests.
-        # When the model is in thinking mode it produces a long reasoning_content
-        # stream BEFORE the tool call, which (a) wastes tokens, (b) confuses
-        # llama.cpp's tool-call parser because the reasoning preamble is
-        # adjacent to the tool-call XML in the same content stream, and (c)
-        # surfaces raw model reasoning to OpenAI-compatible clients that
-        # render it inline. Disabling thinking here makes the model emit
-        # the tool call directly. Clients can opt back in with the
-        # `X-Proxy-Thinking: true` request header.
-        opt_in_thinking = headers.get("x-proxy-thinking", "").lower() == "true"
-        if not opt_in_thinking:
-            payload["chat_template_kwargs"] = {"enable_thinking": False}
+
+    # Thinking-mode control — relies on the service-level default being
+    # ``enable_thinking: false`` (the safe setting, so thinking never
+    # leaks into tool-calling flows or surprises a client that bypasses
+    # the proxy).  The proxy is the "intelligence" layer that opts in
+    # for non-tool tasks where reasoning actually helps.  The header
+    # ``X-Proxy-Thinking`` overrides the default in either direction.
+    thinking_header = headers.get("x-proxy-thinking", "").lower()
+    if thinking_header == "true":
+        payload["chat_template_kwargs"] = {"enable_thinking": True}
+    elif thinking_header == "false":
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+    elif not tools:
+        # No header, no tools: opt into thinking.  Reasoning helps for
+        # multi-step chat, planning, code, and other non-tool tasks.
+        payload["chat_template_kwargs"] = {"enable_thinking": True}
+    # else: no header, tools present: let the service default (off) win.
+    # This is the case the user originally hit — the model would emit a
+    # 60-100 chunk reasoning preamble that confused the tool-call parser
+    # and surfaced raw reasoning in the chat.
 
     # Forward additional OpenAI fields from the client body (R11 hardening).
     for field in OPENAI_FORWARD_FIELDS:

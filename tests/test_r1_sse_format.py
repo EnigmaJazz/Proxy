@@ -51,15 +51,19 @@ def _make_profile_table() -> ModelProfileTable:
     ])
 
 
-def _classification() -> dict[str, Any]:
+def _classification(
+    intent: str = "CHAT",
+    *,
+    tools_required: bool = False,
+) -> dict[str, Any]:
     return {
         "is_valid": True,
-        "intent": "CHAT",
+        "intent": intent,
         "priority": 2,
         "complexity": "low",
         "project_name": "general",
         "is_factual": False,
-        "tools_required": False,
+        "tools_required": tools_required,
     }
 
 
@@ -402,15 +406,18 @@ class TestToolCallThinkingDefault:
     async def test_non_tools_request_enables_thinking_by_default(
         self, r1_client,
     ) -> None:
-        """No tools, no header: the proxy opts into thinking because
-        reasoning helps for non-tool tasks (multi-step chat, planning,
-        code, etc.).  This is the proxy's intelligence layer.
+        """No tools, no header, classifier says complex intent + no tools
+        needed: the proxy opts into thinking because reasoning helps for
+        non-tool tasks (multi-step chat, planning, code, etc.).  This
+        is the proxy's intelligence layer.
         """
         capture = _StreamCapture()
         with patch("routes.stream_llm", new=capture), \
              patch(
                  "routes.classify_with_frontdesk",
-                 new=AsyncMock(return_value=_classification()),
+                 new=AsyncMock(return_value=_classification(
+                     "CODE", tools_required=False,
+                 )),
              ):
             response = await r1_client.post(
                 "/v1/chat/completions",
@@ -425,8 +432,71 @@ class TestToolCallThinkingDefault:
         assert response.status_code == 200, response.text
         assert capture.payload is not None
         assert capture.payload.get("chat_template_kwargs") == {"enable_thinking": True}, (
-            f"non-tool request must opt into thinking; got {capture.payload!r}"
+            f"non-tool request with complex intent must opt into thinking; "
+            f"got {capture.payload!r}"
         )
+
+    @pytest.mark.asyncio
+    async def test_non_tools_request_with_tools_required_keeps_thinking_off(
+        self, r1_client,
+    ) -> None:
+        """No tools in request, but classifier says tools ARE required
+        (e.g. the user asked for code, scholar, or architect work and
+        is likely to add tools in a follow-up).  The proxy keeps
+        thinking OFF to avoid the tool-call/parser conflicts that
+        originally surfaced this whole issue.
+        """
+        capture = _StreamCapture()
+        with patch("routes.stream_llm", new=capture), \
+             patch(
+                 "routes.classify_with_frontdesk",
+                 new=AsyncMock(return_value=_classification(
+                     "CODE", tools_required=True,
+                 )),
+             ):
+            response = await r1_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "professional",
+                    "messages": [{"role": "user", "content": "refactor this code"}],
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            await response.aread()
+
+        assert response.status_code == 200, response.text
+        assert capture.payload is not None
+        assert "chat_template_kwargs" not in capture.payload, (
+            f"classifier set tools_required=True — proxy must NOT opt into "
+            f"thinking; got {capture.payload!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_tools_chat_request_keeps_thinking_off(
+        self, r1_client,
+    ) -> None:
+        """No tools, CHAT intent, no header: simple chat skips thinking
+        (the model is faster and cheaper without the preamble).
+        """
+        capture = _StreamCapture()
+        with patch("routes.stream_llm", new=capture), \
+             patch(
+                 "routes.classify_with_frontdesk",
+                 new=AsyncMock(return_value=_classification("CHAT")),
+             ):
+            response = await r1_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "professional",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            await response.aread()
+
+        assert response.status_code == 200, response.text
+        assert capture.payload is not None
+        assert "chat_template_kwargs" not in capture.payload
 
     @pytest.mark.asyncio
     async def test_non_tools_request_with_opt_out_header_disables_thinking(
@@ -466,12 +536,15 @@ class TestToolCallThinkingDefault:
         turn, not just the first.  Whether the model respects it is
         a model-level concern.
         """
-        # Turn 1: non-tool request, opt-in
+        # Turn 1: non-tool CODE request, classifier says tools not
+        # required → opt-in
         capture_1 = _StreamCapture()
         with patch("routes.stream_llm", new=capture_1), \
              patch(
                  "routes.classify_with_frontdesk",
-                 new=AsyncMock(return_value=_classification()),
+                 new=AsyncMock(return_value=_classification(
+                     "CODE", tools_required=False,
+                 )),
              ):
             response = await r1_client.post(
                 "/v1/chat/completions",
@@ -493,7 +566,9 @@ class TestToolCallThinkingDefault:
         with patch("routes.stream_llm", new=capture_2), \
              patch(
                  "routes.classify_with_frontdesk",
-                 new=AsyncMock(return_value=_classification()),
+                 new=AsyncMock(return_value=_classification(
+                     "TOOL", tools_required=True,
+                 )),
              ):
             response = await r1_client.post(
                 "/v1/chat/completions",

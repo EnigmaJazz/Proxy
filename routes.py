@@ -603,17 +603,41 @@ async def chat_completions(request: Request) -> StreamingResponse:
     # ``enable_thinking: false`` (the safe setting, so thinking never
     # leaks into tool-calling flows or surprises a client that bypasses
     # the proxy).  The proxy is the "intelligence" layer that opts in
-    # for non-tool tasks where reasoning actually helps.  The header
-    # ``X-Proxy-Thinking`` overrides the default in either direction.
+    # only for tasks where reasoning actually helps, using BOTH the
+    # frontdesk classifier's intent AND its ``tools_required`` flag:
+    #
+    #   - tools in request:  no thinking (service default wins)
+    #   - tools_required:    no thinking (classifier says the user
+    #                         likely wants tools; tool calls would
+    #                         re-introduce the original bug)
+    #   - intent is CHAT:    no thinking (simple chat)
+    #   - otherwise:         opt into thinking (the model benefits
+    #                         from planning for code/scholar/creative/
+    #                         architect tasks where no tools are needed)
+    #
+    # The ``X-Proxy-Thinking`` header overrides the heuristic in either
+    # direction: ``true`` forces thinking on, ``false`` forces it off.
     thinking_header = headers.get("x-proxy-thinking", "").lower()
     if thinking_header == "true":
         payload["chat_template_kwargs"] = {"enable_thinking": True}
     elif thinking_header == "false":
         payload["chat_template_kwargs"] = {"enable_thinking": False}
     elif not tools:
-        # No header, no tools: opt into thinking.  Reasoning helps for
-        # multi-step chat, planning, code, and other non-tool tasks.
-        payload["chat_template_kwargs"] = {"enable_thinking": True}
+        intent = (classification or {}).get("intent", "").upper()
+        tools_required = (classification or {}).get("tools_required", False)
+        # Opt into thinking only for complex intents where the classifier
+        # has determined that tools are NOT required.  For tool-heavy
+        # workflows (classifier set tools_required=True) the user is
+        # likely to add tools in this turn or a follow-up, so keep
+        # thinking off to avoid the tool-call/parser conflicts that
+        # originally surfaced this whole issue.
+        if (
+            intent in ("CODE", "SCHOLAR", "CREATIVE", "ARCHITECT")
+            and not tools_required
+        ):
+            payload["chat_template_kwargs"] = {"enable_thinking": True}
+        # else: CHAT, TOOL intent (without tools), or tools_required=True
+        # → let service default (off) win.
     # else: no header, tools present: let the service default (off) win.
     # This is the case the user originally hit — the model would emit a
     # 60-100 chunk reasoning preamble that confused the tool-call parser

@@ -7,6 +7,7 @@ import pytest
 
 from text_to_structured import (
     ToolCallTextToStructured,
+    _format_status,
     _parse_tool_call_inner,
 )
 
@@ -75,6 +76,89 @@ class TestParseToolCallInner:
 
 
 # ---------------------------------------------------------------------------
+# Status formatter
+# ---------------------------------------------------------------------------
+
+class TestFormatStatus:
+    """The status message is what shows in Telegram before each tool
+    call.  Custom formats for the local tools (exec, read_file, etc.)
+    keep it one line of useful info; the generic fallback handles
+    unknown tool names."""
+
+    def test_exec_uses_command_in_code_block(self) -> None:
+        tc = {
+            "id": "call_1",
+            "type": "function",
+            "function": {
+                "name": "exec",
+                "arguments": json.dumps({"command": "sensors 2>/dev/null"}),
+            },
+        }
+        status = _format_status(tc)
+        assert status == "🔧 exec: `sensors 2>/dev/null`"
+
+    def test_exec_truncates_long_commands(self) -> None:
+        long_cmd = "echo " + "x" * 500
+        tc = {
+            "id": "call_1",
+            "type": "function",
+            "function": {
+                "name": "exec",
+                "arguments": json.dumps({"command": long_cmd}),
+            },
+        }
+        status = _format_status(tc)
+        assert "…" in status
+        assert len(status) < 250
+
+    def test_web_search_uses_query(self) -> None:
+        tc = {
+            "function": {
+                "name": "web_search",
+                "arguments": json.dumps({"query": "Qwen 3.5"}),
+            },
+        }
+        status = _format_status(tc)
+        assert 'web_search' in status
+        assert "Qwen 3.5" in status
+
+    def test_read_file_uses_path(self) -> None:
+        tc = {
+            "function": {
+                "name": "read_file",
+                "arguments": json.dumps({"path": "/etc/zramswap"}),
+            },
+        }
+        status = _format_status(tc)
+        assert "read_file" in status
+        assert "/etc/zramswap" in status
+
+    def test_generic_fallback_for_unknown_tool(self) -> None:
+        tc = {
+            "function": {
+                "name": "unknown_tool",
+                "arguments": json.dumps({"arg": "value"}),
+            },
+        }
+        status = _format_status(tc)
+        assert "unknown_tool" in status
+        assert "arg" in status
+
+    def test_handles_malformed_arguments(self) -> None:
+        # Arguments that don't parse as JSON fall back to a simple
+        # "name(args)" format.
+        tc = {
+            "function": {
+                "name": "exec",
+                "arguments": "not valid json",
+            },
+        }
+        status = _format_status(tc)
+        assert "exec" in status
+        assert "not valid json" in status
+
+
+# ---------------------------------------------------------------------------
 # State machine: streaming behavior
 # ---------------------------------------------------------------------------
 
@@ -110,9 +194,12 @@ class TestFeedSingleChunk:
             "</tool_call>"
         )
         emits = sm.feed(text)
-        assert len(emits) == 1
-        assert "tool_calls" in emits[0]
-        tc = emits[0]["tool_calls"][0]
+        # Expect: a status content chunk + the structured tool call.
+        assert len(emits) == 2
+        assert "content" in emits[0]
+        assert "exec" in emits[0]["content"] or "ls" in emits[0]["content"]
+        assert "tool_calls" in emits[1]
+        tc = emits[1]["tool_calls"][0]
         assert tc["type"] == "function"
         assert tc["function"]["name"] == "exec_shell"
         assert json.loads(tc["function"]["arguments"]) == {"command": "ls"}
@@ -126,8 +213,10 @@ class TestFeedMultiChunk:
         assert emits_1 == []  # buffered
         # Chunk 2: rest + close tag
         emits_2 = sm.feed("ls</parameter></function></tool_call>")
-        assert len(emits_2) == 1
-        tc = emits_2[0]["tool_calls"][0]
+        # Expect: status + tool_call
+        assert len(emits_2) == 2
+        assert "content" in emits_2[0]
+        tc = emits_2[1]["tool_calls"][0]
         assert tc["function"]["name"] == "exec_shell"
         assert json.loads(tc["function"]["arguments"]) == {"command": "ls"}
 
@@ -143,8 +232,10 @@ class TestFeedMultiChunk:
         assert emits == []
         # Close
         emits = sm.feed("</tool_call>")
-        assert len(emits) == 1
-        assert "tool_calls" in emits[0]
+        # Expect: status + tool_call
+        assert len(emits) == 2
+        assert "content" in emits[0]
+        assert "tool_calls" in emits[1]
         # Post-content
         emits = sm.feed(" Done.")
         assert emits == [{"content": " Done."}]
@@ -156,11 +247,14 @@ class TestFeedMultiChunk:
             "<tool_call><function=b><parameter=y>2</parameter></function></tool_call>"
         )
         emits = sm.feed(text)
-        assert len(emits) == 2
-        assert emits[0]["tool_calls"][0]["function"]["name"] == "a"
-        assert emits[1]["tool_calls"][0]["function"]["name"] == "b"
-        assert json.loads(emits[0]["tool_calls"][0]["function"]["arguments"]) == {"x": 1}
-        assert json.loads(emits[1]["tool_calls"][0]["function"]["arguments"]) == {"y": 2}
+        # Expect: status(a) + tool_call(a) + status(b) + tool_call(b)
+        assert len(emits) == 4
+        assert "content" in emits[0]
+        assert emits[1]["tool_calls"][0]["function"]["name"] == "a"
+        assert "content" in emits[2]
+        assert emits[3]["tool_calls"][0]["function"]["name"] == "b"
+        assert json.loads(emits[1]["tool_calls"][0]["function"]["arguments"]) == {"x": 1}
+        assert json.loads(emits[3]["tool_calls"][0]["function"]["arguments"]) == {"y": 2}
 
     def test_tool_call_split_at_partial_prefix(self) -> None:
         """The model might emit chunks that split inside the open tag
@@ -174,11 +268,12 @@ class TestFeedMultiChunk:
         emits_2 = sm.feed(
             "ool_call><function=foo><parameter=x>1</parameter></function></tool_call>"
         )
-        # The state machine emits the pre-content ("Let me check ")
-        # and the structured tool call as separate chunks.
-        assert len(emits_2) == 2
+        # The state machine emits the pre-content ("Let me check "),
+        # then a status message, then the structured tool call.
+        assert len(emits_2) == 3
         assert emits_2[0] == {"content": "Let me check "}
-        assert emits_2[1]["tool_calls"][0]["function"]["name"] == "foo"
+        assert "content" in emits_2[1]  # status message
+        assert emits_2[2]["tool_calls"][0]["function"]["name"] == "foo"
 
     def test_partial_open_at_chunk_boundary(self) -> None:
         """Chunk 1: '<tool_call>' (complete open tag, no close yet)."""
@@ -186,8 +281,10 @@ class TestFeedMultiChunk:
         emits_1 = sm.feed("<tool_call><function=foo>")
         assert emits_1 == []  # no close, nothing emitted
         emits_2 = sm.feed("<parameter=x>1</parameter></function></tool_call>")
-        assert len(emits_2) == 1
-        assert emits_2[0]["tool_calls"][0]["function"]["name"] == "foo"
+        # Expect: status + tool_call
+        assert len(emits_2) == 2
+        assert "content" in emits_2[0]  # status
+        assert emits_2[1]["tool_calls"][0]["function"]["name"] == "foo"
 
 
 # ---------------------------------------------------------------------------
@@ -302,3 +399,21 @@ class TestRealWorldPattern:
             e["content"] for e in all_emits if "content" in e
         )
         assert "let me check the value" in pre_text
+
+        # A status message for the tool call should be present, emitted
+        # BEFORE the structured tool call.
+        status_emits = [
+            e
+            for e in all_emits
+            if "content" in e
+            and ("exec" in e["content"] or "zram" in e["content"])
+        ]
+        assert len(status_emits) >= 1
+        # The status must come before the tool call in the emit order.
+        last_status_idx = max(
+            i for i, e in enumerate(all_emits) if e is status_emits[-1]
+        )
+        first_tool_call_idx = next(
+            i for i, e in enumerate(all_emits) if "tool_calls" in e
+        )
+        assert last_status_idx < first_tool_call_idx

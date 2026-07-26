@@ -796,6 +796,11 @@ async def _event_stream(
     # clients expect delta.tool_calls JSON.  This state machine bridges
     # the two formats.  See proxy/text_to_structured.py.
     text_to_structured = ToolCallTextToStructured()
+    # Buffer for accumulating tool call chunks by index, so we can
+    # emit a status message with the FULL arguments once the tool call
+    # is complete (not per-chunk with partial args).  Each entry is
+    # an accumulated tool call dict.
+    pending_tool_calls: dict[int, dict[str, Any]] = {}
 
     # ---- Yield proxy-injected preamble events -----------------------------
     # These events (e.g. params_replaced) are emitted before the triage
@@ -875,6 +880,32 @@ async def _event_stream(
                 # the original chunk's other fields (id, model, role,
                 # reasoning_content, finish_reason).
                 for tts in tts_emits:
+                    # If this is a tool_calls emit, accumulate the tool
+                    # call chunks by index so we can emit a status
+                    # message with the FULL arguments once complete.
+                    if "tool_calls" in tts and tts["tool_calls"]:
+                        for tc in tts["tool_calls"]:
+                            idx = tc.get("index", 0)
+                            if idx not in pending_tool_calls:
+                                pending_tool_calls[idx] = {
+                                    "id": tc.get("id", ""),
+                                    "type": tc.get("type", "function"),
+                                    "function": {
+                                        "name": "",
+                                        "arguments": "",
+                                    },
+                                }
+                            acc = pending_tool_calls[idx]
+                            if "id" in tc and tc["id"]:
+                                acc["id"] = tc["id"]
+                            if "type" in tc and tc["type"]:
+                                acc["type"] = tc["type"]
+                            if "function" in tc:
+                                func = tc["function"]
+                                if "name" in func and func["name"]:
+                                    acc["function"]["name"] = func["name"]
+                                if "arguments" in func and func["arguments"]:
+                                    acc["function"]["arguments"] += func["arguments"]
                     tts_chunk = {
                         "id": chunk.get("id"),
                         "object": "chat.completion.chunk",
@@ -889,8 +920,38 @@ async def _event_stream(
                     }
                     yield f"data: {json.dumps(tts_chunk)}\n\n"
             elif not delta_content:
-                # No content in this chunk — emit the original verbatim
-                # (it has role, finish_reason, etc. that need to pass through).
+                # No content in this chunk.  Check if it has tool_calls
+                # (model produced structured tool calls directly) and
+                # accumulate them by index.
+                delta_tool_calls = (
+                    choices[0].get("delta", {}).get("tool_calls")
+                    if choices else None
+                )
+                if delta_tool_calls:
+                    for tc in delta_tool_calls:
+                        idx = tc.get("index", 0)
+                        if idx not in pending_tool_calls:
+                            pending_tool_calls[idx] = {
+                                "id": tc.get("id", ""),
+                                "type": tc.get("type", "function"),
+                                "function": {
+                                    "name": "",
+                                    "arguments": "",
+                                },
+                            }
+                        acc = pending_tool_calls[idx]
+                        if "id" in tc and tc["id"]:
+                            acc["id"] = tc["id"]
+                        if "type" in tc and tc["type"]:
+                            acc["type"] = tc["type"]
+                        if "function" in tc:
+                            func = tc["function"]
+                            if "name" in func and func["name"]:
+                                acc["function"]["name"] = func["name"]
+                            if "arguments" in func and func["arguments"]:
+                                acc["function"]["arguments"] += func["arguments"]
+                # Emit the original chunk verbatim (it has tool_calls
+                # or other fields that need to pass through).
                 yield f"data: {json.dumps(chunk)}\n\n"
             else:
                 # delta_content was non-empty but produced no tts emits
@@ -899,6 +960,35 @@ async def _event_stream(
                 # chunk — the next chunk will produce the emit when the
                 # tool call completes.
                 pass
+
+            # ---- Emit status messages for completed tool calls -----------
+            # When the model sets finish_reason (any non-null value), all
+            # accumulated tool calls are complete.  Emit the status
+            # messages BEFORE the finish_reason chunk so the user sees
+            # the tool call description before the stream end.
+            finish_reason = (
+                choices[0].get("finish_reason")
+                if choices else None
+            )
+            if finish_reason and pending_tool_calls:
+                from text_to_structured import _format_status
+                for idx, tc in pending_tool_calls.items():
+                    status_msg = _format_status(tc)
+                    if status_msg:
+                        status_chunk = {
+                            "id": chunk.get("id"),
+                            "object": "chat.completion.chunk",
+                            "created": chunk.get("created"),
+                            "model": chunk.get("model"),
+                            "system_fingerprint": chunk.get("system_fingerprint"),
+                            "choices": [{
+                                "index": choices[0].get("index", 0),
+                                "delta": {"content": status_msg + "\n"},
+                                "finish_reason": None,  # not yet, this comes in the next chunk
+                            }],
+                        }
+                        yield f"data: {json.dumps(status_chunk)}\n\n"
+                pending_tool_calls = {}
 
         # ---- Stream completed successfully ----------------------------------
         if db:

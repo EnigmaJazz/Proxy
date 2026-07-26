@@ -41,6 +41,51 @@ _PARAMETER_TAG_RE = re.compile(
 )
 
 
+def _format_status(tool_call: dict[str, Any]) -> str:
+    """Build a short human-readable status message for a parsed tool call.
+
+    The status is emitted as a content delta *before* the structured
+    ``delta.tool_calls`` chunk so nanobot-ai (and the user via Telegram)
+    can see what the model is calling without seeing the raw
+    ``<tool_call>`` XML.  Falls back to a generic format for tool
+    names that don't have a custom handler.
+    """
+    name = tool_call.get("function", {}).get("name", "?")
+    args_str = tool_call.get("function", {}).get("arguments", "{}")
+    try:
+        args = json.loads(args_str)
+    except (json.JSONDecodeError, ValueError):
+        return f"🔧 Calling {name}({args_str})"
+
+    # Custom formats for the tools registered in the local system so
+    # the most common calls are one line of useful information.
+    if name == "exec" and "command" in args:
+        cmd = args["command"]
+        # Truncate very long commands so the chat stays readable.
+        if len(cmd) > 200:
+            cmd = cmd[:200] + "…"
+        return f"🔧 exec: `{cmd}`"
+    if name == "web_search" and "query" in args:
+        return f"🔧 web_search: \"{args['query']}\""
+    if name == "web_fetch" and "url" in args:
+        return f"🔧 web_fetch: {args['url']}"
+    if name == "read_file" and "path" in args:
+        return f"🔧 read_file: {args['path']}"
+    if name == "write_file" and "path" in args:
+        return f"🔧 write_file: {args['path']}"
+    if name == "edit_file" and "path" in args:
+        return f"🔧 edit_file: {args['path']}"
+    if name == "list_files" and "path" in args:
+        return f"🔧 list_files: {args['path']}"
+    if name == "cron":
+        # Cron args: schedule, command, channel, user_id
+        schedule = args.get("schedule", "?")
+        command = args.get("command", "?")
+        return f"🔧 cron ({schedule}): `{command}`"
+    # Generic fallback
+    return f"🔧 {name}({json.dumps(args, ensure_ascii=False)})"
+
+
 def _parse_tool_call_inner(text: str, call_id: str) -> dict[str, Any] | None:
     """Parse the text between ``<tool_call>`` and ``</tool_call>``.
 
@@ -176,6 +221,11 @@ class ToolCallTextToStructured:
                     # intent even if we can't parse it.
                     emits.append({"content": _OPEN_TAG + inner + _CLOSE_TAG})
                 else:
+                    # Emit a human-readable status message BEFORE the
+                    # structured tool call so nanobot-ai (and the user
+                    # via Telegram) can see what the model is doing
+                    # without the raw <tool_call> XML.
+                    emits.append({"content": _format_status(parsed) + "\n"})
                     emits.append({"tool_calls": [parsed]})
                 self._buffer = self._buffer[close_idx + len(_CLOSE_TAG):]
                 self._in_tool_call = False

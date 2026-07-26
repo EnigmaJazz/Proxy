@@ -620,9 +620,9 @@ async def chat_completions(request: Request) -> StreamingResponse:
     #     BUT classifier says tools required   → enable_thinking: False
     thinking_header = headers.get("x-proxy-thinking", "").lower()
     if thinking_header == "true":
-        payload["chat_template_kwargs"] = {"enable_thinking": True}
+        payload["chat_template_kwargs"] = {"enable_thinking": True, "preserve_thinking": True}
     elif thinking_header == "false":
-        payload["chat_template_kwargs"] = {"enable_thinking": False}
+        payload["chat_template_kwargs"] = {"enable_thinking": False, "preserve_thinking": False}
     elif not tools:
         intent = (classification or {}).get("intent", "").upper()
         tools_required = (classification or {}).get("tools_required", False)
@@ -630,17 +630,26 @@ async def chat_completions(request: Request) -> StreamingResponse:
             intent in ("CODE", "SCHOLAR", "CREATIVE", "ARCHITECT")
             and not tools_required
         ):
-            payload["chat_template_kwargs"] = {"enable_thinking": True}
+            payload["chat_template_kwargs"] = {"enable_thinking": True, "preserve_thinking": True}
         else:
             # CHAT, TOOL, or tools_required=True: no thinking
-            payload["chat_template_kwargs"] = {"enable_thinking": False}
+            payload["chat_template_kwargs"] = {"enable_thinking": False, "preserve_thinking": False}
     else:
         # Tools in request, no header: explicit opt-out.  Defense in
         # depth — even if the service's ``--chat-template-kwargs`` is
         # ignored after the first turn (which it is, per Qwen 3.5's
         # chat template behavior), the proxy's per-request setting is
         # always honored.
-        payload["chat_template_kwargs"] = {"enable_thinking": False}
+        #
+        # ``preserve_thinking: false`` is critical here: the fixed
+        # chat template (froggeric v21) emits an empty ``<think>\n\n
+        # ``</think>\n\n`` placeholder when ``enable_thinking: false``
+        # is set.  The model fills that placeholder on turn 4+ of
+        # tool-calling flows, re-introducing the bug.  Setting
+        # ``preserve_thinking: false`` strips past ``<think>`` blocks
+        # from the history so the model doesn't see its own previous
+        # thinking pattern and decide to continue it.
+        payload["chat_template_kwargs"] = {"enable_thinking": False, "preserve_thinking": False}
 
     # Forward additional OpenAI fields from the client body (R11 hardening).
     for field in OPENAI_FORWARD_FIELDS:

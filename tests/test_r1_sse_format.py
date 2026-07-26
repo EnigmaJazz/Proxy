@@ -324,9 +324,12 @@ class TestToolCallThinkingDefault:
 
         assert response.status_code == 200, response.text
         assert capture.payload is not None
-        assert capture.payload.get("chat_template_kwargs") == {"enable_thinking": False}, (
-            f"tools-request must inject enable_thinking: False; "
-            f"got {capture.payload!r}"
+        assert capture.payload.get("chat_template_kwargs") == {
+            "enable_thinking": False,
+            "preserve_thinking": False,
+        }, (
+            f"tools-request must inject enable_thinking: False + "
+            f"preserve_thinking: False; got {capture.payload!r}"
         )
 
     @pytest.mark.asyncio
@@ -366,7 +369,10 @@ class TestToolCallThinkingDefault:
 
         assert response.status_code == 200, response.text
         assert capture.payload is not None
-        assert capture.payload.get("chat_template_kwargs") == {"enable_thinking": True}, (
+        assert capture.payload.get("chat_template_kwargs") == {
+            "enable_thinking": True,
+            "preserve_thinking": True,
+        }, (
             f"opt-in header must force thinking on even for tool requests; "
             f"got {capture.payload!r}"
         )
@@ -408,7 +414,10 @@ class TestToolCallThinkingDefault:
 
         assert response.status_code == 200, response.text
         assert capture.payload is not None
-        assert capture.payload.get("chat_template_kwargs") == {"enable_thinking": False}
+        assert capture.payload.get("chat_template_kwargs") == {
+            "enable_thinking": False,
+            "preserve_thinking": False,
+        }
 
     @pytest.mark.asyncio
     async def test_non_tools_request_enables_thinking_by_default(
@@ -439,7 +448,10 @@ class TestToolCallThinkingDefault:
 
         assert response.status_code == 200, response.text
         assert capture.payload is not None
-        assert capture.payload.get("chat_template_kwargs") == {"enable_thinking": True}, (
+        assert capture.payload.get("chat_template_kwargs") == {
+            "enable_thinking": True,
+            "preserve_thinking": True,
+        }, (
             f"non-tool request with complex intent must opt into thinking; "
             f"got {capture.payload!r}"
         )
@@ -474,7 +486,10 @@ class TestToolCallThinkingDefault:
 
         assert response.status_code == 200, response.text
         assert capture.payload is not None
-        assert capture.payload.get("chat_template_kwargs") == {"enable_thinking": False}, (
+        assert capture.payload.get("chat_template_kwargs") == {
+            "enable_thinking": False,
+            "preserve_thinking": False,
+        }, (
             f"classifier set tools_required=True — proxy must inject "
             f"enable_thinking: False; got {capture.payload!r}"
         )
@@ -504,7 +519,10 @@ class TestToolCallThinkingDefault:
 
         assert response.status_code == 200, response.text
         assert capture.payload is not None
-        assert capture.payload.get("chat_template_kwargs") == {"enable_thinking": False}
+        assert capture.payload.get("chat_template_kwargs") == {
+            "enable_thinking": False,
+            "preserve_thinking": False,
+        }
 
     @pytest.mark.asyncio
     async def test_non_tools_request_with_opt_out_header_disables_thinking(
@@ -534,7 +552,10 @@ class TestToolCallThinkingDefault:
 
         assert response.status_code == 200, response.text
         assert capture.payload is not None
-        assert capture.payload.get("chat_template_kwargs") == {"enable_thinking": False}
+        assert capture.payload.get("chat_template_kwargs") == {
+            "enable_thinking": False,
+            "preserve_thinking": False,
+        }
 
     @pytest.mark.asyncio
     async def test_thinking_default_persists_across_multi_turn(
@@ -567,7 +588,10 @@ class TestToolCallThinkingDefault:
             await response.aread()
         assert response.status_code == 200
         assert capture_1.payload is not None
-        assert capture_1.payload.get("chat_template_kwargs") == {"enable_thinking": True}
+        assert capture_1.payload.get("chat_template_kwargs") == {
+            "enable_thinking": True,
+            "preserve_thinking": True,
+        }
 
         # Turn 2: tool request in same conversation
         capture_2 = _StreamCapture()
@@ -604,7 +628,10 @@ class TestToolCallThinkingDefault:
         # Turn 2 with tools: proxy MUST inject enable_thinking: False
         # explicitly (defense in depth — the service's default isn't
         # honored across multi-turn on Qwen 3.5).
-        assert capture_2.payload.get("chat_template_kwargs") == {"enable_thinking": False}, (
+        assert capture_2.payload.get("chat_template_kwargs") == {
+            "enable_thinking": False,
+            "preserve_thinking": False,
+        }, (
             f"tool request on turn 2 must inject enable_thinking: False; "
             f"got {capture_2.payload!r}"
         )

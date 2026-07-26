@@ -262,33 +262,41 @@ class TestProxyMessagesAsContent:
 # ---------------------------------------------------------------------------
 
 class TestToolCallThinkingDefault:
-    """Architecture: the service file sets ``enable_thinking: false`` as
-    the safe default (so thinking never leaks into tool-calling flows).
-    The proxy is the "intelligence" layer that opts INTO thinking for
-    non-tool tasks where reasoning actually helps.
+    """Architecture: the proxy is the **authoritative** source for
+    ``enable_thinking`` on every request.  The service's
+    ``--chat-template-kwargs '{"enable_thinking": false}'`` is a
+    fallback for clients that bypass the proxy, but it has been
+    observed to NOT be respected across multi-turn conversations on
+    Qwen 3.5 (the chat template honors the override for the first
+    turn only).  Per-request injection is the only reliable mechanism.
 
-    Decision matrix:
-      - tools + no header            → no chat_template_kwargs (service default off)
-      - tools + X-Proxy-Thinking: true  → enable_thinking: True (override on)
-      - tools + X-Proxy-Thinking: false → enable_thinking: False (explicit off)
-      - no tools + no header        → enable_thinking: True (proxy opts in)
-      - no tools + X-Proxy-Thinking: true  → enable_thinking: True (explicit on)
-      - no tools + X-Proxy-Thinking: false → enable_thinking: False (opt out)
+    Decision matrix (the proxy is explicit on every request):
+      - X-Proxy-Thinking: true           → enable_thinking: True
+      - X-Proxy-Thinking: false          → enable_thinking: False
+      - no header, tools in request      → enable_thinking: False
+      - no header, no tools, complex intent
+        (CODE/SCHOLAR/CREATIVE/ARCHITECT)
+        AND not tools_required            → enable_thinking: True
+      - no header, no tools, simple intent → enable_thinking: False
+      - no header, no tools, complex intent
+        AND tools_required                → enable_thinking: False
 
-    The header overrides the default in either direction.  The proxy
-    applies this on every request — the model may still re-enable
-    thinking after a few turns (a chat-template behavior); the fix
-    for that is at the model/service level, not the proxy.
+    The header overrides the default in either direction.  Per-request
+    injection is the only reliable mechanism — see the live-bug
+    context in the test file's module docstring.
     """
 
     @pytest.mark.asyncio
-    async def test_tools_request_lets_service_default_apply(
+    async def test_tools_request_explicitly_disables_thinking(
         self, r1_client,
     ) -> None:
-        """Tools present, no header: the proxy MUST NOT inject
-        ``chat_template_kwargs``.  The service default (off) wins.
-        This is the bug-class the user originally hit — the model
-        was emitting 60-100 reasoning chunks before tool calls.
+        """Tools present, no header: the proxy MUST inject
+        ``chat_template_kwargs: {enable_thinking: False}``.  This is
+        defense in depth — the service's ``--chat-template-kwargs`` is
+        not honored across multi-turn on Qwen 3.5 (only for the first
+        turn), so the proxy sets ``enable_thinking`` on every request
+        to prevent the model from re-enabling thinking mid-conversation
+        and emitting 60-100 reasoning chunks before tool calls.
         """
         capture = _StreamCapture()
         with patch("routes.stream_llm", new=capture), \
@@ -316,8 +324,8 @@ class TestToolCallThinkingDefault:
 
         assert response.status_code == 200, response.text
         assert capture.payload is not None
-        assert "chat_template_kwargs" not in capture.payload, (
-            f"tools-request must let service default (off) apply; "
+        assert capture.payload.get("chat_template_kwargs") == {"enable_thinking": False}, (
+            f"tools-request must inject enable_thinking: False; "
             f"got {capture.payload!r}"
         )
 
@@ -466,9 +474,9 @@ class TestToolCallThinkingDefault:
 
         assert response.status_code == 200, response.text
         assert capture.payload is not None
-        assert "chat_template_kwargs" not in capture.payload, (
-            f"classifier set tools_required=True — proxy must NOT opt into "
-            f"thinking; got {capture.payload!r}"
+        assert capture.payload.get("chat_template_kwargs") == {"enable_thinking": False}, (
+            f"classifier set tools_required=True — proxy must inject "
+            f"enable_thinking: False; got {capture.payload!r}"
         )
 
     @pytest.mark.asyncio
@@ -496,7 +504,7 @@ class TestToolCallThinkingDefault:
 
         assert response.status_code == 200, response.text
         assert capture.payload is not None
-        assert "chat_template_kwargs" not in capture.payload
+        assert capture.payload.get("chat_template_kwargs") == {"enable_thinking": False}
 
     @pytest.mark.asyncio
     async def test_non_tools_request_with_opt_out_header_disables_thinking(
@@ -561,7 +569,7 @@ class TestToolCallThinkingDefault:
         assert capture_1.payload is not None
         assert capture_1.payload.get("chat_template_kwargs") == {"enable_thinking": True}
 
-        # Turn 2: tool request in same conversation, service default
+        # Turn 2: tool request in same conversation
         capture_2 = _StreamCapture()
         with patch("routes.stream_llm", new=capture_2), \
              patch(
@@ -593,9 +601,10 @@ class TestToolCallThinkingDefault:
             await response.aread()
         assert response.status_code == 200
         assert capture_2.payload is not None
-        # Turn 2 with tools: service default (off) wins; proxy MUST
-        # NOT inject chat_template_kwargs.
-        assert "chat_template_kwargs" not in capture_2.payload, (
-            f"tool request on turn 2 must let service default apply; "
+        # Turn 2 with tools: proxy MUST inject enable_thinking: False
+        # explicitly (defense in depth — the service's default isn't
+        # honored across multi-turn on Qwen 3.5).
+        assert capture_2.payload.get("chat_template_kwargs") == {"enable_thinking": False}, (
+            f"tool request on turn 2 must inject enable_thinking: False; "
             f"got {capture_2.payload!r}"
         )

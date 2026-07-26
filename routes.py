@@ -599,24 +599,25 @@ async def chat_completions(request: Request) -> StreamingResponse:
     if tools:
         payload["tools"] = tools
 
-    # Thinking-mode control — relies on the service-level default being
-    # ``enable_thinking: false`` (the safe setting, so thinking never
-    # leaks into tool-calling flows or surprises a client that bypasses
-    # the proxy).  The proxy is the "intelligence" layer that opts in
-    # only for tasks where reasoning actually helps, using BOTH the
-    # frontdesk classifier's intent AND its ``tools_required`` flag:
+    # Thinking-mode control — the proxy is the **authoritative** source
+    # for ``enable_thinking`` on every request.  The service-level
+    # ``--chat-template-kwargs '{"enable_thinking": false}'`` is a
+    # fallback for clients that bypass the proxy, but it has been
+    # observed to NOT be respected across multi-turn conversations on
+    # Qwen 3.5 (the chat template honors the override for the first
+    # turn only).  Per-request injection is the only reliable mechanism.
     #
-    #   - tools in request:  no thinking (service default wins)
-    #   - tools_required:    no thinking (classifier says the user
-    #                         likely wants tools; tool calls would
-    #                         re-introduce the original bug)
-    #   - intent is CHAT:    no thinking (simple chat)
-    #   - otherwise:         opt into thinking (the model benefits
-    #                         from planning for code/scholar/creative/
-    #                         architect tasks where no tools are needed)
+    # Decision matrix (the proxy's contract):
     #
-    # The ``X-Proxy-Thinking`` header overrides the heuristic in either
-    # direction: ``true`` forces thinking on, ``false`` forces it off.
+    #   - X-Proxy-Thinking: true  → enable_thinking: True (force on)
+    #   - X-Proxy-Thinking: false → enable_thinking: False (force off)
+    #   - no header, tools in request        → enable_thinking: False
+    #   - no header, no tools, complex intent
+    #     (CODE/SCHOLAR/CREATIVE/ARCHITECT)
+    #     AND classifier says tools NOT required → enable_thinking: True
+    #   - no header, no tools, simple intent  → enable_thinking: False
+    #   - no header, no tools, complex intent
+    #     BUT classifier says tools required   → enable_thinking: False
     thinking_header = headers.get("x-proxy-thinking", "").lower()
     if thinking_header == "true":
         payload["chat_template_kwargs"] = {"enable_thinking": True}
@@ -625,23 +626,21 @@ async def chat_completions(request: Request) -> StreamingResponse:
     elif not tools:
         intent = (classification or {}).get("intent", "").upper()
         tools_required = (classification or {}).get("tools_required", False)
-        # Opt into thinking only for complex intents where the classifier
-        # has determined that tools are NOT required.  For tool-heavy
-        # workflows (classifier set tools_required=True) the user is
-        # likely to add tools in this turn or a follow-up, so keep
-        # thinking off to avoid the tool-call/parser conflicts that
-        # originally surfaced this whole issue.
         if (
             intent in ("CODE", "SCHOLAR", "CREATIVE", "ARCHITECT")
             and not tools_required
         ):
             payload["chat_template_kwargs"] = {"enable_thinking": True}
-        # else: CHAT, TOOL intent (without tools), or tools_required=True
-        # → let service default (off) win.
-    # else: no header, tools present: let the service default (off) win.
-    # This is the case the user originally hit — the model would emit a
-    # 60-100 chunk reasoning preamble that confused the tool-call parser
-    # and surfaced raw reasoning in the chat.
+        else:
+            # CHAT, TOOL, or tools_required=True: no thinking
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+    else:
+        # Tools in request, no header: explicit opt-out.  Defense in
+        # depth — even if the service's ``--chat-template-kwargs`` is
+        # ignored after the first turn (which it is, per Qwen 3.5's
+        # chat template behavior), the proxy's per-request setting is
+        # always honored.
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
 
     # Forward additional OpenAI fields from the client body (R11 hardening).
     for field in OPENAI_FORWARD_FIELDS:

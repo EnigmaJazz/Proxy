@@ -72,6 +72,68 @@ _PAUSE_RE = re.compile(r"(?i)^\s*/pause(?:\s+(\d+))?\s*$")
 _RESUME_RE = re.compile(r"(?i)^\s*/resume\s*$")
 _CLOUD_RE = re.compile(r"/cloud")
 
+# ---------------------------------------------------------------------------
+# Tool-loop detection (defense in depth against model reasoning loops)
+# ---------------------------------------------------------------------------
+# When a model gets stuck calling the same tool with the same arguments
+# repeatedly (e.g. cat /proc/self/status in a loop), we want the proxy to
+# break the cycle.  This module-level state tracks the last N tool call
+# signatures per job.  When the same signature appears 3+ times in a row,
+# the proxy intercepts the next duplicate and emits a synthetic content
+# message instead of forwarding the duplicate tool_calls chunk.
+#
+# The state is keyed by job_id and capped per-job to avoid unbounded
+# memory growth.  The dict is process-local; if the proxy restarts, the
+# state resets (acceptable: a restart also resets the model's conversation
+# state via nanobot-ai's chat lifecycle).
+_LOOP_DETECTION_WINDOW = 3  # consecutive identical calls trigger detection
+_LOOP_DETECTION_MAX_JOBS = 1000  # cap on tracked jobs (LRU eviction)
+_loop_detection_state: dict[str, list[str]] = {}
+
+
+def _tool_call_signature(tc: dict) -> str:
+    """Build a stable signature for a tool call.
+
+    The signature is ``f"{name}:{args}"`` so two calls with the same
+    function name AND the same arguments string hash to the same
+    signature.  Used to detect consecutive duplicates.
+    """
+    name = tc.get("function", {}).get("name", "")
+    args = tc.get("function", {}).get("arguments", "")
+    return f"{name}:{args}"
+
+
+def _check_tool_loop(
+    job_id: str,
+    signature: str,
+) -> bool:
+    """Record a tool call signature and return True if it's a loop.
+
+    Returns True when the same signature has appeared at least
+    ``_LOOP_DETECTION_WINDOW`` times consecutively for this job.
+    Resets the window when a different signature is seen.
+    """
+    history = _loop_detection_state.setdefault(job_id, [])
+    if history and history[-1] != signature:
+        # Different tool call — reset the consecutive-run window.
+        history.clear()
+    history.append(signature)
+    # Cap per-job history to the window size.
+    if len(history) > _LOOP_DETECTION_WINDOW:
+        del history[0 : len(history) - _LOOP_DETECTION_WINDOW]
+    # LRU-ish cap on total jobs tracked.
+    if len(_loop_detection_state) > _LOOP_DETECTION_MAX_JOBS:
+        # Drop the oldest job_id to bound memory.
+        _loop_detection_state.pop(next(iter(_loop_detection_state)), None)
+    return len(history) >= _LOOP_DETECTION_WINDOW and all(
+        s == signature for s in history
+    )
+
+
+def _clear_tool_loop(job_id: str) -> None:
+    """Drop a job's loop-detection state (called on stream end)."""
+    _loop_detection_state.pop(job_id, None)
+
 
 # ---------------------------------------------------------------------------
 # GET /health
@@ -965,14 +1027,29 @@ async def _event_stream(
             # When the model sets finish_reason (any non-null value), all
             # accumulated tool calls are complete.  Emit the status
             # messages BEFORE the finish_reason chunk so the user sees
-            # the tool call description before the stream end.
+            # the tool call description before the stream end.  Also
+            # check for tool loops here (consecutive identical tool
+            # calls): if detected, emit a synthetic content warning
+            # INSTEAD of the tool_call chunk, so nanobot-ai does not
+            # re-execute the same tool.  The model sees the warning in
+            # its next turn and is expected to use the previous result
+            # or take a fundamentally different approach.
             finish_reason = (
                 choices[0].get("finish_reason")
                 if choices else None
             )
             if finish_reason and pending_tool_calls:
                 from text_to_structured import _format_status
+                looped_indices: set[int] = set()
                 for idx, tc in pending_tool_calls.items():
+                    sig = _tool_call_signature(tc)
+                    if _check_tool_loop(job_id, sig):
+                        looped_indices.add(idx)
+                # Emit status for non-looped tool calls (the loop warning
+                # is emitted by the loop-detection branch below).
+                for idx, tc in pending_tool_calls.items():
+                    if idx in looped_indices:
+                        continue
                     status_msg = _format_status(tc)
                     if status_msg:
                         status_chunk = {
@@ -984,10 +1061,79 @@ async def _event_stream(
                             "choices": [{
                                 "index": choices[0].get("index", 0),
                                 "delta": {"content": status_msg + "\n"},
-                                "finish_reason": None,  # not yet, this comes in the next chunk
+                                "finish_reason": None,
                             }],
                         }
                         yield f"data: {json.dumps(status_chunk)}\n\n"
+                # Emit the actual tool_calls chunks for non-looped calls.
+                # Looped calls are intentionally NOT emitted as
+                # tool_calls so nanobot-ai does not re-execute the same
+                # tool; instead the warning content chunk below is the
+                # sole signal to the client.
+                for idx, tc in pending_tool_calls.items():
+                    if idx in looped_indices:
+                        continue
+                    tc_chunk = {
+                        "id": chunk.get("id"),
+                        "object": "chat.completion.chunk",
+                        "created": chunk.get("created"),
+                        "model": chunk.get("model"),
+                        "system_fingerprint": chunk.get("system_fingerprint"),
+                        "choices": [{
+                            "index": choices[0].get("index", 0),
+                            "delta": {
+                                "role": "assistant",
+                                "tool_calls": [tc],
+                            },
+                            "finish_reason": None,
+                        }],
+                    }
+                    yield f"data: {json.dumps(tc_chunk)}\n\n"
+                # Emit a synthetic content warning for looped calls.
+                # nanobot-ai sees this as the model's response, not as
+                # a tool_call to execute.  The model sees this in its
+                # next turn and (hopefully) stops calling the same tool.
+                for idx, tc in pending_tool_calls.items():
+                    if idx not in looped_indices:
+                        continue
+                    name = tc.get("function", {}).get("name", "?")
+                    args_str = tc.get("function", {}).get("arguments", "{}")
+                    try:
+                        args = json.loads(args_str)
+                        args_repr = json.dumps(args, ensure_ascii=False)
+                    except (json.JSONDecodeError, ValueError):
+                        args_repr = args_str
+                    warning = (
+                        f"⚠️ Tool loop detected: `{name}` was called "
+                        f"{_LOOP_DETECTION_WINDOW}+ times with the same "
+                        f"arguments. The proxy has stopped re-executing "
+                        f"this call. The previous result is still in the "
+                        f"conversation history above. Use that result or "
+                        f"take a fundamentally different approach. "
+                        f"(Arguments: {args_repr})"
+                    )
+                    warn_chunk = {
+                        "id": chunk.get("id"),
+                        "object": "chat.completion.chunk",
+                        "created": chunk.get("created"),
+                        "model": chunk.get("model"),
+                        "system_fingerprint": chunk.get("system_fingerprint"),
+                        "choices": [{
+                            "index": choices[0].get("index", 0),
+                            "delta": {"content": warning + "\n"},
+                            "finish_reason": None,
+                        }],
+                    }
+                    yield f"data: {json.dumps(warn_chunk)}\n\n"
+                    # Also emit a custom event for observability (the
+                    # user's tools, log shippers, etc. can pick this up
+                    # without parsing content).
+                    yield _make_proxy_event("kinver.proxy.tool_loop_detected", {
+                        "job_id": job_id,
+                        "tool": name,
+                        "arguments": args_str,
+                        "ts": int(time.time()),
+                    })
                 pending_tool_calls = {}
 
         # ---- Stream completed successfully ----------------------------------

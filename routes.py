@@ -61,6 +61,7 @@ from routing import (
     CPU_MODELS,
 )
 from auditing import ShadowAuditor
+from text_to_structured import ToolCallTextToStructured
 
 logger = get_logger("proxy.routes")
 
@@ -788,6 +789,13 @@ async def _event_stream(
     full_content: list[str] = []
     chunk_seq = 0
     accumulated = ""
+    # State machine for converting Qwen-style text tool calls in
+    # delta.content to OpenAI structured delta.tool_calls.  The fixed
+    # chat template (froggeric v21) instructs the model to emit
+    # <tool_call>...</tool_call> blocks in content, but OpenAI-compatible
+    # clients expect delta.tool_calls JSON.  This state machine bridges
+    # the two formats.  See proxy/text_to_structured.py.
+    text_to_structured = ToolCallTextToStructured()
 
     # ---- Yield proxy-injected preamble events -----------------------------
     # These events (e.g. params_replaced) are emitted before the triage
@@ -853,16 +861,44 @@ async def _event_stream(
                     job_id, chunk_seq, json.dumps(chunk),
                 )
 
-            # ---- Emit SSE line ------------------------------------------------
-            # Pass the chunk through verbatim.  OpenAI's standard chunks carry
-            # ``delta.content`` (final answer), ``delta.reasoning_content``
-            # (model thinking for a toggleable thinking tab), and
-            # ``delta.tool_calls`` (structured tool invocations).  The proxy
-            # does not rewrite any of these — clients parse and present each
-            # field in its own UI surface.  The proxy's own status messages
-            # (triage, loading, cache, audit_halt) are emitted as custom SSE
-            # events so they never appear as content deltas.
-            yield f"data: {json.dumps(chunk)}\n\n"
+            # ---- Convert text tool calls to structured delta.tool_calls ----
+            # The Qwen 3.5 chat template instructs the model to emit
+            # <tool_call>...</tool_call> blocks as text in delta.content.
+            # OpenAI-compatible clients (nanobot-ai) expect structured
+            # delta.tool_calls JSON.  The state machine below buffers
+            # content across chunks, detects the text-based tool call
+            # blocks, parses them, and emits structured chunks while
+            # stripping the XML text from delta.content.
+            if delta_content:
+                tts_emits = text_to_structured.feed(delta_content)
+                # Emit each tts_emit as a separate SSE chunk, preserving
+                # the original chunk's other fields (id, model, role,
+                # reasoning_content, finish_reason).
+                for tts in tts_emits:
+                    tts_chunk = {
+                        "id": chunk.get("id"),
+                        "object": "chat.completion.chunk",
+                        "created": chunk.get("created"),
+                        "model": chunk.get("model"),
+                        "system_fingerprint": chunk.get("system_fingerprint"),
+                        "choices": [{
+                            "index": choices[0].get("index", 0),
+                            "delta": tts,
+                            "finish_reason": None,
+                        }],
+                    }
+                    yield f"data: {json.dumps(tts_chunk)}\n\n"
+            elif not delta_content:
+                # No content in this chunk — emit the original verbatim
+                # (it has role, finish_reason, etc. that need to pass through).
+                yield f"data: {json.dumps(chunk)}\n\n"
+            else:
+                # delta_content was non-empty but produced no tts emits
+                # (e.g., content was held back because a tool call started
+                # but hasn't closed yet).  Don't emit anything for this
+                # chunk — the next chunk will produce the emit when the
+                # tool call completes.
+                pass
 
         # ---- Stream completed successfully ----------------------------------
         if db:

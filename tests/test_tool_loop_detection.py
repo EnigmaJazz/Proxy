@@ -6,8 +6,11 @@ import pytest
 from routes import (
     _check_tool_loop,
     _clear_tool_loop,
-    _tool_call_signature,
+    _first_user_message_content,
     _loop_detection_state,
+    _resolve_session_id,
+    _session_state,
+    _tool_call_signature,
 )
 
 
@@ -132,3 +135,144 @@ class TestCheckToolLoop:
             _check_tool_loop("job-1", v2)
         assert _check_tool_loop("job-1", v1) is False
         assert _check_tool_loop("job-1", v2) is False
+
+
+# ---------------------------------------------------------------------------
+# First-user-message extraction (for session_id)
+# ---------------------------------------------------------------------------
+
+class TestFirstUserMessageContent:
+    def test_extracts_string_content(self) -> None:
+        messages = [
+            {"role": "system", "content": "you are a helper"},
+            {"role": "user", "content": "what is the cpu temperature"},
+        ]
+        assert _first_user_message_content(messages) == "what is the cpu temperature"
+
+    def test_skips_system_messages(self) -> None:
+        # Multi-line system prompts (common in nanobot-ai) should not
+        # be the session identifier.
+        messages = [
+            {"role": "system", "content": "very long system prompt..."},
+            {"role": "user", "content": "hi"},
+        ]
+        assert _first_user_message_content(messages) == "hi"
+
+    def test_joins_typed_content_parts(self) -> None:
+        # Some clients send content as a list of typed parts.
+        messages = [
+            {"role": "user", "content": [
+                {"type": "text", "text": "hello "},
+                {"type": "text", "text": "world"},
+            ]},
+        ]
+        assert _first_user_message_content(messages) == "hello  world"
+
+    def test_no_user_message_returns_empty(self) -> None:
+        messages = [{"role": "system", "content": "system only"}]
+        assert _first_user_message_content(messages) == ""
+
+
+# ---------------------------------------------------------------------------
+# Session ID resolution (for cross-request loop detection)
+# ---------------------------------------------------------------------------
+
+class TestResolveSessionId:
+    """``_resolve_session_id`` returns a stable session_id per
+    conversation.  Two simultaneous sessions with the same first
+    user message get DIFFERENT session_ids because the time
+    component is the FIRST time the proxy saw that first message.
+    """
+
+    def test_same_first_message_same_session_id_across_calls(self) -> None:
+        messages = [{"role": "user", "content": "what is the cpu temp"}]
+        s1 = _resolve_session_id(messages)
+        s2 = _resolve_session_id(messages)
+        assert s1 == s2  # same session, same session_id
+
+    def test_different_first_messages_different_session_ids(self) -> None:
+        m1 = [{"role": "user", "content": "what is the cpu temp"}]
+        m2 = [{"role": "user", "content": "what is the memory usage"}]
+        assert _resolve_session_id(m1) != _resolve_session_id(m2)
+
+    def test_session_id_format(self) -> None:
+        """The session_id is ``<first_user_msg_hash>:<first_seen_unix>``."""
+        messages = [{"role": "user", "content": "test message"}]
+        s = _resolve_session_id(messages)
+        # Format: <16 hex chars>:<digits>
+        parts = s.split(":")
+        assert len(parts) == 2
+        assert len(parts[0]) == 16
+        assert all(c in "0123456789abcdef" for c in parts[0])
+        assert parts[1].isdigit()
+
+    def test_conversation_with_tool_results_still_resolves(self) -> None:
+        """Subsequent requests have assistant messages with tool_calls
+        and tool results.  The first USER message is still the same."""
+        m1 = [
+            {"role": "system", "content": "long prompt"},
+            {"role": "user", "content": "check no_new_privs"},
+        ]
+        s1 = _resolve_session_id(m1)
+        m2 = [
+            {"role": "system", "content": "long prompt"},
+            {"role": "user", "content": "check no_new_privs"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "exec", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+        ]
+        s2 = _resolve_session_id(m2)
+        assert s1 == s2  # same conversation, same session_id
+
+    def test_no_user_message_returns_anonymous_session(self) -> None:
+        messages = [{"role": "system", "content": "system only"}]
+        s = _resolve_session_id(messages)
+        assert s.startswith("anon:")
+
+
+# ---------------------------------------------------------------------------
+# Cross-request loop detection via session_id
+# ---------------------------------------------------------------------------
+
+class TestCrossRequestLoopDetection:
+    """The end-to-end behavior: detect a loop across multiple HTTP
+    requests in the same conversation.  Each request is a new job
+    (new job_id) but the session_id is the same, so the loop state
+    carries over.
+    """
+
+    def test_loop_detected_across_two_requests(self) -> None:
+        """Reproduce the runaway: request 1 calls exec, request 2
+        calls exec with the same args, request 3 triggers loop."""
+        messages = [
+            {"role": "user", "content": "check no_new_privs repeatedly"},
+        ]
+        # First request — model makes the first call
+        sig = "exec:ls"
+        # Simulate the proxy being called 3 times (across 3 requests)
+        # for the same conversation, each time the model making the
+        # same tool call.
+        from routes import _resolve_session_id as resolve
+        session_id = resolve(messages)
+        # First request: signature seen once
+        assert _check_tool_loop(session_id, sig) is False
+        # Second request: signature seen twice (carries over via
+        # the shared session_id).
+        assert _check_tool_loop(session_id, sig) is False
+        # Third request: signature seen three times → loop.
+        assert _check_tool_loop(session_id, sig) is True
+
+    def test_different_conversations_have_separate_state(self) -> None:
+        """Two conversations with the same first user message but
+        different first-seen times get different session_ids and
+        separate loop state."""
+        messages = [{"role": "user", "content": "check no_new_privs"}]
+        s1 = _resolve_session_id(messages)
+        # Both calls return the same session_id (same conversation).
+        s2 = _resolve_session_id(messages)
+        assert s1 == s2
+        # A different first user message → different session.
+        other = [{"role": "user", "content": "check memory usage"}]
+        s3 = _resolve_session_id(other)
+        assert s1 != s3

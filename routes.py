@@ -76,19 +76,35 @@ _CLOUD_RE = re.compile(r"/cloud")
 # Tool-loop detection (defense in depth against model reasoning loops)
 # ---------------------------------------------------------------------------
 # When a model gets stuck calling the same tool with the same arguments
-# repeatedly (e.g. cat /proc/self/status in a loop), we want the proxy to
-# break the cycle.  This module-level state tracks the last N tool call
-# signatures per job.  When the same signature appears 3+ times in a row,
-# the proxy intercepts the next duplicate and emits a synthetic content
-# message instead of forwarding the duplicate tool_calls chunk.
+# repeatedly (e.g. ``cat /proc/self/status | grep no_new_privs`` in a
+# loop), we want the proxy to break the cycle.  The detection has two
+# parts:
 #
-# The state is keyed by job_id and capped per-job to avoid unbounded
-# memory growth.  The dict is process-local; if the proxy restarts, the
-# state resets (acceptable: a restart also resets the model's conversation
-# state via nanobot-ai's chat lifecycle).
+#   1. **Per-job, per-turn tracking** (``_loop_detection_state``): a
+#      sliding window of the last N tool call signatures seen in the
+#      current request.  When 3+ identical calls appear in a row, the
+#      proxy intercepts the next duplicate and emits a synthetic warning
+#      instead of forwarding the tool_calls chunk.
+#
+#   2. **Cross-request (multi-turn) tracking** (``_session_state``):
+#      detects loops ACROSS requests by hashing the first user message
+#      + the server-side timestamp when the proxy first saw that
+#      message.  The hash is the ``session_id``; the per-session loop
+#      state is keyed by session_id.  Two simultaneous sessions with
+#      the same first message but started at different times get
+#      different session_ids, so they don't collide.
+#
+# Both states are process-local and capped with an LRU eviction so
+# they don't leak memory across a long-lived proxy.
+import hashlib
+import time as _time
+
 _LOOP_DETECTION_WINDOW = 3  # consecutive identical calls trigger detection
-_LOOP_DETECTION_MAX_JOBS = 1000  # cap on tracked jobs (LRU eviction)
+_LOOP_DETECTION_MAX_JOBS = 1000  # cap on tracked sessions (LRU eviction)
+_LOOP_DETECTION_SESSION_TTL = 3600  # session state expires after 1 hour of inactivity
+
 _loop_detection_state: dict[str, list[str]] = {}
+_session_state: dict[str, dict] = {}
 
 
 def _tool_call_signature(tc: dict) -> str:
@@ -103,36 +119,110 @@ def _tool_call_signature(tc: dict) -> str:
     return f"{name}:{args}"
 
 
+def _first_user_message_content(messages: list) -> str:
+    """Return the content of the first user-role message in the
+    conversation, or an empty string if there is none.  This is the
+    stable identifier we use for cross-request session tracking.
+
+    We skip system messages because every nanobot-ai request has a long
+    system prompt that's identical across all requests in the same
+    conversation (and across different conversations that share the
+    same template).  The first USER message is what actually
+    distinguishes one conversation from another.
+    """
+    for msg in messages:
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                # Some clients send content as a list of typed parts
+                # (e.g. ``[{"type": "text", "text": "..."}]``).  Join the
+                # text parts for a stable identifier.
+                content = " ".join(
+                    p.get("text", "")
+                    for p in content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+            return str(content) if content else ""
+    return ""
+
+
+def _resolve_session_id(messages: list) -> str:
+    """Return a session ID for a request, identifying the conversation.
+
+    The session ID is the SHA-256 of the first user message combined
+    with the server-side timestamp when the proxy first saw that
+    first user message.  Two sessions that start with the same first
+    user message but at different times get different session IDs.
+
+    The state is cached so that subsequent requests in the same
+    conversation get the same session_id (using the ORIGINAL first-
+    seen timestamp, not the timestamp of the current request).
+    """
+    first_msg = _first_user_message_content(messages)
+    if not first_msg:
+        # No user message — fall back to a per-request random session.
+        return f"anon:{uuid.uuid4().hex}"
+    first_msg_hash = hashlib.sha256(first_msg.encode("utf-8")).hexdigest()[:16]
+    cached = _session_state.get(first_msg_hash)
+    now = _time.time()
+    if cached is not None and (now - cached["first_seen"]) < _LOOP_DETECTION_SESSION_TTL:
+        # Cache hit — return the original session_id.
+        cached["last_seen"] = now
+        return cached["session_id"]
+    # New session — first time we see this first user message (or
+    # the cache expired).  Generate a fresh session_id.
+    session_id = f"{first_msg_hash}:{int(now)}"
+    _session_state[first_msg_hash] = {
+        "session_id": session_id,
+        "first_seen": now,
+        "last_seen": now,
+    }
+    # LRU-ish cap on total sessions tracked.
+    if len(_session_state) > _LOOP_DETECTION_MAX_JOBS:
+        # Drop the session with the smallest last_seen (oldest access).
+        oldest_key = min(_session_state, key=lambda k: _session_state[k]["last_seen"])
+        _session_state.pop(oldest_key, None)
+    return session_id
+
+
 def _check_tool_loop(
-    job_id: str,
+    session_id: str,
     signature: str,
 ) -> bool:
     """Record a tool call signature and return True if it's a loop.
 
     Returns True when the same signature has appeared at least
-    ``_LOOP_DETECTION_WINDOW`` times consecutively for this job.
+    ``_LOOP_DETECTION_WINDOW`` times consecutively for this session.
     Resets the window when a different signature is seen.
     """
-    history = _loop_detection_state.setdefault(job_id, [])
+    history = _loop_detection_state.setdefault(session_id, [])
     if history and history[-1] != signature:
         # Different tool call — reset the consecutive-run window.
         history.clear()
     history.append(signature)
-    # Cap per-job history to the window size.
+    # Cap per-session history to the window size.
     if len(history) > _LOOP_DETECTION_WINDOW:
         del history[0 : len(history) - _LOOP_DETECTION_WINDOW]
-    # LRU-ish cap on total jobs tracked.
+    # LRU-ish cap on total sessions tracked.
     if len(_loop_detection_state) > _LOOP_DETECTION_MAX_JOBS:
-        # Drop the oldest job_id to bound memory.
-        _loop_detection_state.pop(next(iter(_loop_detection_state)), None)
+        # Drop the oldest session_id to bound memory.
+        oldest_key = min(
+            _loop_detection_state,
+            key=lambda k: _session_state.get(k, {}).get("last_seen", 0),
+        )
+        _loop_detection_state.pop(oldest_key, None)
     return len(history) >= _LOOP_DETECTION_WINDOW and all(
         s == signature for s in history
     )
 
 
-def _clear_tool_loop(job_id: str) -> None:
-    """Drop a job's loop-detection state (called on stream end)."""
-    _loop_detection_state.pop(job_id, None)
+def _clear_tool_loop(session_id: str) -> None:
+    """Drop a session's loop-detection state (called on stream end)."""
+    _loop_detection_state.pop(session_id, None)
+
+
+# ``uuid`` is used for the anonymous-session fallback above.
+import uuid
 
 
 # ---------------------------------------------------------------------------
@@ -782,6 +872,7 @@ async def chat_completions(request: Request) -> StreamingResponse:
             auditor_active=auditor_active,
             proxy_preamble=proxy_preamble,
             client_named_model=client_named_model,
+            session_id=_resolve_session_id(processed_messages),
         ),
         media_type="text/event-stream",
         headers={
@@ -808,6 +899,7 @@ async def _event_stream(
     auditor_active: bool,
     proxy_preamble: list[str] | None = None,
     client_named_model: bool = False,
+    session_id: str = "",  # SHA-256[:16]:<first_seen_unix> for cross-request loop detection
 ) -> AsyncIterator[str]:
     """
     Core SSE streaming generator.
@@ -823,6 +915,11 @@ async def _event_stream(
     db = state.database
     systemd = state.systemd
     cooler = state.cooler
+    # Use the per-conversation session_id (if provided) for tool-loop
+    # detection so multi-turn loops (across requests) are caught.  Fall
+    # back to job_id for backwards compatibility with callers that
+    # don't pass a session_id yet.
+    loop_key = session_id or job_id
 
     audit_fatal_triggered = False
     audit_fatal_reason = ""
@@ -1043,7 +1140,7 @@ async def _event_stream(
                 looped_indices: set[int] = set()
                 for idx, tc in pending_tool_calls.items():
                     sig = _tool_call_signature(tc)
-                    if _check_tool_loop(job_id, sig):
+                    if _check_tool_loop(loop_key, sig):
                         looped_indices.add(idx)
                 # Emit status for non-looped tool calls (the loop warning
                 # is emitted by the loop-detection branch below).
@@ -1194,6 +1291,7 @@ async def _event_stream_with_model_startup(
     auditor_active: bool,
     proxy_preamble: list[str] | None = None,
     client_named_model: bool = False,
+    session_id: str = "",
 ) -> AsyncIterator[str]:
     """
     Wrapper around ``_event_stream`` that ensures heavy GPU models are
@@ -1312,6 +1410,11 @@ async def _event_stream_with_model_startup(
                     )
 
     # ---- Delegate to the core streaming generator ---------------------------
+    # Resolve the per-conversation session_id (SHA-256[:16] of the first
+    # user message + the server-side timestamp when the proxy first saw
+    # that message).  Used by ``_event_stream`` to track tool-call loops
+    # across requests in the same conversation.
+    session_id = _resolve_session_id(processed_messages)
     async for chunk in _event_stream(
         state=state,
         route=route,
@@ -1325,6 +1428,7 @@ async def _event_stream_with_model_startup(
         auditor_active=auditor_active,
         proxy_preamble=proxy_preamble,
         client_named_model=client_named_model,
+        session_id=session_id,
     ):
         yield chunk
 

@@ -33,6 +33,15 @@ project-specific.
    `thinking_budget_tokens` from a profile). Intent-based overrides of
    `temperature`/`top_p`/`max_tokens` are FORBIDDEN on direct calls.
 
+   **Documented carve-out — context governance** (`proxy/context_governance.py`): the
+   proxy MAY truncate/offload oversized `role: "tool"` results and snip the oldest
+   complete turns in the OUTBOUND model-copy only, to protect the model's runtime
+   context window in tool-call-heavy conversations. It never touches user or assistant
+   text, never splits tool_call/result pairs, never drops the latest user turn, never
+   mutates the client's stored conversation or the DB audit copy, and is per-request
+   opt-out via `X-Proxy-Context-Governance: off`. This is a mechanical budget
+   optimization, not an intent alteration.
+
 2. **No payload injection in flight**: the proxy never injects synthetic assistant
    content deltas (triage/loading messages, audit overrides) into in-flight
    `tool_calls` JSON. Triage metadata must go in a separate SSE chunk

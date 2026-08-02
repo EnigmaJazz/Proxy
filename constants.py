@@ -24,6 +24,38 @@ from prometheus_client import Gauge
 PROJECT_ROOT: Path = Path(__file__).resolve().parent
 
 # ---------------------------------------------------------------------------
+# Runtime context windows — operator-declared n_ctx per model
+# ---------------------------------------------------------------------------
+# These are the TRUE caps the running llama-server processes enforce (the
+# ``-c`` value in the llama-*.service units), NOT the GGUF native context from
+# model_profiles.yaml (which may be larger, e.g. professional GGUF 262144 vs
+# server 65536). Context governance uses these so the input-budget snip is
+# grounded in the real runtime limit.
+RUNTIME_CONTEXT_WINDOWS: dict[str, int] = {
+    "frontdesk": 12_288,
+    "chatter": 32_768,
+    "professional": 65_536,
+    "scholar": 32_768,
+    "creative": 32_768,
+    "architect": 32_768,
+    "coder": 32_768,
+}
+
+# ---------------------------------------------------------------------------
+# Context governance — frontend-agnostic tool-call context budget
+# ---------------------------------------------------------------------------
+# Mirrors the discipline nanobot-ai applies inside its agent loop, but lives in
+# the proxy so EVERY frontend gets it. See proxy/context_governance.py.
+CONTEXT_GOVERNANCE_DEFAULT_ENABLED: bool = True
+MAX_TOOL_RESULT_CHARS: int = 16_000       # per-tool result cap (all tools)
+READ_FILE_RESULT_CHARS: int = 32_000      # read_file keeps a larger head inline
+TOOL_RESULT_PREVIEW_CHARS: int = 800      # preview length in offload references
+SNIP_SAFETY_BUFFER_TOKENS: int = 1_024    # headroom below the budget
+TOOL_RESULTS_DIR_NAME: str = "tool_results"
+OFFLOAD_MAX_FILES: int = 500              # cap on offloaded result files
+ESTIMATED_CHARS_PER_TOKEN: int = 4        # cheap ASCII-biased token estimate
+
+# ---------------------------------------------------------------------------
 # Logger (reusable — returns a pre-configured logger for any module name)
 # ---------------------------------------------------------------------------
 

@@ -39,8 +39,10 @@ from constants import (
     TOOL_KEYWORDS,
     _HEAVY_MODEL_KEYS,
     MODEL_LABELS,
+    RUNTIME_CONTEXT_WINDOWS,
     get_logger,
 )
+from context_governance import apply_context_governance
 from llm import (
     stream_llm,
     openrouter_cloud_escalation,
@@ -294,6 +296,33 @@ async def list_models(request: Request) -> JSONResponse:
 # POST /v1/chat/completions
 # ---------------------------------------------------------------------------
 
+
+def _govern_messages(
+    request: Request,
+    messages: list[dict[str, Any]],
+    model_key: str,
+    max_tokens: int,
+) -> list[dict[str, Any]]:
+    """Apply frontend-agnostic context governance to the OUTBOUND copy.
+
+    Governed messages replace the model-copy only; the client's stored
+    conversation and the DB audit copy are never touched.  Opt out per
+    request with ``X-Proxy-Context-Governance: off``.
+    """
+    header = request.headers.get("x-proxy-context-governance", "")
+    if header.strip().lower() == "off":
+        return messages
+    context_window = RUNTIME_CONTEXT_WINDOWS.get(model_key)
+    if not context_window:
+        return messages
+    return apply_context_governance(
+        messages,
+        model_key=model_key,
+        context_window=context_window,
+        max_output_tokens=max_tokens,
+    )
+
+
 async def chat_completions(request: Request) -> Response:
     """
     OpenAI-compatible chat completions endpoint.
@@ -488,7 +517,12 @@ async def chat_completions(request: Request) -> Response:
                 caller_type="AGENTIC",
             )
         payload = {
-            "messages": processed_messages,
+            "messages": _govern_messages(
+                request,
+                processed_messages,
+                model_key="professional",
+                max_tokens=int(parameters["max_tokens"]),
+            ),
             "temperature": parameters["temperature"],
             "max_tokens": parameters["max_tokens"],
             "stream": True,
@@ -763,7 +797,12 @@ async def chat_completions(request: Request) -> Response:
         ]
 
     payload = {
-        "messages": processed_messages,
+        "messages": _govern_messages(
+            request,
+            processed_messages,
+            model_key=route.model_key,
+            max_tokens=int(parameters["max_tokens"]),
+        ),
         "temperature": parameters["temperature"],
         "top_p": parameters["top_p"],
         "max_tokens": parameters["max_tokens"],

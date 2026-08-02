@@ -941,6 +941,14 @@ async def _event_stream(
     # is complete (not per-chunk with partial args).  Each entry is
     # an accumulated tool call dict.
     pending_tool_calls: dict[int, dict[str, Any]] = {}
+    # Indices whose native structured tool_calls were already relayed to
+    # the client verbatim (llama.cpp parsed them itself).  Re-emitting the
+    # accumulated copy at finish would concatenate duplicate arguments at
+    # the client (e.g. '{"query":...}{"query":...}') which breaks JSON
+    # parsing in OpenAI-compatible clients (nanobot-ai "got str" error).
+    # Text-converted calls (the state machine) are NOT in this set: their
+    # finish-time emission is their only delivery.
+    streamed_tool_call_indices: set[int] = set()
 
     # ---- Yield proxy-injected preamble events -----------------------------
     # These events (e.g. params_replaced) are emitted before the triage
@@ -1061,6 +1069,7 @@ async def _event_stream(
                 if delta_tool_calls:
                     for tc in delta_tool_calls:
                         idx = tc.get("index", 0)
+                        streamed_tool_call_indices.add(idx)
                         if idx not in pending_tool_calls:
                             pending_tool_calls[idx] = {
                                 "id": tc.get("id", ""),
@@ -1094,15 +1103,16 @@ async def _event_stream(
 
             # ---- Emit status messages for completed tool calls -----------
             # When the model sets finish_reason (any non-null value), all
-            # accumulated tool calls are complete.  Emit the status
-            # messages BEFORE the finish_reason chunk so the user sees
-            # the tool call description before the stream end.  Also
-            # check for tool loops here (consecutive identical tool
-            # calls): if detected, emit a synthetic content warning
-            # INSTEAD of the tool_call chunk, so nanobot-ai does not
-            # re-execute the same tool.  The model sees the warning in
-            # its next turn and is expected to use the previous result
-            # or take a fundamentally different approach.
+            # accumulated tool calls are complete.  NOTE: the verbatim
+            # finish_reason chunk is already yielded above (in the elif
+            # branch), so the status messages below arrive AFTER it in
+            # the native structured-tool_calls path.  Also check for
+            # tool loops here (consecutive identical tool calls): if
+            # detected, emit a synthetic content warning INSTEAD of the
+            # tool_call chunk, so nanobot-ai does not re-execute the
+            # same tool.  The model sees the warning in its next turn
+            # and is expected to use the previous result or take a
+            # fundamentally different approach.
             finish_reason = (
                 choices[0].get("finish_reason")
                 if choices else None
@@ -1138,9 +1148,14 @@ async def _event_stream(
                 # Looped calls are intentionally NOT emitted as
                 # tool_calls so nanobot-ai does not re-execute the same
                 # tool; instead the warning content chunk below is the
-                # sole signal to the client.
+                # sole signal to the client.  Calls already relayed
+                # verbatim (native structured tool_calls) are also not
+                # re-emitted here: doing so would duplicate the arguments
+                # at the client.
                 for idx, tc in pending_tool_calls.items():
                     if idx in looped_indices:
+                        continue
+                    if idx in streamed_tool_call_indices:
                         continue
                     tc_chunk = {
                         "id": chunk.get("id"),
@@ -1421,7 +1436,7 @@ async def _handle_pause_command(
     Pauses the queue for the specified duration.  Returns a streaming
     response with status updates.
     """
-    async def _stream():
+    async def _stream() -> AsyncIterator[str]:
         pause_msg = (
             f"_⏸️ [Proxy: Attempting to pause queue for "
             f"{duration_mins} minutes...]_\n\n"
@@ -1445,7 +1460,7 @@ async def _handle_resume_command(state: "AppState") -> StreamingResponse:
 
     Manually unpauses the queue.
     """
-    async def _stream():
+    async def _stream() -> AsyncIterator[str]:
         state.try_resume_queue()
         msg = "_▶️ [Proxy: Queue resumed manually.]_\n\n"
         yield f"data: {json.dumps(_make_system_chunk(msg))}\n\n"
@@ -1460,7 +1475,7 @@ async def _handle_cloud_command(user_text: str) -> StreamingResponse:
 
     Routes the request directly to OpenRouter.
     """
-    async def _stream():
+    async def _stream() -> AsyncIterator[str]:
         status_msg = "_⏳ [Proxy: Routing concurrently to OpenRouter...]_\n\n"
         yield f"data: {json.dumps(_make_system_chunk(status_msg))}\n\n"
 
@@ -1496,7 +1511,7 @@ async def _stream_cached_response(
     Sends the entire cached text as a single content delta followed by
     [DONE] — the client sees it as an instant completion.
     """
-    async def _stream():
+    async def _stream() -> AsyncIterator[str]:
         chunk = {
             "id": f"chatcmpl-cached-{int(time.time())}",
             "object": "chat.completion.chunk",

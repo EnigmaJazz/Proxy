@@ -225,3 +225,103 @@ async def test_dream_forwards_tools_to_model(dream_client: Any) -> None:
     assert db.last_enqueue is not None
     assert json.loads(db.last_enqueue["tools_json"]) == tools
 
+
+@pytest.mark.asyncio
+async def test_native_tool_calls_not_double_emitted(dream_client: Any) -> None:
+    """Native structured tool_calls must be relayed once, not re-emitted at finish.
+
+    Regression: the proxy relayed llama.cpp's structured tool_call chunks
+    verbatim AND re-emitted the accumulated copy at finish_reason.  Any
+    OpenAI client accumulates arguments per tool-call index, so it
+    received each call doubled ('{"query":...}{"query":...}'), which
+    broke JSON parsing in nanobot-ai ("parameters must be a JSON object,
+    got str").  The failed tool execution made the model retry the same
+    call — the tool-loop flood seen in production.
+    """
+
+    class _NativeToolStream:
+        """Fake stream_llm yielding llama.cpp-style structured tool_calls."""
+
+        async def __call__(
+            self,
+            *,
+            endpoint: str,
+            payload: dict[str, Any],
+            port: int = 0,
+            headers: Optional[dict[str, Any]] = None,
+            **kwargs: Any,
+        ) -> Any:
+            yield {
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_abc123",
+                            "type": "function",
+                            "function": {
+                                "name": "web_search",
+                                "arguments": "{\"query\":",
+                            },
+                        }],
+                    },
+                    "finish_reason": None,
+                }],
+            }
+            yield {
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "function": {"arguments": "\"weather\"}"},
+                        }],
+                    },
+                    "finish_reason": None,
+                }],
+            }
+            yield {
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "tool_calls",
+                }],
+            }
+
+    stream = _NativeToolStream()
+    with patch("routes.stream_llm", new=stream), \
+         patch("routes.is_dream_process", new=AsyncMock(return_value=True)):
+        resp = await dream_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "auto",
+                "messages": [{"role": "user", "content": "extract facts"}],
+                "stream": True,
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "web_search",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+            },
+        )
+
+    assert resp.status_code == 200
+    fragments: list[str] = []
+    for _event, data in _parse_sse_events(resp.text):
+        for ch in data.get("choices", []):
+            for tc in (ch.get("delta") or {}).get("tool_calls") or []:
+                args = (tc.get("function") or {}).get("arguments") or ""
+                if args:
+                    fragments.append(args)
+    # Two fragments build ONE JSON object.  A finish-time re-emission
+    # would append a third fragment and double the arguments.
+    joined = "".join(fragments)
+    assert joined == '{"query":"weather"}', (
+        f"tool_call arguments doubled or corrupted: {joined!r}"
+    )
+

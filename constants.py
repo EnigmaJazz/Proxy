@@ -274,10 +274,6 @@ THERMAL_LIMITS: dict[str, dict[str, float | str]] = {
         "warn": 95.0, "crit": 102.0, "max": 105.0,
         "name": "RX 6700XT VRAM",
     },
-    "spd5118": {
-        "warn": 70.0, "crit": 80.0, "max": 85.0,
-        "name": "Crucial DDR5 RAM",
-    },
     "nvme": {
         "warn": 65.0, "crit": 75.0, "max": 80.0,
         "name": "Samsung 990 PRO NVMe",

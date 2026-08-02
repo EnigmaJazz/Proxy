@@ -507,20 +507,11 @@ async def resolve_route_for_lane_a(
     project_name = classification.get("project_name", "general")
     tools_required = classification.get("tools_required", False)
     is_factual = classification.get("is_factual", False)
-    complexity = classification.get("complexity", "low")
 
+    # CHAT/TOOL always route to professional (ROUTE_MAP encodes this);
+    # lightweight requests are handled synchronously, never fall back to a
+    # CPU model, and are never enqueued.
     model_key = ROUTE_MAP.get(intent, "professional")
-
-    # ---- CHAT / TOOL — lightweight requests always route to Professional
-    # Unconditionally: a CHAT/TOOL request routes to "professional" even
-    # when the GPU is occupied by a different specialist.  There is no
-    # CPU fallback and nothing is enqueued for these intents.
-    if intent == "CHAT" and complexity == "low":
-        model_key = "professional"
-    elif intent == "TOOL":
-        model_key = "professional"
-    else:
-        model_key = ROUTE_MAP.get(intent, "professional")
     port = await systemd.get_port(model_key)
     is_cpu_fallback = False
     hardware_path = "gpu"

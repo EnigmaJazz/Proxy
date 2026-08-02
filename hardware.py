@@ -643,6 +643,20 @@ async def send_bash_notification(title: str, message: str) -> None:
 # Thermal monitor background task
 # ---------------------------------------------------------------------------
 
+def _build_thermal_temps(cpu: float, gpu: dict[str, float]) -> dict[str, float]:
+    """Zone → current-value map for thermal enforcement.
+
+    Only REAL temperature sensors belong here. RAM usage percent is not a
+    temperature and must never be compared against degree-C thresholds —
+    a prior fake ``spd5118`` zone powered the host off at 80% RAM usage.
+    """
+    return {
+        "k10temp": cpu,
+        "amdgpu_core": gpu["edge"],
+        "amdgpu_vram": gpu["vram"],
+    }
+
+
 async def thermal_monitor_task(
     state: dict[str, float],
     interval: float = SENSOR_INTERVAL,
@@ -698,12 +712,11 @@ async def thermal_monitor_task(
             metric_ram_used_pct.set(ram)
 
             # ---- Thermal threshold enforcement -------------------------------
-            temps = {
-                "k10temp": cpu,
-                "amdgpu_core": gpu["edge"],
-                "amdgpu_vram": gpu["vram"],
-                "spd5118": ram,  # RAM % as approximation (no SPD temp sensors)
-            }
+            # Only real temperature sensors belong in the zone map. RAM usage
+            # percent is NOT a temperature and must never be compared against
+            # °C thresholds (it used to power the host off at 80% RAM via a
+            # fake spd5118 zone).
+            temps = _build_thermal_temps(cpu, gpu)
 
             for zone, current in temps.items():
                 limits = THERMAL_LIMITS.get(zone)

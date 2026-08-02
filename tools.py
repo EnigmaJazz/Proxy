@@ -27,8 +27,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
-from typing import Optional, Dict, Any, List
+from collections.abc import Awaitable, Callable
+from functools import lru_cache
+from typing import Optional, Any
 
 import httpx
 from flashrank import Ranker, RerankRequest
@@ -40,17 +41,24 @@ from constants import (
     get_logger,
 )
 
+from database import Database
+from systemd import SystemdController
+
 logger = get_logger("proxy.tools")
 
 # ---------------------------------------------------------------------------
-# FlashRank reranker — initialised once at module load
+# FlashRank reranker — initialised lazily and cached (once)
 # ---------------------------------------------------------------------------
-_RANKER = None
-try:
-    _RANKER = Ranker(model_name="ms-marco-MiniLM-L-12-v2", cache_dir="/tmp/flashrank_cache")
-    logger.info("FlashRank CPU reranker initialised")
-except Exception as exc:
-    logger.error("Failed to initialise FlashRank: %s", exc)
+@lru_cache(maxsize=1)
+def _get_ranker() -> Optional[Ranker]:
+    """Lazily initialise the FlashRank CPU reranker (cached after first load)."""
+    try:
+        ranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2", cache_dir="/tmp/flashrank_cache")
+        logger.info("FlashRank CPU reranker initialised")
+        return ranker
+    except (OSError, ValueError, RuntimeError) as exc:
+        logger.error("Failed to initialise FlashRank: %s", exc)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -58,11 +66,11 @@ except Exception as exc:
 # ---------------------------------------------------------------------------
 
 async def execute_tool(
-    job,                       # Job dict with keys: id, project_id, messages, tools, etc.
-    tool_call_dict: dict,
-    stream_feedback_callback=None,  # Optional async callback(job, message)
-    database=None,             # Optional Database handle
-    systemd=None,              # Optional SystemdController
+    job: dict[str, Any],       # Job dict with keys: id, project_id, messages, tools, etc.
+    tool_call_dict: dict[str, Any],
+    stream_feedback_callback: Optional[Callable[[dict[str, Any], str], Awaitable[None]]] = None,  # async callback(job, message)
+    database: Optional[Database] = None,     # Optional Database handle
+    systemd: Optional[SystemdController] = None,  # Optional SystemdController
 ) -> str:
     """
     Central registry router for proxy-native tools.
@@ -94,7 +102,7 @@ async def execute_tool(
     name = tool_call_dict.get("name", "unknown_tool")
 
     # Parse arguments — they may be a JSON string or a dict
-    args: dict = {}
+    args: dict[str, Any] = {}
     raw_args = tool_call_dict.get("arguments", "{}")
     if isinstance(raw_args, str):
         try:
@@ -154,7 +162,8 @@ async def execute_web_search(query: str, depth: str = "standard") -> str:
     str
         Markdown-formatted search results, or an error string.
     """
-    if _RANKER is None:
+    ranker = _get_ranker()
+    if ranker is None:
         return "[Search System Error: Reranker failed to initialize.]"
 
     cfg = DEPTH_CONFIG.get(depth.lower(), DEPTH_CONFIG["standard"])
@@ -187,7 +196,7 @@ async def execute_web_search(query: str, depth: str = "standard") -> str:
 
             # ---- 3. FlashRank reranking -------------------------------------
             rerank_request = RerankRequest(query=query, passages=candidates)
-            ranked = _RANKER.rerank(rerank_request)
+            ranked = ranker.rerank(rerank_request)
 
             # ---- 4. Format output -------------------------------------------
             formatted_blocks: list[str] = []
@@ -234,7 +243,7 @@ async def _scrape_article(
                 "text": text[:char_limit],
                 "meta": {"url": url},
             }
-    except Exception:
+    except (httpx.HTTPError, ValueError, TypeError, IndexError):
         logger.debug("Article scrape failed for %s", url)
     return None
 

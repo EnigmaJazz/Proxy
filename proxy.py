@@ -34,17 +34,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import time
 from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional
 
 import httpx
 import uvloop
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import JSONResponse
 
 # ---------------------------------------------------------------------------
 # Configure logging (to both rotating file and stdout)
@@ -75,28 +74,19 @@ logger.info("PROXY STARTING — Logging configured")
 from constants import (
     PROJECT_ROOT,
     DB_PATH,
-    CoolingPreset,
     SENSOR_INTERVAL,
-    get_logger,
 )
 from database import Database
 from systemd import SystemdController
 from cooling import CoolingStateMachine
 from hardware import (
     HardwareGovernor,
-    thermal_state,
+    default_thermal_state,
     thermal_monitor_task,
-    write_cooling_ipc,
-    send_wayland_notification,
-    send_telegram_alert,
-    send_bash_notification,
 )
 from llm import (
-    wait_for_port_readiness,
-    clear_model_cache,
     openrouter_cloud_escalation,
 )
-from routing import RouteDecision
 from profile_loader import load_model_profiles, ModelProfileTable
 
 # Route handlers (imported from routes.py)
@@ -157,6 +147,7 @@ class AppState:
         self.pause_task: Optional[asyncio.Task] = None
         self.transition_pause: asyncio.Event = asyncio.Event()
         self.thermal_halt: asyncio.Event = asyncio.Event()
+        self.thermal_state: dict[str, float] = default_thermal_state()
 
     # ------------------------------------------------------------------
     # Pause / resume queue (for OS transitions)
@@ -253,7 +244,7 @@ async def lifespan(app: FastAPI):
     # ---- 6. Background tasks -----------------------------------------------
     # Thermal monitor (reads sensors, enforces shutdown thresholds)
     thermal_task = asyncio.create_task(
-        thermal_monitor_task(thermal_state, SENSOR_INTERVAL),
+        thermal_monitor_task(state.thermal_state, SENSOR_INTERVAL),
     )
 
     # Queue worker (processes enqueued jobs from the database)
@@ -418,7 +409,9 @@ async def queue_worker(state: AppState) -> None:
             )
             logger.info("Job %s completed", job["id"])
 
-        except Exception:
+        except Exception:  # noqa: BLE001 — queue-worker boundary (AGENTS.md
+        # rule 10): a catch-all here keeps one bad job from killing the worker
+        # loop; each job is failed + escalated individually.
             logger.exception("Job %s failed with exception", job["id"])
             await db.fail_job(job["id"])
             # Re-queue for escalation
@@ -510,7 +503,7 @@ async def zram_keepalive_worker(state: AppState) -> None:
                         timeout=2.0,
                     )
                     logger.debug("ZRAM keepalive pinged %s on port %d", domain, port)
-                except Exception:
+                except (httpx.HTTPError, OSError, ValueError):
                     logger.debug("ZRAM keepalive ping failed for %s (non-critical)", domain)
 
 
@@ -542,7 +535,8 @@ async def _restore_pending_jobs(state: AppState) -> None:
                 )
         else:
             logger.info("No pending jobs to restore")
-    except Exception:
+    except Exception:  # noqa: BLE001 — lifespan boundary (AGENTS.md rule 10):
+    # startup restore must never abort the whole app on one bad queued job.
         logger.exception("Failed to restore pending jobs (non-fatal)")
 
 
@@ -570,14 +564,26 @@ app.state = AppState()
 app.add_api_route("/health", health_check, methods=["GET"])
 app.add_api_route("/v1/models", list_models, methods=["GET"])
 app.add_api_route("/v1/chat/completions", chat_completions, methods=["POST"])
+
+
+async def _transition_check_route(request: Request) -> JSONResponse:
+    """GET /v1/system/transition-check — current cooling/queue transition state."""
+    return await _transition_check(request)
+
+
+async def _resume_queue_route(request: Request) -> JSONResponse:
+    """GET /v1/system/queue/resume — resume a paused job queue."""
+    return await _resume_queue(request)
+
+
 app.add_api_route(
     "/v1/system/transition-check",
-    lambda request: _transition_check(request),
+    _transition_check_route,
     methods=["GET"],
 )
 app.add_api_route(
     "/v1/system/queue/resume",
-    lambda request: _resume_queue(request),
+    _resume_queue_route,
     methods=["GET"],
 )
 

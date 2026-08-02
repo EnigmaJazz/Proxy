@@ -12,10 +12,10 @@ import types
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from typing import Any
 
 import httpx
-import pytest
+import pytest_asyncio
 
 # Ensure project root is importable when pytest loads conftest from tests/.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -69,7 +69,7 @@ class _NoOpDatabase:
     async def purge_stream_chunks(self, *args, **kwargs) -> None:
         pass
 
-    async def get_pending_jobs(self, *args, **kwargs) -> list:
+    async def get_pending_jobs(self, *args, **kwargs) -> list[dict[str, Any]]:
         return []
 
     async def dequeue_next(self, *args, **kwargs) -> None:
@@ -87,7 +87,7 @@ class _NoOpSystemd:
 
     active_heavy_model: str | None = None
 
-    async def scan_models(self) -> list:
+    async def scan_models(self) -> list[dict[str, Any]]:
         return []
 
     async def get_port(self, domain: str) -> int:
@@ -147,9 +147,16 @@ import proxy  # noqa: E402
 # ---------------------------------------------------------------------------
 # 4. Fixtures
 # ---------------------------------------------------------------------------
-@pytest.fixture
+@pytest_asyncio.fixture
 async def app_client() -> AsyncIterator[httpx.AsyncClient]:
-    """Yield an httpx async client against the real app with lifespan off."""
+    """Yield an httpx async client against the real app with lifespan off.
+
+    ``@pytest_asyncio.fixture`` (not ``@pytest.fixture``) so the async
+    generator works under pytest-asyncio strict mode.  No current test
+    consumes this fixture directly (the test files declare their own
+    local ``pd_client``/``r1_client`` fixtures), but it must not be a
+    trap for future tests.
+    """
     # Attach no-op component instances so routes can call them without crashing.
     proxy.app.state.database = _NoOpDatabase()
     proxy.app.state.systemd = _NoOpSystemd()

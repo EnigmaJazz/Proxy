@@ -31,21 +31,30 @@ Maintainers: James Stansfield
 """
 from __future__ import annotations
 
-import asyncio
 import difflib
+import asyncio
 import glob
 import json
-import logging
 import os
 import re
-from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Any, FrozenSet
+import sqlite3
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import Any, Optional
+
+import httpx
 
 from constants import (
     FRONTEND_KEYS,
     IDE_PASSTHROUGH_HEADER,
+    LOOP_LIMITS,
+    ROUTE_MAP,
+    _DREAM_FALLBACK_PHRASES,
     get_logger,
 )
+
+from database import Database
+from systemd import SystemdController
 
 logger = get_logger("proxy.routing")
 
@@ -53,37 +62,45 @@ logger = get_logger("proxy.routing")
 # Dream/soul detection — discovers Nanobot dream template phrases
 # ---------------------------------------------------------------------------
 
-# Default fallback phrases extracted from Nanobot dream_phase1.md template.
-# These are used if the installed Nanobot package cannot be found or read.
-# The phrases are unique to Nanobot's dream/autonomous consolidation prompt
-# and do NOT appear in normal conversational requests — making them a
-# reliable fingerprint for background autonomous tasks.
-_DREAM_FALLBACK_PHRASES: list[str] = [
-    "extract new facts from conversation history",
-    "output one line per finding",
-    "deduplicate existing memory files",
-    "atomic fact (not already in memory)",
-    "[file] atomic fact",
-    "[file-remove] reason for removal",
-    "[skill] kebab-case-name",
-    "[skip] if nothing needs updating",
-    "find and flag redundant, overlapping, or stale content",
-    "update memory files based on the analysis below",
-]
+# Dream phrase reading is a lazy file cache keyed by (path, mtime) so
+# dream detection survives Nanobot updates (`uv tool upgrade nanobot-ai`).
+# The glob pattern uses a wildcard Python version path since uv-managed
+# packages move between python3.13/, python3.14/ etc. across updates.
+@lru_cache(maxsize=4)
+def _read_dream_phrases(latest_path: str, mtime: float) -> list[str]:
+    """Read + extract dream fingerprint phrases from a template file.
 
-# Lazy cache with mtime staleness checks so dream detection survives
-# Nanobot updates (`uv tool upgrade nanobot-ai`).  The glob pattern
-# uses a wildcard Python version path since uv-managed packages move
-# between python3.13/, python3.14/ etc. across updates.
-_dream_cache: dict = {"phrases": None, "mtime": 0.0, "path": ""}
+    Cached by (path, mtime) — the phrases reload automatically when the
+    file changes (mtime differs), and are reused across requests when it
+    hasn't.  Returns ``_DREAM_FALLBACK_PHRASES`` if the file cannot be
+    read (mirrors the old lazy-cache fallback).
+    """
+    try:
+        with open(latest_path, "r") as f:
+            text = f.read().lower()
+    except OSError:
+        return _DREAM_FALLBACK_PHRASES
+
+    lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip("- #*▶").strip()
+        if len(stripped) > 15:
+            lines.append(stripped)
+
+    logger.debug(
+        "Dream phrases refreshed from %s (%d phrases)", latest_path, len(lines),
+    )
+    return lines
+
 
 def _get_dream_phrases() -> list[str]:
     """
     Discover the latest Nanobot dream_phase1.md template and extract
     unique identifying phrases for dream/soul task detection.
 
-    Uses lazy caching with file mtime checks so that the phrases are
-    automatically refreshed when Nanobot is updated after proxy startup.
+    Uses a lazy file cache keyed by (path, mtime) so that the phrases
+    are automatically refreshed when Nanobot is updated after proxy
+    startup (``functools.lru_cache`` on ``_read_dream_phrases``).
 
     Returns
     -------
@@ -108,34 +125,10 @@ def _get_dream_phrases() -> list[str]:
     except OSError:
         return _DREAM_FALLBACK_PHRASES
 
-    # Reuse cached phrases if the file hasn't changed
-    if _dream_cache["path"] == latest_path and _dream_cache["mtime"] == mtime:
-        return _dream_cache["phrases"]  # type: ignore[return-value]
-
-    # Read the template and extract distinct phrases (lines > 15 chars,
-    # non-comment, non-empty) as lowercase for substring matching.
-    try:
-        with open(latest_path, "r") as f:
-            text = f.read().lower()
-    except OSError:
-        return _DREAM_FALLBACK_PHRASES
-
-    lines: list[str] = []
-    for line in text.splitlines():
-        stripped = line.strip("- #*▶").strip()
-        if len(stripped) > 15:
-            lines.append(stripped)
-
-    _dream_cache["phrases"] = lines
-    _dream_cache["mtime"] = mtime
-    _dream_cache["path"] = latest_path
-    logger.debug(
-        "Dream phrases refreshed from %s (%d phrases)", latest_path, len(lines),
-    )
-    return lines
+    return _read_dream_phrases(latest_path, mtime)
 
 
-def is_dream_process(raw_text: str) -> bool:
+async def is_dream_process(raw_text: str) -> bool:
     """
     Detect whether *raw_text* originates from a Nanobot dream/autonomous
     background task by matching against fingerprint phrases from the
@@ -146,6 +139,10 @@ def is_dream_process(raw_text: str) -> bool:
     Matching 2+ of these phrases in the user message provides a
     high-confidence signal that this is an autonomous background task
     that should be routed at BACKGROUND priority.
+
+    The phrase lookup (glob + mtime + file read) is offloaded to a worker
+    thread so the dream check never blocks the event loop in the request
+    path (AGENTS.md rule 3).  The lru-cached file read is preserved.
 
     Parameters
     ----------
@@ -160,7 +157,7 @@ def is_dream_process(raw_text: str) -> bool:
     if not raw_text:
         return False
 
-    phrases = _get_dream_phrases()
+    phrases = await asyncio.to_thread(_get_dream_phrases)
     matches = 0
     for phrase in phrases:
         if phrase in raw_text:
@@ -177,54 +174,6 @@ def is_dream_process(raw_text: str) -> bool:
 # ---------------------------------------------------------------------------
 # Tool keyword heuristic — safety net when frontdesk misclassifies CHAT
 # ---------------------------------------------------------------------------
-
-# Keywords that indicate a request likely needs tool access (web search,
-# file I/O, or system exec).  Over-detection is safe because the Worker
-# model can handle plain chat just as well as Chatter.
-# All matching is done lowercase with substring matching.
-TOOL_KEYWORDS: FrozenSet[str] = frozenset({
-    # Weather / temporal — need live data
-    "weather", "forecast", "tomorrow", "tonight", "next week",
-    "this weekend", "next month", "today's",
-    # Web search / live data
-    "search", "look up", "latest", "news", "current",
-    "stock", "price",
-    # File I/O
-    "read the file", "read file", "open file", "save file",
-    "write file", "edit file", "modify", "rename",
-    # Exec / system
-    "run command", "execute",
-})
-
-# ---------------------------------------------------------------------------
-# ROUTE_MAP: classified intent → local model endpoint key
-#
-#   CHAT      → chatter  (9B, fast chat model)
-#   TOOL      → worker   (9B, tool-capable model)
-#   CODE      → professional (35B MoE, heavy coding model)
-#   SCHOLAR   → scholar  (deep research)
-#   PROFESSIONAL → professional (professional writing / 35B MoE)
-#   CREATIVE  → creative (long-form creative writing)
-#   ARCHITECT → architect (complex multi-stage planning)
-#
-#   Lane B (IDE passthrough) ALWAYS goes to professional regardless
-#   of intent — the frontdesk is bypassed entirely.
-# ---------------------------------------------------------------------------
-ROUTE_MAP: Dict[str, str] = {
-    "CHAT":         "professional",
-    "TOOL":         "professional",
-    "CODE":         "professional",  # 35B MoE
-    "SCHOLAR":      "scholar",
-    "PROFESSIONAL": "professional",
-    "CREATIVE":     "creative",
-    "ARCHITECT":    "architect",
-}
-
-# Heavy GPU models (require VRAM allocation, can't be quickly swapped)
-HEAVY_MODELS: set[str] = {"professional", "coder", "creative", "scholar", "architect"}
-
-# CPU-only models (always resident, never hot-swapped)
-CPU_MODELS: set[str] = {"frontdesk"}
 
 # ---------------------------------------------------------------------------
 # RouteDecision dataclass
@@ -281,7 +230,7 @@ class RouteDecision:
 # Caller type discrimination
 # ---------------------------------------------------------------------------
 
-def discriminate_caller(headers: dict) -> str:
+def discriminate_caller(headers: dict[str, str]) -> str:
     """
     Categorize the incoming request as IDE or AGENTIC based on auth
     headers and user-agent.
@@ -322,7 +271,7 @@ def discriminate_caller(headers: dict) -> str:
 # Lane detection
 # ---------------------------------------------------------------------------
 
-def is_lane_b(headers: dict) -> bool:
+def is_lane_b(headers: dict[str, str]) -> bool:
     """
     Return True if the ``sk-ide-pass`` header is present and matches
     the expected value — this triggers Lane B (IDE coding, bypasses
@@ -343,30 +292,29 @@ def is_lane_b(headers: dict) -> bool:
 # This allows the prompt to be iterated on without touching proxy code.
 # The placeholder {project_list} is injected at runtime with the
 # current project roster from the database.
-_FRONT_DESK_BASE_PROMPT: Optional[str] = None
+@lru_cache(maxsize=1)
+def _front_desk_prompt() -> str:
+    """Load the frontdesk prompt from disk (cached after first load).
+
+    Uses ``load_role_prompt("frontdesk")`` which reads from
+    ``~/kinver-hub/prompts/frontdesk.txt``.  Cached since the
+    prompt doesn't change at runtime.
+    """
+    from llm import load_role_prompt
+    return load_role_prompt("frontdesk")
 
 
 def _get_frontdesk_prompt() -> str:
-    """
-    Lazily load the frontdesk prompt from disk.
-
-    Uses ``load_role_prompt("frontdesk")`` which reads from
-    ``~/kinver-hub/prompts/frontdesk.txt``.
-    Cached after first load since the prompt doesn't change at runtime.
-    """
-    global _FRONT_DESK_BASE_PROMPT
-    if _FRONT_DESK_BASE_PROMPT is None:
-        from llm import load_role_prompt
-        _FRONT_DESK_BASE_PROMPT = load_role_prompt("frontdesk")
-    return _FRONT_DESK_BASE_PROMPT
+    """Return the cached frontdesk prompt (see ``_front_desk_prompt``)."""
+    return _front_desk_prompt()
 
 
 async def classify_with_frontdesk(
     user_text: str,
-    database=None,  # Optional Database for project list injection
+    database: Optional[Database] = None,  # Optional Database for project list injection
     frontdesk_port: int = 0,
     available_tool_names: Optional[list[str]] = None,
-) -> dict:
+) -> dict[str, Any]:
     """
     Run the 2B frontdesk model to classify the user's intent.
 
@@ -402,7 +350,7 @@ async def classify_with_frontdesk(
         complexity, project_name, is_factual, tools_required.
         Falls back to safe defaults on failure.
     """
-    defaults: dict = {
+    defaults: dict[str, Any] = {
         "is_valid": True,
         "intent": "CHAT",
         "priority": 2,
@@ -414,7 +362,7 @@ async def classify_with_frontdesk(
 
     try:
         # ---- Build the full prompt with project list injected --------------
-        base_prompt = _get_frontdesk_prompt()
+        base_prompt = await asyncio.to_thread(_get_frontdesk_prompt)
 
         # Build project list string for injection
         project_list_str = "No existing projects."
@@ -431,7 +379,7 @@ async def classify_with_frontdesk(
                             + (f" ({root})" if root else "")
                         )
                     project_list_str = "\n".join(lines)
-            except Exception:
+            except (sqlite3.Error, OSError, ValueError):
                 logger.debug("Failed to fetch project list (non-critical)")
 
         # Inject project list into prompt
@@ -499,7 +447,7 @@ async def classify_with_frontdesk(
         # Merge with defaults to ensure all 7 keys are present
         return {**defaults, **classification}
 
-    except Exception:
+    except (httpx.HTTPError, json.JSONDecodeError, OSError):
         logger.exception("Frontdesk classification failed — using defaults")
         return defaults
 
@@ -525,8 +473,8 @@ def resolve_model(intent: str, is_lane_b: bool = False) -> str:
 # ---------------------------------------------------------------------------
 
 async def resolve_route_for_lane_a(
-    classification: dict,
-    systemd,  # SystemdController
+    classification: dict[str, Any],
+    systemd: SystemdController,
     has_tool_history: bool = False,  # True if conversation has tool_calls
 ) -> RouteDecision:
     """
@@ -618,24 +566,11 @@ async def resolve_route_for_lane_a(
 # Semantic loop detection (sqlite-vec with difflib fallback)
 # ---------------------------------------------------------------------------
 
-# Maximum tool call repetitions allowed per domain before breaking the loop
-LOOP_LIMITS: Dict[str, int] = {
-    "scholar":      6,
-    "architect":    4,
-    "coder":        4,
-    "professional": 4,
-    "creative":     5,
-    "standard":     3,
-    "worker":       2,
-    "CHAT":         2,
-    "TOOL":         2,
-}
-
 
 async def detect_tool_loops(
     messages: list[dict],
     domain: str = "standard",
-    database=None,  # Optional Database for semantic search
+    database: Optional[Database] = None,  # Optional Database for semantic search
 ) -> tuple[bool, str]:
     """
     Detect repetitive tool call patterns that indicate an agentic death
@@ -710,7 +645,7 @@ async def detect_tool_loops(
                         pattern_text=f"{latest_call['name']}: {latest_call['args'][:200]}",
                         source="loop_detection",
                     )
-                except Exception:
+                except (sqlite3.Error, OSError, ValueError):
                     pass
 
             return True, reason
@@ -725,7 +660,7 @@ async def detect_tool_loops(
 async def check_semantic_cache(
     query_text: str,
     is_factual: bool,
-    database,  # Database
+    database: Optional[Database],  # Database
 ) -> Optional[str]:
     """
     If the query is marked as factual, check the semantic cache for a
@@ -743,7 +678,7 @@ async def check_semantic_cache(
         if cached:
             logger.info("Semantic cache HIT for factual query")
         return cached
-    except Exception:
+    except (sqlite3.Error, OSError, ValueError):
         logger.debug("Semantic cache lookup failed (non-critical)")
         return None
 
@@ -752,7 +687,7 @@ async def check_semantic_cache(
 # Project context extraction (file paths from prompt)
 # ---------------------------------------------------------------------------
 
-def extract_project_context(prompt: str) -> dict:
+def extract_project_context(prompt: str) -> dict[str, Any]:
     """
     Extract file paths from the prompt text and infer a project name
     from the directory structure.

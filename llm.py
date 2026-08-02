@@ -34,17 +34,15 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import os
 import re
 import time
-from pathlib import Path
-from typing import Optional, Dict, Any, AsyncIterator, List
+from collections.abc import Awaitable, Callable
+from typing import Optional, Any, AsyncIterator
 
 import httpx
 
 from constants import (
-    PROJECT_ROOT,
     OPENROUTER_API_KEY,
     OPENROUTER_SITE_URL,
     OPENROUTER_SITE_NAME,
@@ -106,17 +104,17 @@ def load_role_prompt(role_name: str) -> str:
 
 async def stream_llm(
     endpoint: str,
-    payload: Dict[str, Any],
+    payload: dict[str, Any],
     api_key: str = "",
     api_url: str = "",
     port: int = 0,
     site_url: str = "",
     site_name: str = "",
     model_name: str = "",
-    headers: Optional[Dict[str, str]] = None,
+    headers: Optional[dict[str, str]] = None,
     timeout: float = REQUEST_TIMEOUT,
-    set_cooling=None,  # Optional async callback(chip, CoolingPreset)
-) -> AsyncIterator[Dict[str, Any]]:
+    set_cooling: Optional[Callable[[str, CoolingPreset], Awaitable[None]]] = None,  # async callback(chip, CoolingPreset)
+) -> AsyncIterator[dict[str, Any]]:
     """
     Yield parsed JSON chunks from an SSE streaming endpoint.
 
@@ -183,7 +181,7 @@ async def stream_llm(
         body["model"] = model_name
 
     # ---- Build headers -----------------------------------------------------
-    http_headers: Dict[str, str] = {"Content-Type": "application/json"}
+    http_headers: dict[str, str] = {"Content-Type": "application/json"}
     if headers:
         http_headers.update(headers)
     if endpoint == "cloud":
@@ -273,7 +271,7 @@ async def stream_llm(
             if attempt < MAX_RETRIES:
                 await asyncio.sleep(RETRY_DELAY)
 
-        except Exception:
+        except (httpx.HTTPError, json.JSONDecodeError, OSError):
             logger.exception("stream_llm unexpected error on attempt %d", attempt)
             raise
 
@@ -287,16 +285,16 @@ async def stream_llm(
 
 async def call_llm(
     endpoint: str,
-    payload: Dict[str, Any],
+    payload: dict[str, Any],
     api_key: str = "",
     api_url: str = "",
     port: int = 0,
     site_url: str = "",
     site_name: str = "",
     model_name: str = "",
-    headers: Optional[Dict[str, str]] = None,
+    headers: Optional[dict[str, str]] = None,
     timeout: float = REQUEST_TIMEOUT,
-) -> dict:
+) -> dict[str, Any]:
     """
     Convenience wrapper that collects the full stream into a single
     OpenAI-compatible ``choices[0].message.content`` dict.
@@ -351,7 +349,7 @@ async def call_llm(
 # ---------------------------------------------------------------------------
 
 def _inject_provider_metadata(
-    chunk: Dict[str, Any],
+    chunk: dict[str, Any],
     provider: str,
     model: str,
     fallback_used: bool = False,
@@ -401,7 +399,7 @@ async def call_model(
     str
         The generated text content, or ``""`` on failure.
     """
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "prompt": prompt,
         "n_predict": max_tokens,
         "cache_prompt": True,
@@ -438,7 +436,7 @@ async def call_model(
                 timeout=300,
             )
             return response.json().get("content", "")
-        except Exception:
+        except (httpx.HTTPError, json.JSONDecodeError):
             logger.exception("call_model failed on port %d", port)
             return ""
 
@@ -498,7 +496,7 @@ async def openrouter_cloud_escalation(
             if response.status_code == 200:
                 return response.json()["choices"][0]["message"]["content"]
             return f"[Cloud Escalation API Error: {response.status_code}]"
-        except Exception as exc:
+        except (httpx.HTTPError, json.JSONDecodeError) as exc:
             return f"[Cloud Escalation Network Error: {str(exc)}]"
 
 
@@ -518,7 +516,7 @@ async def clear_model_cache(port: int) -> None:
                 f"http://127.0.0.1:{port}/slots/0?action=erase",
                 timeout=5,
             )
-        except Exception:
+        except httpx.HTTPError:
             logger.debug("Failed to clear model cache on port %d (non-critical)", port)
 
 
@@ -546,7 +544,7 @@ async def manage_slot_cache(
                 json={"filename": filename},
                 timeout=10.0,
             )
-        except Exception:
+        except httpx.HTTPError:
             logger.debug(
                 "Slot cache %s failed on port %d (non-critical)",
                 action, port,
@@ -584,7 +582,7 @@ async def wait_for_port_readiness(port: int, timeout: float = 120.0) -> bool:
                 )
                 if resp.status_code == 200:
                     return True
-            except Exception:
+            except httpx.HTTPError:
                 pass
             await asyncio.sleep(0.5)
     return False

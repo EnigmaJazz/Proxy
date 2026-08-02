@@ -11,7 +11,7 @@ These regression tests pin three contracts:
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, AsyncIterator, Optional
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -26,10 +26,9 @@ from routing import RouteDecision
 # ---------------------------------------------------------------------------
 # Self-contained async test client fixture
 # ---------------------------------------------------------------------------
-# conftest.py declares ``app_client`` as a plain ``@pytest.fixture`` (sync) on
-# an async function. In pytest-asyncio strict mode that decorator is rejected.
-# We declare our own equivalent here so this test file is independent of the
-# (broken) conftest fixture.
+# conftest.py now declares ``app_client`` as a proper ``@pytest_asyncio.fixture``
+# (async generator). This file still declares its own equivalent so it stays
+# independent of conftest.
 
 @pytest_asyncio.fixture
 async def r19_client() -> Any:
@@ -116,7 +115,15 @@ class _StreamCapture:
         self.port: int | None = None
         self.headers: dict[str, str] | None = None
 
-    async def __call__(self, *, endpoint, payload, port=0, headers=None, **kwargs):
+    async def __call__(
+        self,
+        *,
+        endpoint: str,
+        payload: dict[str, Any],
+        port: int = 0,
+        headers: Optional[dict[str, str]] = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[dict[str, Any]]:
         self.endpoint = endpoint
         self.payload = payload
         self.port = port

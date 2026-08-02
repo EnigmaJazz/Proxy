@@ -55,17 +55,19 @@ project-specific.
 
 7. **Tests**: new code paths MUST have a regression test. Use the harness in
    `tests/conftest.py` (stubs FlashRank + heavy deps, lifespan disabled).
-   Async tests need `@pytest_asyncio.fixture` (NOT plain `@pytest.fixture` —
-   the conftest `app_client` has this pre-existing bug; fix in place or
-   declare a local fixture).
+   Async tests need `@pytest_asyncio.fixture` (NOT plain `@pytest.fixture`).
 
 8. **No AI attribution in commits**: `Co-Authored-By:` trailers are forbidden.
    Use conventional commits: `type(scope): subject`.
 
-9. **No `print()`**: use `get_logger(name)` from constants.py.
+9. **No `print()`**: use `get_logger(name)` from constants.py. **CLI carve-out:**
+   CLI tools whose stdout IS the deliverable (e.g. `tools/sync_model_profiles.py`
+   emitting the YAML template) may use `print()` for that stdout deliverable;
+   all diagnostics must go through a logger to stderr.
 
 10. **No bare `except:`**: catch specific exceptions. `except Exception` is OK
-    only at process boundaries (lifespan, queue worker).
+    only at process boundaries (lifespan, queue worker) and at the terminal
+    SSE stream boundary where any error must become a client-visible error chunk.
 
 ## Scope conventions
 

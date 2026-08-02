@@ -32,16 +32,15 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
-import logging
+import sqlite3
 import time
 import uuid
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Any
 
 import aiosqlite
 
-from constants import DB_PATH, get_logger
+from constants import DB_PATH, MIGRATIONS, get_logger
 
 logger = get_logger("proxy.database")
 
@@ -49,101 +48,6 @@ logger = get_logger("proxy.database")
 # Schema version constant — bump when migrations change
 # ---------------------------------------------------------------------------
 SCHEMA_VERSION: int = 1
-
-# ---------------------------------------------------------------------------
-# SQL statements for table creation (executed in order during migration)
-# ---------------------------------------------------------------------------
-
-MIGRATIONS: list[str] = [
-    # ---- Enable WAL mode (must be first, outside a transaction) -------------
-    "PRAGMA journal_mode=WAL",
-    "PRAGMA synchronous=NORMAL",
-    "PRAGMA foreign_keys=ON",
-    "PRAGMA busy_timeout=5000",
-
-    # ---- jobs table ----------------------------------------------------------
-    """
-    CREATE TABLE IF NOT EXISTS jobs (
-        id              TEXT PRIMARY KEY,
-        priority        INTEGER NOT NULL DEFAULT 2,
-        state           TEXT NOT NULL DEFAULT 'queued',
-        intent          TEXT NOT NULL DEFAULT 'CHAT',
-        project_id      TEXT,
-        messages_json   TEXT NOT NULL,
-        tools_json      TEXT,
-        parameters_json TEXT,
-        failure_count   INTEGER NOT NULL DEFAULT 0,
-        current_tier    TEXT,
-        partial_content TEXT DEFAULT '',
-        finish_reason   TEXT,
-        lane            TEXT NOT NULL DEFAULT 'lane_a',
-        is_lane_b       INTEGER NOT NULL DEFAULT 0,
-        caller_type     TEXT DEFAULT 'AGENTIC',
-        model_override  TEXT,
-        created_at      TEXT NOT NULL,
-        started_at      TEXT,
-        completed_at    TEXT,
-        FOREIGN KEY (project_id) REFERENCES projects(id)
-    )
-    """,
-
-    # ---- projects table -----------------------------------------------------
-    """
-    CREATE TABLE IF NOT EXISTS projects (
-        id              TEXT PRIMARY KEY,
-        display_name    TEXT,
-        root_path       TEXT,
-        created_at      TEXT NOT NULL,
-        last_active_at  TEXT NOT NULL
-    )
-    """,
-
-    # ---- semantic_cache table ------------------------------------------------
-    """
-    CREATE TABLE IF NOT EXISTS semantic_cache (
-        id              INTEGER PRIMARY KEY AUTOINCREMENT,
-        query_hash      TEXT NOT NULL UNIQUE,
-        query_text      TEXT NOT NULL,
-        response_text   TEXT NOT NULL,
-        embedding       BLOB,
-        hit_count       INTEGER NOT NULL DEFAULT 0,
-        created_at      TEXT NOT NULL,
-        expires_at      TEXT NOT NULL
-    )
-    """,
-
-    # ---- lessons_learned table -----------------------------------------------
-    """
-    CREATE TABLE IF NOT EXISTS lessons_learned (
-        id              INTEGER PRIMARY KEY AUTOINCREMENT,
-        project_id      TEXT NOT NULL,
-        pattern_text    TEXT NOT NULL,
-        embedding       BLOB,
-        source          TEXT,
-        created_at      TEXT NOT NULL,
-        FOREIGN KEY (project_id) REFERENCES projects(id)
-    )
-    """,
-
-    # ---- stream_chunks table -------------------------------------------------
-    """
-    CREATE TABLE IF NOT EXISTS stream_chunks (
-        id              INTEGER PRIMARY KEY AUTOINCREMENT,
-        job_id          TEXT NOT NULL,
-        seq             INTEGER NOT NULL,
-        chunk_json      TEXT NOT NULL,
-        created_at      TEXT NOT NULL,
-        FOREIGN KEY (job_id) REFERENCES jobs(id)
-    )
-    """,
-
-    # ---- indexes ------------------------------------------------------------
-    "CREATE INDEX IF NOT EXISTS idx_jobs_state_priority ON jobs(state, priority)",
-    "CREATE INDEX IF NOT EXISTS idx_jobs_project ON jobs(project_id)",
-    "CREATE INDEX IF NOT EXISTS idx_stream_chunks_job ON stream_chunks(job_id, seq)",
-    "CREATE INDEX IF NOT EXISTS idx_semantic_cache_hash ON semantic_cache(query_hash)",
-    "CREATE INDEX IF NOT EXISTS idx_lessons_project ON lessons_learned(project_id)",
-]
 
 # ---------------------------------------------------------------------------
 # Database manager class
@@ -226,7 +130,7 @@ class Database:
             await self._conn.execute("SELECT load_extension('sqlite-vec')")
             self._vec_loaded = True
             logger.info("sqlite-vec extension loaded successfully")
-        except Exception as exc:
+        except (sqlite3.Error, OSError) as exc:
             logger.warning(
                 "sqlite-vec extension not available (%s) — "
                 "semantic features will be disabled",
@@ -243,7 +147,7 @@ class Database:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    async def _execute_write(self, sql: str, params: tuple = ()) -> aiosqlite.Cursor:
+    async def _execute_write(self, sql: str, params: tuple[Any, ...] = ()) -> aiosqlite.Cursor:
         """
         Execute a write statement under the internal write lock to
         serialise concurrent mutations.
@@ -328,7 +232,7 @@ class Database:
                       job_id, priority, intent, lane)
         return job_id
 
-    async def dequeue_next(self, max_priority: int = 2) -> Optional[Dict[str, Any]]:
+    async def dequeue_next(self, max_priority: int = 2) -> Optional[dict[str, Any]]:
         """
         Atomically claim the next queued job whose priority <= *max_priority*.
 
@@ -429,7 +333,7 @@ class Database:
         )
         logger.info("Job %s escalated to tier %s", job_id, new_tier)
 
-    async def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+    async def get_job(self, job_id: str) -> Optional[dict[str, Any]]:
         """Retrieve a single job by ID."""
         cursor = await self._conn.execute(
             "SELECT * FROM jobs WHERE id = ?", (job_id,)
@@ -437,7 +341,7 @@ class Database:
         row = await cursor.fetchone()
         return dict(row) if row else None
 
-    async def get_pending_jobs(self) -> List[Dict[str, Any]]:
+    async def get_pending_jobs(self) -> list[dict[str, Any]]:
         """
         Return all jobs in 'queued' or 'active' state.
         Used at startup to rebuild the in-memory working set.
@@ -628,7 +532,7 @@ class Database:
             "DELETE FROM stream_chunks WHERE job_id = ?", (job_id,)
         )
 
-    async def get_all_projects(self) -> List[Dict[str, Any]]:
+    async def get_all_projects(self) -> list[dict[str, Any]]:
         """
         Return all projects ordered by most recently active first.
 

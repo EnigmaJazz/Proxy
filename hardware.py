@@ -31,29 +31,32 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import os
 import subprocess
 import time
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional
 
 import httpx
-from prometheus_client import Gauge
 
 from constants import (
     THERMAL_LIMITS,
     CPU_TEMP_PATH,
     GPU_TEMP_PATH,
-    CoolingPreset,
-    PROJECT_ROOT,
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
     SENSOR_INTERVAL,
+    metric_cpu_temp,
+    metric_gpu_edge_temp,
+    metric_gpu_junc_temp,
+    metric_gpu_vram_temp,
+    metric_gpu_used_vram_gb,
+    metric_ram_used_pct,
     get_logger,
 )
 
 logger = get_logger("proxy.hardware")
+from systemd import SystemdController
 
 # ---------------------------------------------------------------------------
 # PyRSMI availability flag (set once at import time)
@@ -73,26 +76,20 @@ THERMAL_COOLDOWN: float = 30.0  # seconds after critical before re-checking
 VRAM_DEFAULT_TOTAL_MB: int = 12800  # fallback for 12GB card
 
 # ---------------------------------------------------------------------------
-# Prometheus metrics (registered at module level)
-# ---------------------------------------------------------------------------
-metric_cpu_temp = Gauge("cpu_temp_celsius", "CPU temperature (°C)")
-metric_gpu_edge_temp = Gauge("gpu_edge_temp_celsius", "GPU edge temperature (°C)")
-metric_gpu_junc_temp = Gauge("gpu_junc_temp_celsius", "GPU junction temperature (°C)")
-metric_gpu_vram_temp = Gauge("gpu_vram_temp_celsius", "GPU VRAM temperature (°C)")
-metric_gpu_used_vram_gb = Gauge("gpu_used_vram_gb", "GPU VRAM in use (GiB)")
-metric_ram_used_pct = Gauge("ram_used_percent", "System RAM usage (%)")
-
-# ---------------------------------------------------------------------------
 # In-memory thermal state (updated by background monitor, read by proxy)
+# The dict lives on ``app.state.thermal_state`` (one per proxy app);
+# ``default_thermal_state`` is the factory that builds a fresh one.
 # ---------------------------------------------------------------------------
-thermal_state: Dict[str, float] = {
-    "cpu": 0.0,
-    "gpu_edge": 0.0,
-    "gpu_junction": 0.0,
-    "gpu_vram": 0.0,
-    "gpu_vram_used_gb": 0.0,
-    "ram_used_percent": 0.0,
-}
+def default_thermal_state() -> dict[str, float]:
+    """Return a fresh thermal-state dict (mutated in place by the monitor)."""
+    return {
+        "cpu": 0.0,
+        "gpu_edge": 0.0,
+        "gpu_junction": 0.0,
+        "gpu_vram": 0.0,
+        "gpu_vram_used_gb": 0.0,
+        "ram_used_percent": 0.0,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +107,7 @@ def _read_hwmon(label_path: str, value_path: str) -> float:
             if name_file.exists() and name_file.read_text().strip() == label_path:
                 val = (base / value_path).read_text().strip()
                 return float(val) / 1000.0
-    except Exception:
+    except (OSError, ValueError):
         pass
     return 0.0
 
@@ -133,7 +130,7 @@ def get_cpu_temp() -> float:
     return _read_hwmon("k10temp", "temp1_input")
 
 
-def _read_amdgpu_hwmon() -> dict:
+def _read_amdgpu_hwmon() -> dict[str, float]:
     """
     Read AMD GPU temperatures from the ``amdgpu`` hwmon sysfs interface.
 
@@ -148,7 +145,7 @@ def _read_amdgpu_hwmon() -> dict:
         ``{"edge": float, "junction": float, "vram": float}``.
         Missing or unreadable sensors default to 0.0.
     """
-    result: dict = {"edge": 0.0, "junction": 0.0, "vram": 0.0}
+    result: dict[str, float] = {"edge": 0.0, "junction": 0.0, "vram": 0.0}
     try:
         for base in Path("/sys/class/hwmon").iterdir():
             name_file = base / "name"
@@ -171,12 +168,12 @@ def _read_amdgpu_hwmon() -> dict:
                     if temp_path.exists():
                         result[key] = float(temp_path.read_text().strip()) / 1000.0
             break  # Use the first amdgpu device with labeled temps
-    except Exception:
+    except (OSError, ValueError):
         logger.debug("amdgpu hwmon read failed", exc_info=True)
     return result
 
 
-def get_gpu_temps() -> dict:
+def get_gpu_temps() -> dict[str, float]:
     """
     Return dict with keys: edge, junction, vram, vram_used_gb (all floats).
 
@@ -185,7 +182,7 @@ def get_gpu_temps() -> dict:
     with the amdgpu kernel driver) when pyrsmi is unavailable.
     Returns zeros if both sources fail.
     """
-    result: dict = {"edge": 0.0, "junction": 0.0, "vram": 0.0, "vram_used_gb": 0.0}
+    result: dict[str, float] = {"edge": 0.0, "junction": 0.0, "vram": 0.0, "vram_used_gb": 0.0}
 
     if PYRSMI_AVAILABLE:
         try:
@@ -203,7 +200,7 @@ def get_gpu_temps() -> dict:
             vram_bytes = rocUtil.getVRAMUsage(device)
             result["vram_used_gb"] = vram_bytes / (1024**3)
             return result
-        except Exception:
+        except (OSError, ValueError, RuntimeError):
             logger.exception("pyrsmi readout failed — falling back to hwmon")
 
     # Fallback: read amdgpu hwmon sysfs (edge, junction, VRAM temps only)
@@ -256,7 +253,7 @@ async def get_total_vram_mb() -> int:
         logger.error("rocm-smi not found — install ROCm tools to detect VRAM")
     except asyncio.TimeoutError:
         logger.error("rocm-smi command timed out")
-    except Exception:
+    except (OSError, ValueError, subprocess.SubprocessError):
         logger.exception("Failed to get total VRAM")
     return VRAM_DEFAULT_TOTAL_MB
 
@@ -292,7 +289,7 @@ async def get_free_vram_mb() -> int:
         logger.error("rocm-smi not found")
     except asyncio.TimeoutError:
         logger.error("rocm-smi command timed out")
-    except Exception:
+    except (OSError, ValueError, subprocess.SubprocessError):
         logger.exception("Failed to get free VRAM")
     return 0
 
@@ -336,6 +333,12 @@ async def verify_vram_availability(required_mb: int = 8000) -> None:
         await asyncio.sleep(30)
 
 
+def _write_fit_target(fit_target: int, env_ngl_file: str) -> None:
+    """Persist the FIT_TARGET value to the .env.ngl file (sync helper)."""
+    with open(env_ngl_file, "w") as f:
+        f.write(f"FIT_TARGET={fit_target}\n")
+
+
 async def calculate_dynamic_ngl(
     target_service: str,
     is_headless: Optional[bool] = None,
@@ -352,14 +355,13 @@ async def calculate_dynamic_ngl(
     from constants import ENV_NGL_FILE
 
     if is_headless is None:
-        is_headless = is_system_headless()
+        is_headless = await asyncio.to_thread(is_system_headless)
 
     # fit-target is the MB buffer to leave free when --fit calculates offloading
     fit_target: int = 256 if is_headless else 1024
 
     try:
-        with open(ENV_NGL_FILE, "w") as f:
-            f.write(f"FIT_TARGET={fit_target}\n")
+        await asyncio.to_thread(_write_fit_target, fit_target, ENV_NGL_FILE)
         logger.info("FIT_TARGET set to %dMB (headless=%s)", fit_target, is_headless)
     except OSError:
         logger.exception("Failed to write FIT_TARGET to %s", ENV_NGL_FILE)
@@ -390,7 +392,7 @@ def is_system_headless() -> bool:
             if result.returncode == 0:
                 logger.debug("Graphical process '%s' detected — system is NOT headless", proc)
                 return False
-        except Exception:
+        except (subprocess.SubprocessError, OSError):
             pass
 
     logger.debug("No graphical process detected — system is headless")
@@ -408,7 +410,7 @@ SHARED_ENV_FILE: str = "~/kinver-hub/gpu_state.env"
 async def arm_gpu_for_inference(
     target_service: str,
     target_port: int,
-    systemd=None,  # Optional SystemdController (avoids circular import)
+    systemd: Optional[SystemdController] = None,  # injected to avoid import cycles
 ) -> None:
     """
     Prepare the physical GPU for optimal inference by:
@@ -431,7 +433,7 @@ async def arm_gpu_for_inference(
         temporary controller is created.
     """
     # Abort if Wayland/Xorg is active — pinning VRAM would crash the display
-    if not is_system_headless():
+    if not await asyncio.to_thread(is_system_headless):
         logger.info("Graphical session active — skipping GPU arm (safe mode)")
         return
 
@@ -490,7 +492,7 @@ async def arm_gpu_for_inference(
             # Wait for port with a simple health check
             await _wait_for_port(target_port)
 
-    except Exception as exc:
+    except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
         logger.error("Failed to arm GPU: %s", exc)
 
 
@@ -510,7 +512,7 @@ async def _detect_backend(target_service: str) -> str:
             content = stdout.decode().lower()
             if "vulkan" in content:
                 return "vulkan"
-    except Exception:
+    except (OSError, subprocess.SubprocessError, ValueError):
         pass
     return "rocm"
 
@@ -520,7 +522,6 @@ async def _wait_for_port(port: int, timeout: float = 30.0) -> None:
     Simple TCP connect loop to wait for a port to become available.
     Used as a fallback when SystemdController is not provided.
     """
-    import socket
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
@@ -532,7 +533,7 @@ async def _wait_for_port(port: int, timeout: float = 30.0) -> None:
             await writer.wait_closed()
             logger.info("Port %d is active", port)
             return
-        except Exception:
+        except (OSError, TimeoutError):
             await asyncio.sleep(0.5)
     logger.warning("Port %d did not become ready within %.1fs", port, timeout)
 
@@ -585,7 +586,7 @@ async def send_wayland_notification(title: str, message: str) -> None:
             stderr=asyncio.subprocess.DEVNULL,
         )
         await proc.communicate()
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         pass  # Notification failure is non-critical
 
 
@@ -611,7 +612,7 @@ async def send_telegram_alert(title: str, message: str) -> None:
                 },
                 timeout=5.0,
             )
-        except Exception as exc:
+        except httpx.HTTPError as exc:
             logger.error("Failed to send Telegram alert: %s", exc)
 
 
@@ -634,7 +635,7 @@ async def send_bash_notification(title: str, message: str) -> None:
             stderr=asyncio.subprocess.DEVNULL,
         )
         await proc.communicate()
-    except Exception as exc:
+    except (OSError, subprocess.SubprocessError) as exc:
         logger.error("Failed to trigger bash notification: %s", exc)
 
 
@@ -643,7 +644,7 @@ async def send_bash_notification(title: str, message: str) -> None:
 # ---------------------------------------------------------------------------
 
 async def thermal_monitor_task(
-    state: Dict[str, float],
+    state: dict[str, float],
     interval: float = SENSOR_INTERVAL,
 ) -> None:
     """
@@ -665,7 +666,7 @@ async def thermal_monitor_task(
     interval : float
         Seconds between sensor polls (default from constants.SENSOR_INTERVAL).
     """
-    cooldown_until: Dict[str, float] = {}  # per-zone cooldown after crit warning
+    cooldown_until: dict[str, float] = {}  # per-zone cooldown after crit warning
 
     logger.info(
         "Thermal monitor started (interval=%.1fs, limits=%s)",
@@ -735,11 +736,11 @@ async def thermal_monitor_task(
                             stderr=asyncio.subprocess.DEVNULL,
                         )
                         await asyncio.wait_for(proc.communicate(), timeout=10.0)
-                    except Exception:
+                    except (OSError, subprocess.SubprocessError, TimeoutError):
                         logger.exception("Emergency shutdown failed")
                     cooldown_until[zone] = now + THERMAL_COOLDOWN
 
-        except Exception:
+        except (OSError, ValueError):
             logger.exception("Thermal monitor iteration failed")
 
         await asyncio.sleep(interval)

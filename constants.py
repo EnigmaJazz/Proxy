@@ -15,6 +15,8 @@ import logging
 import re
 from pathlib import Path
 
+from prometheus_client import Gauge
+
 # ---------------------------------------------------------------------------
 # Project root & directory helpers
 # ---------------------------------------------------------------------------
@@ -131,6 +133,100 @@ GPU_TEMP_PATH: Path = Path("/tmp/gpu_temp.txt")
 # SQLite database (replaces RAM queue + JSON persistence)
 DB_PATH: Path = PROJECT_ROOT / "ai_queue.db"
 
+# ---------------------------------------------------------------------------
+# SQLite schema migrations — executed in order during startup
+# ---------------------------------------------------------------------------
+MIGRATIONS: list[str] = [
+    # ---- Enable WAL mode (must be first, outside a transaction) -------------
+    "PRAGMA journal_mode=WAL",
+    "PRAGMA synchronous=NORMAL",
+    "PRAGMA foreign_keys=ON",
+    "PRAGMA busy_timeout=5000",
+
+    # ---- jobs table ----------------------------------------------------------
+    """
+    CREATE TABLE IF NOT EXISTS jobs (
+        id              TEXT PRIMARY KEY,
+        priority        INTEGER NOT NULL DEFAULT 2,
+        state           TEXT NOT NULL DEFAULT 'queued',
+        intent          TEXT NOT NULL DEFAULT 'CHAT',
+        project_id      TEXT,
+        messages_json   TEXT NOT NULL,
+        tools_json      TEXT,
+        parameters_json TEXT,
+        failure_count   INTEGER NOT NULL DEFAULT 0,
+        current_tier    TEXT,
+        partial_content TEXT DEFAULT '',
+        finish_reason   TEXT,
+        lane            TEXT NOT NULL DEFAULT 'lane_a',
+        is_lane_b       INTEGER NOT NULL DEFAULT 0,
+        caller_type     TEXT DEFAULT 'AGENTIC',
+        model_override  TEXT,
+        created_at      TEXT NOT NULL,
+        started_at      TEXT,
+        completed_at    TEXT,
+        FOREIGN KEY (project_id) REFERENCES projects(id)
+    )
+    """,
+
+    # ---- projects table -----------------------------------------------------
+    """
+    CREATE TABLE IF NOT EXISTS projects (
+        id              TEXT PRIMARY KEY,
+        display_name    TEXT,
+        root_path       TEXT,
+        created_at      TEXT NOT NULL,
+        last_active_at  TEXT NOT NULL
+    )
+    """,
+
+    # ---- semantic_cache table ------------------------------------------------
+    """
+    CREATE TABLE IF NOT EXISTS semantic_cache (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        query_hash      TEXT NOT NULL UNIQUE,
+        query_text      TEXT NOT NULL,
+        response_text   TEXT NOT NULL,
+        embedding       BLOB,
+        hit_count       INTEGER NOT NULL DEFAULT 0,
+        created_at      TEXT NOT NULL,
+        expires_at      TEXT NOT NULL
+    )
+    """,
+
+    # ---- lessons_learned table -----------------------------------------------
+    """
+    CREATE TABLE IF NOT EXISTS lessons_learned (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id      TEXT NOT NULL,
+        pattern_text    TEXT NOT NULL,
+        embedding       BLOB,
+        source          TEXT,
+        created_at      TEXT NOT NULL,
+        FOREIGN KEY (project_id) REFERENCES projects(id)
+    )
+    """,
+
+    # ---- stream_chunks table -------------------------------------------------
+    """
+    CREATE TABLE IF NOT EXISTS stream_chunks (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id          TEXT NOT NULL,
+        seq             INTEGER NOT NULL,
+        chunk_json      TEXT NOT NULL,
+        created_at      TEXT NOT NULL,
+        FOREIGN KEY (job_id) REFERENCES jobs(id)
+    )
+    """,
+
+    # ---- indexes ------------------------------------------------------------
+    "CREATE INDEX IF NOT EXISTS idx_jobs_state_priority ON jobs(state, priority)",
+    "CREATE INDEX IF NOT EXISTS idx_jobs_project ON jobs(project_id)",
+    "CREATE INDEX IF NOT EXISTS idx_stream_chunks_job ON stream_chunks(job_id, seq)",
+    "CREATE INDEX IF NOT EXISTS idx_semantic_cache_hash ON semantic_cache(query_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_lessons_project ON lessons_learned(project_id)",
+]
+
 # Legacy paths (kept for transition / backward compat)
 MODELS_DIR: str = "~/kinver-hub/models/"
 PROMPTS_DIR: str = "~/kinver-hub/prompts/"
@@ -234,6 +330,109 @@ NATIVE_TOOLS: list[dict] = [
         },
     },
 ]
+
+# ---------------------------------------------------------------------------
+# Routing & classifier configuration
+# ---------------------------------------------------------------------------
+
+# Default fallback phrases extracted from Nanobot dream_phase1.md template.
+# These are used if the installed Nanobot package cannot be found or read.
+# The phrases are unique to Nanobot's dream/autonomous consolidation prompt
+# and do NOT appear in normal conversational requests — making them a
+# reliable fingerprint for background autonomous tasks.
+_DREAM_FALLBACK_PHRASES: list[str] = [
+    "extract new facts from conversation history",
+    "output one line per finding",
+    "deduplicate existing memory files",
+    "atomic fact (not already in memory)",
+    "[file] atomic fact",
+    "[file-remove] reason for removal",
+    "[skill] kebab-case-name",
+    "[skip] if nothing needs updating",
+    "find and flag redundant, overlapping, or stale content",
+    "update memory files based on the analysis below",
+]
+
+# Keywords that indicate a request likely needs tool access (web search,
+# file I/O, or system exec).  Over-detection is safe because the Worker
+# model can handle plain chat just as well as Chatter.
+# All matching is done lowercase with substring matching.
+TOOL_KEYWORDS: frozenset[str] = frozenset({
+    # Weather / temporal — need live data
+    "weather", "forecast", "tomorrow", "tonight", "next week",
+    "this weekend", "next month", "today's",
+    # Web search / live data
+    "search", "look up", "latest", "news", "current",
+    "stock", "price",
+    # File I/O
+    "read the file", "read file", "open file", "save file",
+    "write file", "edit file", "modify", "rename",
+    # Exec / system
+    "run command", "execute",
+})
+
+# ---------------------------------------------------------------------------
+# ROUTE_MAP: classified intent → local model endpoint key
+#
+#   CHAT      → chatter  (9B, fast chat model)
+#   TOOL      → worker   (9B, tool-capable model)
+#   CODE      → professional (35B MoE, heavy coding model)
+#   SCHOLAR   → scholar  (deep research)
+#   PROFESSIONAL → professional (professional writing / 35B MoE)
+#   CREATIVE  → creative (long-form creative writing)
+#   ARCHITECT → architect (complex multi-stage planning)
+#
+#   Lane B (IDE passthrough) ALWAYS goes to professional regardless
+#   of intent — the frontdesk is bypassed entirely.
+# ---------------------------------------------------------------------------
+ROUTE_MAP: dict[str, str] = {
+    "CHAT":         "professional",
+    "TOOL":         "professional",
+    "CODE":         "professional",  # 35B MoE
+    "SCHOLAR":      "scholar",
+    "PROFESSIONAL": "professional",
+    "CREATIVE":     "creative",
+    "ARCHITECT":    "architect",
+}
+
+# Heavy GPU models (require VRAM allocation, can't be quickly swapped)
+HEAVY_MODELS: set[str] = {"professional", "coder", "creative", "scholar", "architect"}
+
+# CPU-only models (always resident, never hot-swapped)
+CPU_MODELS: set[str] = {"frontdesk"}
+
+# Heavy model keys that may need cold-starting before streaming (includes
+# the always-on Chatter/Worker models, so it is a superset of HEAVY_MODELS).
+_HEAVY_MODEL_KEYS: set[str] = {"professional", "coder", "creative", "scholar", "architect", "chatter", "worker"}
+
+# Maximum tool call repetitions allowed per domain before breaking the loop
+LOOP_LIMITS: dict[str, int] = {
+    "scholar":      6,
+    "architect":    4,
+    "coder":        4,
+    "professional": 4,
+    "creative":     5,
+    "standard":     3,
+    "worker":       2,
+    "CHAT":         2,
+    "TOOL":         2,
+}
+
+# ---------------------------------------------------------------------------
+# Prometheus metric descriptors
+#
+# These are STATELESS metric descriptors (label templates), not runtime
+# state: each Gauge registers with the default collector registry at import
+# time and only its numeric VALUE is mutated at runtime via ``.set()``.  The
+# /metrics scrape reads the default registry, so the descriptors may live
+# here as configuration.
+# ---------------------------------------------------------------------------
+metric_cpu_temp = Gauge("cpu_temp_celsius", "CPU temperature (°C)")
+metric_gpu_edge_temp = Gauge("gpu_edge_temp_celsius", "GPU edge temperature (°C)")
+metric_gpu_junc_temp = Gauge("gpu_junc_temp_celsius", "GPU junction temperature (°C)")
+metric_gpu_vram_temp = Gauge("gpu_vram_temp_celsius", "GPU VRAM temperature (°C)")
+metric_gpu_used_vram_gb = Gauge("gpu_used_vram_gb", "GPU VRAM in use (GiB)")
+metric_ram_used_pct = Gauge("ram_used_percent", "System RAM usage (%)")
 
 # ---------------------------------------------------------------------------
 # LLM inference constants

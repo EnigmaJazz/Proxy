@@ -27,10 +27,9 @@ Maintainers: James Stansfield
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
 import re
-from typing import Optional, List, Dict
+from typing import Any, Optional
 
 import httpx
 import aiofiles
@@ -39,7 +38,6 @@ import aiofiles.os as aio_os
 from constants import (
     SYSTEMD_DIR,
     SERVICE_PATTERN,
-    TCP_TIMEOUT,
     get_logger,
 )
 
@@ -73,7 +71,7 @@ class SystemdController:
     def __init__(self, systemd_dir: str = SYSTEMD_DIR) -> None:
         self._systemd_dir: str = systemd_dir
         # port cache: domain_name → port_number
-        self._port_cache: Dict[str, int] = {}
+        self._port_cache: dict[str, int] = {}
         # Track which GPU-heavy models are currently active
         self._active_heavy_model: Optional[str] = None
 
@@ -197,7 +195,7 @@ class SystemdController:
             logger.debug(
                 "Unit file %s not found for domain '%s'", unit_path, domain
             )
-        except Exception:
+        except (OSError, ValueError):
             logger.exception("Failed to read unit file for domain '%s'", domain)
 
         # Fallback: if not found, try the worker port as default
@@ -236,18 +234,18 @@ class SystemdController:
             True if the endpoint became healthy, False on timeout.
         """
         url = f"http://127.0.0.1:{port}/health"
-        deadline = asyncio.get_event_loop().time() + timeout
+        deadline = asyncio.get_running_loop().time() + timeout
 
         logger.info("Waiting for port %d readiness (timeout=%.1fs)...", port, timeout)
 
         async with httpx.AsyncClient() as client:
-            while asyncio.get_event_loop().time() < deadline:
+            while asyncio.get_running_loop().time() < deadline:
                 try:
                     resp = await client.get(url, timeout=httpx.Timeout(1.0))
                     if resp.status_code == 200:
                         logger.info("Port %d is ready", port)
                         return True
-                except Exception:
+                except httpx.HTTPError:
                     pass  # Not ready yet — retry after interval
                 await asyncio.sleep(HEALTH_CHECK_INTERVAL)
 
@@ -321,14 +319,14 @@ class SystemdController:
     # Model discovery
     # ------------------------------------------------------------------
 
-    async def scan_models(self) -> list[dict]:
+    async def scan_models(self) -> list[dict[str, Any]]:
         """
         Enumerate all llama-<name>.service units and return them as an
         OpenAI-compatible ``/v1/models`` list.
 
         Each returned dict has keys: ``id``, ``object``, ``owned_by``, ``port``.
         """
-        discovered: list[dict] = []
+        discovered: list[dict[str, Any]] = []
 
         try:
             entries = await aio_os.listdir(self._systemd_dir)
@@ -358,7 +356,7 @@ class SystemdController:
                         "owned_by": "systemd",
                         "port": int(port_match.group(1)),
                     })
-            except Exception:
+            except (OSError, ValueError):
                 logger.debug("Skipping unreadable unit file: %s", filename)
 
         logger.debug("Discovered %d models from systemd", len(discovered))

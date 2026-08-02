@@ -18,55 +18,55 @@ Maintainers: James Stansfield
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
-import logging
 import re
+import subprocess
 import time
 import uuid
-from typing import Optional, Dict, Any, AsyncIterator, List
+import httpx
+from typing import TYPE_CHECKING, Any, AsyncIterator
 
-from fastapi import Request
+from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
 from constants import (
-    IDE_PASSTHROUGH_HEADER,
     STOP_SEQS,
-    NATIVE_TOOLS,
     OPENAI_FORWARD_FIELDS,
     R11_AUTHORITY_FIELDS,
     ALL_MODEL_KEYS,
-    CoolingPreset,
+    CPU_MODELS,
+    TOOL_KEYWORDS,
+    _HEAVY_MODEL_KEYS,
     get_logger,
 )
 from llm import (
     stream_llm,
-    call_llm,
     openrouter_cloud_escalation,
-    _inject_provider_metadata,
 )
 from routing import (
     RouteDecision,
     discriminate_caller,
     is_lane_b,
     classify_with_frontdesk,
-    resolve_model,
     resolve_route_for_lane_a,
     detect_tool_loops,
     check_semantic_cache,
     extract_project_context,
     is_dream_process,
-    TOOL_KEYWORDS,
-    CPU_MODELS,
 )
 from text_to_structured import ToolCallTextToStructured
+
+if TYPE_CHECKING:
+    from proxy import AppState
 
 logger = get_logger("proxy.routes")
 
 # ---------------------------------------------------------------------------
 # /v1/system commands (embedded in user prompts)
 # ---------------------------------------------------------------------------
-_PAUSE_RE = re.compile(r"(?i)^\s*/pause(?:\s+(\d+))?\s*$")
-_RESUME_RE = re.compile(r"(?i)^\s*/resume\s*$")
+_PAUSE_RE = re.compile(r"(?i)\s*/pause(?:\s+(\d+))?\s*$")
+_RESUME_RE = re.compile(r"(?i)\s*/resume\s*$")
 _CLOUD_RE = re.compile(r"/cloud")
 
 # ---------------------------------------------------------------------------
@@ -93,18 +93,34 @@ _CLOUD_RE = re.compile(r"/cloud")
 #
 # Both states are process-local and capped with an LRU eviction so
 # they don't leak memory across a long-lived proxy.
-import hashlib
-import time as _time
 
 _LOOP_DETECTION_WINDOW = 3  # consecutive identical calls trigger detection
 _LOOP_DETECTION_MAX_JOBS = 1000  # cap on tracked sessions (LRU eviction)
 _LOOP_DETECTION_SESSION_TTL = 3600  # session state expires after 1 hour of inactivity
 
-_loop_detection_state: dict[str, list[str]] = {}
-_session_state: dict[str, dict] = {}
+
+def _loop_state(app: FastAPI) -> dict[str, list[str]]:
+    """Lazy accessor for the cross-request tool-loop state.
+
+    The state lives on ``app.state`` (Rule 6 — no module-level mutable
+    globals).  ``getattr``/``setattr`` so lifespan-less test apps and the
+    real app both work.
+    """
+    state = app.state
+    if not hasattr(state, "loop_detection_state"):
+        state.loop_detection_state = {}
+    return state.loop_detection_state
 
 
-def _tool_call_signature(tc: dict) -> str:
+def _session_state(app: FastAPI) -> dict[str, dict]:
+    """Lazy accessor for the cross-request session map on ``app.state``."""
+    state = app.state
+    if not hasattr(state, "session_state"):
+        state.session_state = {}
+    return state.session_state
+
+
+def _tool_call_signature(tc: dict[str, Any]) -> str:
     """Build a stable signature for a tool call.
 
     The signature is ``f"{name}:{args}"`` so two calls with the same
@@ -116,7 +132,7 @@ def _tool_call_signature(tc: dict) -> str:
     return f"{name}:{args}"
 
 
-def _first_user_message_content(messages: list) -> str:
+def _first_user_message_content(messages: list[dict[str, Any]]) -> str:
     """Return the content of the first user-role message in the
     conversation, or an empty string if there is none.  This is the
     stable identifier we use for cross-request session tracking.
@@ -143,7 +159,7 @@ def _first_user_message_content(messages: list) -> str:
     return ""
 
 
-def _resolve_session_id(messages: list) -> str:
+def _resolve_session_id(messages: list[dict[str, Any]], app: FastAPI) -> str:
     """Return a session ID for a request, identifying the conversation.
 
     The session ID is the SHA-256 of the first user message combined
@@ -160,8 +176,9 @@ def _resolve_session_id(messages: list) -> str:
         # No user message — fall back to a per-request random session.
         return f"anon:{uuid.uuid4().hex}"
     first_msg_hash = hashlib.sha256(first_msg.encode("utf-8")).hexdigest()[:16]
-    cached = _session_state.get(first_msg_hash)
-    now = _time.time()
+    session_state = _session_state(app)
+    cached = session_state.get(first_msg_hash)
+    now = time.time()
     if cached is not None and (now - cached["first_seen"]) < _LOOP_DETECTION_SESSION_TTL:
         # Cache hit — return the original session_id.
         cached["last_seen"] = now
@@ -169,22 +186,23 @@ def _resolve_session_id(messages: list) -> str:
     # New session — first time we see this first user message (or
     # the cache expired).  Generate a fresh session_id.
     session_id = f"{first_msg_hash}:{int(now)}"
-    _session_state[first_msg_hash] = {
+    session_state[first_msg_hash] = {
         "session_id": session_id,
         "first_seen": now,
         "last_seen": now,
     }
     # LRU-ish cap on total sessions tracked.
-    if len(_session_state) > _LOOP_DETECTION_MAX_JOBS:
+    if len(session_state) > _LOOP_DETECTION_MAX_JOBS:
         # Drop the session with the smallest last_seen (oldest access).
-        oldest_key = min(_session_state, key=lambda k: _session_state[k]["last_seen"])
-        _session_state.pop(oldest_key, None)
+        oldest_key = min(session_state, key=lambda k: session_state[k]["last_seen"])
+        session_state.pop(oldest_key, None)
     return session_id
 
 
 def _check_tool_loop(
     session_id: str,
     signature: str,
+    app: FastAPI,
 ) -> bool:
     """Record a tool call signature and return True if it's a loop.
 
@@ -192,7 +210,8 @@ def _check_tool_loop(
     ``_LOOP_DETECTION_WINDOW`` times consecutively for this session.
     Resets the window when a different signature is seen.
     """
-    history = _loop_detection_state.setdefault(session_id, [])
+    loop_state = _loop_state(app)
+    history = loop_state.setdefault(session_id, [])
     if history and history[-1] != signature:
         # Different tool call — reset the consecutive-run window.
         history.clear()
@@ -201,25 +220,21 @@ def _check_tool_loop(
     if len(history) > _LOOP_DETECTION_WINDOW:
         del history[0 : len(history) - _LOOP_DETECTION_WINDOW]
     # LRU-ish cap on total sessions tracked.
-    if len(_loop_detection_state) > _LOOP_DETECTION_MAX_JOBS:
+    if len(loop_state) > _LOOP_DETECTION_MAX_JOBS:
         # Drop the oldest session_id to bound memory.
         oldest_key = min(
-            _loop_detection_state,
-            key=lambda k: _session_state.get(k, {}).get("last_seen", 0),
+            loop_state,
+            key=lambda k: _session_state(app).get(k, {}).get("last_seen", 0),
         )
-        _loop_detection_state.pop(oldest_key, None)
+        loop_state.pop(oldest_key, None)
     return len(history) >= _LOOP_DETECTION_WINDOW and all(
         s == signature for s in history
     )
 
 
-def _clear_tool_loop(session_id: str) -> None:
+def _clear_tool_loop(session_id: str, app: FastAPI) -> None:
     """Drop a session's loop-detection state (called on stream end)."""
-    _loop_detection_state.pop(session_id, None)
-
-
-# ``uuid`` is used for the anonymous-session fallback above.
-import uuid
+    _loop_state(app).pop(session_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +320,7 @@ async def chat_completions(request: Request) -> StreamingResponse:
     except json.JSONDecodeError:
         return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
 
-    messages: list = body.get("messages", [])
+    messages: list[dict[str, Any]] = body.get("messages", [])
     if not messages:
         return JSONResponse({"error": "messages array required"}, status_code=400)
 
@@ -321,7 +336,6 @@ async def chat_completions(request: Request) -> StreamingResponse:
     seed = body.get("seed")
     top_logprobs = body.get("top_logprobs")
     response_format = body.get("response_format")
-    n = body.get("n", 1)
 
     # ---- Discriminate caller type ------------------------------------------
     headers = dict(request.headers)
@@ -330,7 +344,7 @@ async def chat_completions(request: Request) -> StreamingResponse:
     is_dream = False
 
     # ---- Prepare messages (Glass Pipe Rule: NO text alteration) ------------
-    processed_messages: list = list(messages)  # Shallow copy
+    processed_messages: list[dict[str, Any]] = list(messages)  # Shallow copy
 
     # ---- Lane B (IDE passthrough): strip tools, bypass frontdesk -----------
     if caller_type == "IDE" or lane_b:
@@ -352,7 +366,7 @@ async def chat_completions(request: Request) -> StreamingResponse:
             m.get("content", "") for m in processed_messages
             if isinstance(m.get("content"), str)
         ).lower()
-        is_dream = is_dream_process(raw_text)
+        is_dream = await is_dream_process(raw_text)
 
         effective_domain = model_domain if model_domain in (
             "coder", "architect", "professional", "creative", "scholar",
@@ -405,13 +419,13 @@ async def chat_completions(request: Request) -> StreamingResponse:
 
     # ---- Handle embedded commands -------------------------------------------
     # /pause [minutes]
-    pause_match = _PAUSE_RE.match(user_text.strip()) if user_text else None
+    pause_match = _PAUSE_RE.search(user_text) if user_text else None
     if pause_match:
         duration_mins = int(pause_match.group(1)) if pause_match.group(1) else 60
         return await _handle_pause_command(duration_mins, state)
 
     # /resume
-    if user_text and _RESUME_RE.match(user_text.strip()):
+    if user_text and _RESUME_RE.search(user_text):
         return await _handle_resume_command(state)
 
     # /cloud
@@ -490,14 +504,16 @@ async def chat_completions(request: Request) -> StreamingResponse:
 
         from cooling import CoolingStateMachine
         hardware_path = CoolingStateMachine.hardware_path_for_model("architect")
+        session_id = _resolve_session_id(processed_messages, request.app)
         return StreamingResponse(
             _event_stream_with_model_startup(
-                state=state, route=route, payload=payload, fwd_headers={},
+                state=state, app=request.app, route=route, payload=payload, fwd_headers={},
                 job_id=job_id, project_id="soul",
                 processed_messages=processed_messages,
                 requested_model="architect",
                 hardware_path=hardware_path,
                 proxy_preamble=proxy_preamble,
+                session_id=session_id,
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
@@ -522,7 +538,7 @@ async def chat_completions(request: Request) -> StreamingResponse:
         last_msg.get("role") == "tool"
     )
 
-    classification: dict = {
+    classification: dict[str, Any] = {
         "is_valid": True,
         "intent": "CHAT",
         "priority": 2,
@@ -570,7 +586,7 @@ async def chat_completions(request: Request) -> StreamingResponse:
             "Frontdesk classified: intent=%s priority=%s project=%s factual=%s",
             classification.get("intent"),
             classification.get("priority"),
-            classification.get("project"),
+            classification.get("project_name"),
             classification.get("is_factual"),
         )
     else:
@@ -656,7 +672,7 @@ async def chat_completions(request: Request) -> StreamingResponse:
 
     # ---- Extract project context for database ---------------------------------
     ctx = extract_project_context(user_text)
-    project_name = ctx["project"] if ctx["project"] != "default" else classification.get("project", "general")
+    project_name = ctx["project"] if ctx["project"] != "general" else classification.get("project_name", "general")
 
     # ---- Create project in database ------------------------------------------
     project_id = "general"
@@ -803,7 +819,7 @@ async def chat_completions(request: Request) -> StreamingResponse:
                 payload[field] = entry.values[field]
 
     # ---- Forward headers for Lane B ----------------------------------------
-    fwd_headers: Dict[str, str] = {}
+    fwd_headers: dict[str, str] = {}
     if route.is_lane_b:
         fwd_headers["X-IDE-Mode"] = "true"
 
@@ -846,6 +862,7 @@ async def chat_completions(request: Request) -> StreamingResponse:
     return StreamingResponse(
         _event_stream_with_model_startup(
             state=state,
+            app=request.app,
             route=route,
             payload=payload,
             fwd_headers=fwd_headers,
@@ -856,7 +873,7 @@ async def chat_completions(request: Request) -> StreamingResponse:
             hardware_path=hardware_path,
             proxy_preamble=proxy_preamble,
             client_named_model=client_named_model,
-            session_id=_resolve_session_id(processed_messages),
+            session_id=_resolve_session_id(processed_messages, request.app),
         ),
         media_type="text/event-stream",
         headers={
@@ -871,13 +888,14 @@ async def chat_completions(request: Request) -> StreamingResponse:
 # ---------------------------------------------------------------------------
 
 async def _event_stream(
-    state,
+    state: "AppState",
+    app: FastAPI,
     route: RouteDecision,
-    payload: dict,
-    fwd_headers: dict,
+    payload: dict[str, Any],
+    fwd_headers: dict[str, str],
     job_id: str,
     project_id: str,
-    processed_messages: list,
+    processed_messages: list[dict[str, Any]],
     requested_model: str,
     hardware_path: str,
     proxy_preamble: list[str] | None = None,
@@ -1092,7 +1110,7 @@ async def _event_stream(
                 looped_indices: set[int] = set()
                 for idx, tc in pending_tool_calls.items():
                     sig = _tool_call_signature(tc)
-                    if _check_tool_loop(loop_key, sig):
+                    if _check_tool_loop(loop_key, sig, app):
                         looped_indices.add(idx)
                 # Emit status for non-looped tool calls (the loop warning
                 # is emitted by the loop-detection branch below).
@@ -1194,6 +1212,10 @@ async def _event_stream(
             )
         yield "data: [DONE]\n\n"
 
+    # AGENTS.md rule 10 permits `except Exception` at the terminal SSE
+    # stream boundary: every stream error must be converted to a
+    # client-visible SSE error chunk below. Narrowing this would silently
+    # truncate client streams on unexpected bugs.
     except Exception as exc:
         logger.exception("Stream error for job %s: %s", job_id, exc)
         if db:
@@ -1223,17 +1245,15 @@ async def _event_stream(
 # Model startup wrapper — starts heavy GPU models before streaming
 # ---------------------------------------------------------------------------
 
-# Heavy GPU models that may need cold-starting before streaming
-_HEAVY_MODEL_KEYS = {"professional", "coder", "creative", "scholar", "architect", "chatter", "worker"}
-
 async def _event_stream_with_model_startup(
-    state,
+    state: "AppState",
+    app: FastAPI,
     route: RouteDecision,
-    payload: dict,
-    fwd_headers: dict,
+    payload: dict[str, Any],
+    fwd_headers: dict[str, str],
     job_id: str,
     project_id: str,
-    processed_messages: list,
+    processed_messages: list[dict[str, Any]],
     requested_model: str,
     hardware_path: str,
     proxy_preamble: list[str] | None = None,
@@ -1320,7 +1340,7 @@ async def _event_stream_with_model_startup(
                     "Model '%s' ready on port %d — proceeding with stream",
                     model_key, new_port,
                 )
-            except Exception as exc:
+            except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
                 logger.exception("Failed to start heavy model '%s': %s", model_key, exc)
                 # Emit the error and bail — don't try to stream to a dead port
                 error_chunk = json.dumps({
@@ -1350,20 +1370,16 @@ async def _event_stream_with_model_startup(
                         f"'{project_id}' for {label}]"
                     )
                     yield f"data: {json.dumps(_make_system_chunk(cache_msg))}\n\n"
-                except Exception:
+                except httpx.HTTPError:
                     logger.debug(
                         "Cache restore skipped for %s (non-critical)",
                         cache_filename,
                     )
 
     # ---- Delegate to the core streaming generator ---------------------------
-    # Resolve the per-conversation session_id (SHA-256[:16] of the first
-    # user message + the server-side timestamp when the proxy first saw
-    # that message).  Used by ``_event_stream`` to track tool-call loops
-    # across requests in the same conversation.
-    session_id = _resolve_session_id(processed_messages)
     async for chunk in _event_stream(
         state=state,
+        app=app,
         route=route,
         payload=payload,
         fwd_headers=fwd_headers,
@@ -1385,7 +1401,7 @@ async def _event_stream_with_model_startup(
         try:
             await manage_slot_cache(route.port, "save", cache_filename)
             logger.debug("Saved KV cache for project '%s' model '%s'", project_id, model_key)
-        except Exception:
+        except httpx.HTTPError:
             logger.debug("Cache save failed for %s (non-critical)", cache_filename)
 
 
@@ -1395,7 +1411,7 @@ async def _event_stream_with_model_startup(
 
 async def _handle_pause_command(
     duration_mins: int,
-    state,
+    state: "AppState",
 ) -> StreamingResponse:
     """
     Handle the /pause [minutes] command embedded in a user prompt.
@@ -1421,7 +1437,7 @@ async def _handle_pause_command(
     return StreamingResponse(_stream(), media_type="text/event-stream")
 
 
-async def _handle_resume_command(state) -> StreamingResponse:
+async def _handle_resume_command(state: "AppState") -> StreamingResponse:
     """
     Handle the /resume command embedded in a user prompt.
 
@@ -1500,7 +1516,7 @@ async def _stream_cached_response(
 # Helper: make a system-styled chunk for proxy messages
 # ---------------------------------------------------------------------------
 
-def _make_system_chunk(content: str) -> dict:
+def _make_system_chunk(content: str) -> dict[str, Any]:
     """
     Create an SSE chunk dict styled as a system message for proxy
     status updates (pause, resume, triage, etc.).
@@ -1518,7 +1534,7 @@ def _make_system_chunk(content: str) -> dict:
     }
 
 
-def _make_proxy_event(event: str, payload: dict) -> str:
+def _make_proxy_event(event: str, payload: dict[str, Any]) -> str:
     """
     Build a top-level SSE event line for proxy-injected signals.
 

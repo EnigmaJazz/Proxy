@@ -44,7 +44,6 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from typing import Optional
 
 from constants import (
     CPU_TEMP_PATH,
@@ -104,7 +103,7 @@ class CoolingStateMachine:
         """
         try:
             return int(path.read_text().strip())
-        except Exception:
+        except (OSError, ValueError):
             return 0
 
     def _write_temp(
@@ -244,7 +243,7 @@ class CoolingStateMachine:
         - Hybrid models (architect, coder, creative, professional, scholar):
           ``"hybrid"`` — these models use partial CPU offloading alongside
           GPU compute and benefit from full-system cooling on both channels.
-        - GPU-only models (worker, chatter): ``"gpu"``
+        - GPU-only models (chatter): ``"gpu"`` 
         - Cloud: no local cooling needed (returns ``"none"``)
 
         Parameters

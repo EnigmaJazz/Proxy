@@ -38,7 +38,7 @@ import time
 from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Optional
+from typing import AsyncIterator, Optional
 
 import httpx
 import uvloop
@@ -81,6 +81,7 @@ from systemd import SystemdController
 from cooling import CoolingStateMachine
 from hardware import (
     HardwareGovernor,
+    ThermalState,
     default_thermal_state,
     thermal_monitor_task,
 )
@@ -147,7 +148,7 @@ class AppState:
         self.pause_task: Optional[asyncio.Task] = None
         self.transition_pause: asyncio.Event = asyncio.Event()
         self.thermal_halt: asyncio.Event = asyncio.Event()
-        self.thermal_state: dict[str, float] = default_thermal_state()
+        self.thermal_state: ThermalState = default_thermal_state()
 
     # ------------------------------------------------------------------
     # Pause / resume queue (for OS transitions)
@@ -197,7 +198,7 @@ class AppState:
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
     FastAPI lifespan context manager.
 
@@ -382,8 +383,8 @@ async def queue_worker(state: AppState) -> None:
 
             # Normalize to a known model key
             if target_model not in systemd._port_cache:
-                # Default to worker if the model is unknown
-                target_model = "worker"
+                # Default to professional if the model is unknown
+                target_model = "professional"
 
             # ---- Hot-swap if needed -----------------------------------------
             current_heavy = systemd.active_heavy_model
@@ -421,7 +422,7 @@ async def queue_worker(state: AppState) -> None:
             state.active_priority = 3  # IDLE
             # Clean up: unload heavy model if queue is empty.
             # Only unload for heavy GPU models — lightweight models
-            # (worker, chatter) are handled by direct streaming and
+            # (chatter) is handled by direct streaming and
             # must not be disrupted by the queue worker.
             if db:
                 pending = await db.get_pending_jobs()

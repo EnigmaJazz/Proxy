@@ -25,7 +25,7 @@ Usage::
 
     from llm import stream_llm, call_llm
 
-    async for chunk in stream_llm("worker", payload):
+    async for chunk in stream_llm("professional", payload):
         yield chunk
 
 Maintainers: James Stansfield
@@ -121,7 +121,7 @@ async def stream_llm(
     Parameters
     ----------
     endpoint : str
-        Logical name (e.g. ``"worker"``, ``"cloud"``).  Used only for
+        Logical name (e.g. ``"professional"``, ``"cloud"``).  Used only for
         the hard-coded fallback URL when neither ``api_url`` nor ``port``
         is provided.
     payload : dict

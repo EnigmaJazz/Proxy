@@ -34,6 +34,7 @@ import json
 import os
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -77,19 +78,24 @@ VRAM_DEFAULT_TOTAL_MB: int = 12800  # fallback for 12GB card
 
 # ---------------------------------------------------------------------------
 # In-memory thermal state (updated by background monitor, read by proxy)
-# The dict lives on ``app.state.thermal_state`` (one per proxy app);
+# The dataclass lives on ``app.state.thermal_state`` (one per proxy app);
 # ``default_thermal_state`` is the factory that builds a fresh one.
 # ---------------------------------------------------------------------------
-def default_thermal_state() -> dict[str, float]:
-    """Return a fresh thermal-state dict (mutated in place by the monitor)."""
-    return {
-        "cpu": 0.0,
-        "gpu_edge": 0.0,
-        "gpu_junction": 0.0,
-        "gpu_vram": 0.0,
-        "gpu_vram_used_gb": 0.0,
-        "ram_used_percent": 0.0,
-    }
+@dataclass
+class ThermalState:
+    """Shared thermal telemetry — mutated in place by the monitor task."""
+
+    cpu: float = 0.0
+    gpu_edge: float = 0.0
+    gpu_junction: float = 0.0
+    gpu_vram: float = 0.0
+    gpu_vram_used_gb: float = 0.0
+    ram_used_percent: float = 0.0
+
+
+def default_thermal_state() -> ThermalState:
+    """Return a fresh ThermalState (mutated in place by the monitor)."""
+    return ThermalState()
 
 
 # ---------------------------------------------------------------------------
@@ -658,7 +664,7 @@ def _build_thermal_temps(cpu: float, gpu: dict[str, float]) -> dict[str, float]:
 
 
 async def thermal_monitor_task(
-    state: dict[str, float],
+    state: ThermalState,
     interval: float = SENSOR_INTERVAL,
 ) -> None:
     """
@@ -675,8 +681,8 @@ async def thermal_monitor_task(
 
     Parameters
     ----------
-    state : dict
-        Shared thermal state dict — mutated in-place each iteration.
+    state : ThermalState
+        Shared thermal state — mutated in-place each iteration.
     interval : float
         Seconds between sensor polls (default from constants.SENSOR_INTERVAL).
     """
@@ -696,12 +702,12 @@ async def thermal_monitor_task(
             ram = get_ram_usage_percent()
 
             # ---- Update shared state -----------------------------------------
-            state["cpu"] = cpu
-            state["gpu_edge"] = gpu["edge"]
-            state["gpu_junction"] = gpu["junction"]
-            state["gpu_vram"] = gpu["vram"]
-            state["gpu_vram_used_gb"] = gpu["vram_used_gb"]
-            state["ram_used_percent"] = ram
+            state.cpu = cpu
+            state.gpu_edge = gpu["edge"]
+            state.gpu_junction = gpu["junction"]
+            state.gpu_vram = gpu["vram"]
+            state.gpu_vram_used_gb = gpu["vram_used_gb"]
+            state.ram_used_percent = ram
 
             # ---- Update Prometheus metrics -----------------------------------
             metric_cpu_temp.set(cpu)
@@ -799,7 +805,7 @@ class HardwareGovernor:
         Return True if a heavy GPU model is currently tracked as active.
 
         Heavy models are: professional, coder, creative, scholar, architect.
-        Lightweight models (worker, chatter, frontdesk)
+        Lightweight models (chatter, frontdesk)
         are NOT considered "heavy."
         """
         heavy_models = {"professional", "coder", "creative", "scholar", "architect"}

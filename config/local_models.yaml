@@ -6,15 +6,13 @@
 # file path. If omitted or unparseable, intent defaults fill in.
 #
 # model_keys MUST match the proxy's ROUTE_MAP in routing.py:
-#   CHAT→chatter, TOOL→worker, CODE→professional, SCHOLAR→scholar,
+#   CHAT→chatter, TOOL→professional, CODE→professional, SCHOLAR→scholar,
 #   CREATIVE→creative, ARCHITECT→architect
 #   (frontdesk is a CPU agent role, not in ROUTE_MAP but still needs
 #    an entry for R17 profile resolution)
 models:
   architect:
     path: ~/kinver-hub/models/Architect.gguf
-  worker:
-    path: ~/kinver-hub/models/Worker.gguf
   coder:
     path: ~/kinver-hub/models/Coder.gguf
   professional:

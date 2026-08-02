@@ -95,7 +95,6 @@ FRONTEND_KEYS: dict[str, str] = {
 LLAMA_ENDPOINTS: dict[str, str] = {
     # Tier 1 — lightweight always-on models
     "frontdesk":    "http://127.0.0.1:8081/v1/chat/completions",
-    "worker":       "http://127.0.0.1:8082/v1/chat/completions",
     "chatter":      "http://127.0.0.1:8083/v1/chat/completions",
     # Tier 2 — heavy GPU models
     "professional": "http://127.0.0.1:8084/v1/chat/completions",
@@ -350,8 +349,8 @@ _DREAM_FALLBACK_PHRASES: list[str] = [
 ]
 
 # Keywords that indicate a request likely needs tool access (web search,
-# file I/O, or system exec).  Over-detection is safe because the Worker
-# model can handle plain chat just as well as Chatter.
+# file I/O, or system exec).  Over-detection is safe because TOOL-routed
+# requests reach the professional model, which handles plain chat fine.
 # All matching is done lowercase with substring matching.
 TOOL_KEYWORDS: frozenset[str] = frozenset({
     # Weather / temporal — need live data
@@ -398,8 +397,8 @@ HEAVY_MODELS: set[str] = {"professional", "coder", "creative", "scholar", "archi
 CPU_MODELS: set[str] = {"frontdesk"}
 
 # Heavy model keys that may need cold-starting before streaming (includes
-# the always-on Chatter/Worker models, so it is a superset of HEAVY_MODELS).
-_HEAVY_MODEL_KEYS: set[str] = {"professional", "coder", "creative", "scholar", "architect", "chatter", "worker"}
+# the always-on Chatter model, so it is a superset of HEAVY_MODELS).
+_HEAVY_MODEL_KEYS: set[str] = {"professional", "coder", "creative", "scholar", "architect", "chatter"}
 
 # Maximum tool call repetitions allowed per domain before breaking the loop
 LOOP_LIMITS: dict[str, int] = {
@@ -409,7 +408,6 @@ LOOP_LIMITS: dict[str, int] = {
     "professional": 4,
     "creative":     5,
     "standard":     3,
-    "worker":       2,
     "CHAT":         2,
     "TOOL":         2,
 }

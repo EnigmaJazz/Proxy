@@ -43,7 +43,6 @@ _MODEL_INTENTS: dict[str, tuple[str, ...]] = {
     "architect": ("code",),
     "creative": ("chat",),
     "scholar": ("chat",),
-    "worker": ("code",),
     "chatter": ("chat",),
     "frontdesk": ("chat",),
 }
@@ -136,7 +135,7 @@ def fetch_sampling_source(source: str, client: httpx.Client) -> Optional[str]:
             response = client.get(source, follow_redirects=True, timeout=30.0)
             response.raise_for_status()
             return response.text
-        except Exception as exc:
+        except (httpx.HTTPError, OSError, ValueError) as exc:
             logger.warning("Could not fetch %s: %s", source, exc)
             return None
     if source.startswith("file://"):
@@ -148,7 +147,7 @@ def fetch_sampling_source(source: str, client: httpx.Client) -> Optional[str]:
         return None
     try:
         return path.read_text(encoding="utf-8")
-    except Exception as exc:
+    except (OSError, UnicodeError) as exc:
         logger.warning("Could not read %s: %s", path, exc)
         return None
 
@@ -259,12 +258,12 @@ def extract_with_llm(
         if params:
             logger.info("LLM extractor returned %s for %s", params, source)
         return params or None
-    except Exception as exc:
+    except (httpx.HTTPError, json.JSONDecodeError, OSError) as exc:
         logger.warning("LLM extraction failed for %s: %s", source, exc)
         return None
 
 
-def parse_sampling_params(content: str, source: str) -> dict[str, Any]:
+def parse_sampling_params(content: str, source: str) -> Optional[dict[str, Any]]:
     """Extract recommended sampling parameters from a sampling source.
 
     Returns a dict of any parameters found.  An empty dict means the content

@@ -101,7 +101,7 @@ def _make_profile_table() -> ModelProfileTable:
             "thinking_budget_tokens": 0,
         },
         {
-            "model": "worker",
+            "model": "coder",
             "intent": "code",
             "temperature": 0.2,
             "top_p": 0.95,
@@ -246,7 +246,15 @@ class _StreamCapture:
         self.port: int | None = None
         self.headers: dict[str, str] | None = None
 
-    async def __call__(self, *, endpoint, payload, port=0, headers=None, **kwargs):
+    async def __call__(
+        self,
+        *,
+        endpoint: str,
+        payload: dict[str, Any] | None,
+        port: int = 0,
+        headers: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[dict[str, Any]]:
         self.endpoint = endpoint
         self.payload = payload
         self.port = port
@@ -429,8 +437,8 @@ class TestIntegration:
         assert capture.endpoint == "chatter"
 
     @pytest.mark.asyncio
-    async def test_explicit_worker_opt_in(self, pd_client) -> None:
-        """Scenario-5: client names worker → worker is used."""
+    async def test_explicit_coder_opt_in(self, pd_client) -> None:
+        """Scenario-5: client names coder → coder is used."""
         capture = _StreamCapture()
         with patch("routes.stream_llm", new=capture), \
              patch(
@@ -440,7 +448,7 @@ class TestIntegration:
             response = await pd_client.post(
                 "/v1/chat/completions",
                 json={
-                    "model": "worker",
+                    "model": "coder",
                     "messages": [{"role": "user", "content": "run a tool"}],
                     "tools": [{"type": "function", "function": {"name": "web_search"}}],
                 },
@@ -449,7 +457,7 @@ class TestIntegration:
             await response.aread()
 
         assert response.status_code == 200, response.text
-        assert capture.endpoint == "worker"
+        assert capture.endpoint == "coder"
 
     @pytest.mark.asyncio
     async def test_explicit_specialist_opt_in(self, pd_client) -> None:

@@ -523,10 +523,10 @@ async def chat_completions(request: Request) -> StreamingResponse:
 
     # ---- Lane A: classify intent via 2B Front Desk --------------------------
     # Check if the conversation already has tool calls in progress (from
-    # a previous Worker interaction in this session).  If so, skip frontdesk
-    # classification entirely and keep Worker — reclassifying mid-tool-flow
-    # causes wrongful model switches (CODE → Professional, TOOL → Worker)
-    # that break the tool execution chain.
+    # a previous tool-calling interaction in this session).  If so, skip
+    # frontdesk classification entirely and preserve the classified route —
+    # reclassifying mid-tool-flow causes wrongful model switches that break
+    # the tool execution chain.
     # Check if the LAST message in the conversation is a tool_call or tool
     # result (mid-tool-flow).  Only skip frontdesk when the model is actively
     # executing tools — NOT when the user sends a new message after a
@@ -551,13 +551,13 @@ async def chat_completions(request: Request) -> StreamingResponse:
     }
 
     if has_tool_calls:
-        # Conversation already has tool calls — stay with Worker, don't
-        # let frontdesk reclassify and accidentally switch models
+        # Conversation already has tool calls — preserve the classified
+        # route, don't let frontdesk reclassify and switch models
         classification["intent"] = "TOOL"
         classification["tools_required"] = True
         logger.info(
             "Mid-tool-flow detected (%d messages with tool_calls) — "
-            "skipping frontdesk, staying on Worker",
+            "skipping frontdesk, preserving classified route",
             sum(1 for m in processed_messages
                 if m.get("role") in ("assistant", "tool")
                 and ("tool_calls" in m or m.get("role") == "tool")),
@@ -599,7 +599,8 @@ async def chat_completions(request: Request) -> StreamingResponse:
     # ---- Tool keyword heuristic: safety net for 2B frontdesk limitations ---
     # If the 2B frontdesk classified as CHAT but the query contains obvious
     # tool-triggering keywords (weather, file I/O, web search, exec), force
-    # intent to TOOL.  Over-detection is safe because Worker handles chat too.
+    # intent to TOOL.  Over-detection is safe because TOOL-routed requests
+    # reach a capable model (professional) that handles plain chat too.
     if classification.get("intent") == "CHAT":
         user_lower = user_text.lower()
         for kw in TOOL_KEYWORDS:
@@ -829,7 +830,7 @@ async def chat_completions(request: Request) -> StreamingResponse:
     # Resolve from the cooling module's classification.  This ensures
     # hybrid models (architect, coder, creative, professional, scholar)
     # write to BOTH CPU and GPU IPC files, CPU-only models (frontdesk)
-    # write only to CPU, and GPU-only models (worker, chatter) write
+    # write only to CPU, and GPU-only models (chatter) write
     # only to GPU.
     from cooling import CoolingStateMachine
     hardware_path = CoolingStateMachine.hardware_path_for_model(route.model_key)
@@ -1281,7 +1282,7 @@ async def _event_stream_with_model_startup(
     Wrapper around ``_event_stream`` that ensures heavy GPU models are
     started and ready before attempting to stream.
 
-    For lightweight / CPU-resident models (chatter, worker, frontdesk)
+    For lightweight / CPU-resident models (chatter, frontdesk)
     this is a passthrough — the model should already be running.  For
     heavy GPU models (professional, coder, creative, scholar,
     architect), this performs a hot-swap if the model is not already
@@ -1323,11 +1324,11 @@ async def _event_stream_with_model_startup(
 
             try:
                 # Before loading a heavy GPU model, stop any lightweight
-                # GPU models (worker, chatter) that may occupy VRAM.
+                # GPU models (chatter) that may occupy VRAM.
                 # The systemd.hot_swap() only stops the previous *heavy*
-                # model — worker/chatter run alongside and must be
+                # model — chatter runs alongside and must be
                 # explicitly stopped to free VRAM for the heavy model.
-                gpu_lightweights = ["worker", "chatter"]
+                gpu_lightweights = ["chatter"]
                 for lw in gpu_lightweights:
                     if await systemd.is_active(lw):
                         logger.info(
@@ -1602,7 +1603,6 @@ def _build_triage_message(
     model_descriptions = {
         "frontdesk":     "Front Desk (2B classifier)",
         "chatter":       "Chatter (9B fast chat)",
-        "worker":        "Worker (9B tool-capable)",
         "professional":  "Professional (35B MoE)",
         "coder":         "Coder (27B Dense)",
         "creative":      "Creative (long-form)",

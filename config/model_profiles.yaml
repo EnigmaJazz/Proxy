@@ -16,19 +16,6 @@ profiles:
   top_logprobs: null
   response_format: null
   n: 1
-- model: worker
-  intent: code
-  architecture: qwen35
-  file_type: 18
-  context_window: 262144
-  max_tokens: 235929
-  temperature: 0.2
-  top_p: 0.95
-  thinking_budget_tokens: 4096
-  seed: null
-  top_logprobs: null
-  response_format: null
-  n: 1
 - model: coder
   intent: code
   architecture: qwen35

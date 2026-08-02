@@ -20,7 +20,7 @@ Usage::
 
     systemd = SystemdController()
     port = systemd.get_port("professional")
-    await systemd.hot_swap("worker", "professional")
+    await systemd.hot_swap("creative", "professional")
 
 Maintainers: James Stansfield
 """
@@ -165,12 +165,12 @@ class SystemdController:
         Parameters
         ----------
         domain : str
-            Service domain name (e.g. ``"worker"``, ``"chatter"``).
+            Service domain name (e.g. ``"chatter"``, ``"professional"``).
 
         Returns
         -------
         int
-            The resolved port number.  Falls back to 13105 (worker default)
+            The resolved port number.  Falls back to 13109 (professional default)
             if the file cannot be read or parsed.
         """
         domain = domain.lower().strip()
@@ -198,13 +198,13 @@ class SystemdController:
         except (OSError, ValueError):
             logger.exception("Failed to read unit file for domain '%s'", domain)
 
-        # Fallback: if not found, try the worker port as default
-        if domain != "worker":
-            logger.debug("Falling back to worker port for domain '%s'", domain)
-            return await self.get_port("worker")
+        # Fallback: if not found, try the professional port as default
+        if domain != "professional":
+            logger.debug("Falling back to professional port for domain '%s'", domain)
+            return await self.get_port("professional")
 
         # Ultimate fallback
-        port = 13105
+        port = 13109
         self._port_cache[domain] = port
         return port
 
@@ -303,17 +303,17 @@ class SystemdController:
     async def unload_all_heavy(self) -> None:
         """
         Stop the currently active heavy GPU model (if any) and restart
-        the default worker service.
+        the default professional service.
         """
         if self._active_heavy_model:
             logger.info("Unloading heavy model: %s", self._active_heavy_model)
             await self.stop_service(self._active_heavy_model)
             self._active_heavy_model = None
 
-        # Ensure worker is running as the default light model
-        await self.start_service("worker")
-        worker_port = await self.get_port("worker")
-        logger.info("Worker service started on port %d", worker_port)
+        # Ensure professional is running as the default model
+        await self.start_service("professional")
+        professional_port = await self.get_port("professional")
+        logger.info("Professional service started on port %d", professional_port)
 
     # ------------------------------------------------------------------
     # Model discovery
@@ -381,7 +381,7 @@ class SystemdController:
         Return True if a heavy GPU model is currently active.
 
         Heavy models are: professional, coder, creative, scholar, architect.
-        Lightweight models (worker, chatter, frontdesk)
+        Lightweight models (chatter, frontdesk)
         are NOT considered "heavy" and can coexist or be quickly swapped.
         """
         heavy_models = {"professional", "coder", "creative", "scholar", "architect"}

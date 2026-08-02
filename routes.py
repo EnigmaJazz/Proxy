@@ -432,12 +432,12 @@ async def chat_completions(request: Request) -> StreamingResponse:
     if user_text and _CLOUD_RE.search(user_text.lower()):
         return await _handle_cloud_command(user_text)
 
-    # ---- Dream/soul fast-path: bypass frontdesk, route to architect --------
+    # ---- Dream/soul fast-path: bypass frontdesk, route to professional ----
     if is_dream:
-        logger.info("Dream/soul process detected — routing to architect (priority 3)")
-        port = await systemd.get_port("architect")
+        logger.info("Dream/soul process detected — routing to professional (priority 3)")
+        port = await systemd.get_port("professional")
         route = RouteDecision(
-            model_key="architect",
+            model_key="professional",
             port=port,
             is_cpu_fallback=False,
             hardware_path="hybrid",
@@ -450,10 +450,10 @@ async def chat_completions(request: Request) -> StreamingResponse:
             tools_required=False,
         )
         # Jump straight to payload building, skipping frontdesk + cache
-        # R17: dream/soul path is authoritative — use architect profile values
+        # R17: dream/soul path is authoritative — use professional profile values
         # when available, otherwise fall back to the legacy hardcoded defaults.
         profiles = state.model_profiles
-        entry = profiles.resolve("ARCHITECT", "architect") if profiles else None
+        entry = profiles.resolve("ARCHITECT", "professional") if profiles else None
         if entry is not None:
             parameters = {**entry.values}
         else:
@@ -493,7 +493,7 @@ async def chat_completions(request: Request) -> StreamingResponse:
                 "kind": "params_replaced",
                 "ts": int(time.time()),
                 "data": {
-                    "model": "architect",
+                    "model": "professional",
                     "replaced": replaced_fields,
                     "values": {field: entry.values[field] for field in replaced_fields},
                 },
@@ -503,14 +503,14 @@ async def chat_completions(request: Request) -> StreamingResponse:
             )
 
         from cooling import CoolingStateMachine
-        hardware_path = CoolingStateMachine.hardware_path_for_model("architect")
+        hardware_path = CoolingStateMachine.hardware_path_for_model("professional")
         session_id = _resolve_session_id(processed_messages, request.app)
         return StreamingResponse(
             _event_stream_with_model_startup(
                 state=state, app=request.app, route=route, payload=payload, fwd_headers={},
                 job_id=job_id, project_id="soul",
                 processed_messages=processed_messages,
-                requested_model="architect",
+                requested_model="professional",
                 hardware_path=hardware_path,
                 proxy_preamble=proxy_preamble,
                 session_id=session_id,

@@ -785,7 +785,7 @@ class HardwareGovernor:
         Return True if a heavy GPU model is currently tracked as active.
 
         Heavy models are: professional, coder, creative, scholar, architect.
-        Lightweight models (worker, chatter, frontdesk, lifeboat, reasoning)
+        Lightweight models (worker, chatter, frontdesk)
         are NOT considered "heavy."
         """
         heavy_models = {"professional", "coder", "creative", "scholar", "architect"}

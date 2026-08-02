@@ -130,15 +130,15 @@ class TestRouting:
         assert "professional" in decision.model_key
 
     @pytest.mark.asyncio
-    async def test_auto_chat_occupied_gpu_lifeboat(self) -> None:
-        """CHAT + GPU occupied by specialist → Lifeboat contention fallback."""
+    async def test_auto_chat_occupied_gpu_routes_to_professional(self) -> None:
+        """CHAT + GPU occupied by specialist → Professional (no CPU fallback)."""
         systemd = _FakeSystemd(occupied=True, active="coder")
         decision = await resolve_route_for_lane_a(
             _classification("CHAT"), systemd, has_tool_history=False,
         )
-        assert decision.model_key == "lifeboat"
-        assert decision.is_cpu_fallback is True
-        assert decision.hardware_path == "cpu"
+        assert decision.model_key == "professional"
+        assert decision.is_cpu_fallback is False
+        assert decision.hardware_path == "gpu"
 
     @pytest.mark.asyncio
     async def test_auto_chat_resident_professional_stays(self) -> None:
@@ -162,7 +162,7 @@ class TestRouting:
 
     @pytest.mark.asyncio
     async def test_auto_tool_mid_flow_forces_professional(self) -> None:
-        """Mid-tool-flow TOOL with specialist active → Professional (Lifeboat rejects history)."""
+        """Mid-tool-flow TOOL with specialist active → Professional."""
         systemd = _FakeSystemd(occupied=True, active="coder")
         decision = await resolve_route_for_lane_a(
             _classification("TOOL", tools_required=True), systemd, has_tool_history=True,
@@ -171,14 +171,15 @@ class TestRouting:
         assert decision.tools_required is True
 
     @pytest.mark.asyncio
-    async def test_auto_tool_occupied_no_history_lifeboat(self) -> None:
-        """TOOL + GPU occupied by specialist, no history → Lifeboat."""
+    async def test_auto_tool_occupied_no_history_routes_to_professional(self) -> None:
+        """TOOL + GPU occupied by specialist, no history → Professional."""
         systemd = _FakeSystemd(occupied=True, active="coder")
         decision = await resolve_route_for_lane_a(
             _classification("TOOL", tools_required=True), systemd, has_tool_history=False,
         )
-        assert decision.model_key == "lifeboat"
-        assert decision.is_cpu_fallback is True
+        assert decision.model_key == "professional"
+        assert decision.is_cpu_fallback is False
+        assert decision.hardware_path == "gpu"
 
     @pytest.mark.asyncio
     async def test_auto_code_routes_to_professional(self) -> None:
@@ -265,7 +266,6 @@ class _StreamCapture:
 async def pd_client() -> Any:
     """Yield an httpx async client against the real app with state stubbed."""
     from tests.conftest import (
-        _NoOpAuditor,
         _NoOpCooling,
         _NoOpDatabase,
         _NoOpSystemd,
@@ -275,7 +275,6 @@ async def pd_client() -> Any:
     proxy.app.state.systemd = _NoOpSystemd()
     proxy.app.state.cooler = _NoOpCooling()
     proxy.app.state.hardware = None
-    proxy.app.state.auditor = _NoOpAuditor()
     proxy.app.state.active_heavy_model = None
     proxy.app.state.active_priority = 3
     proxy.app.state.requests_served = 0
@@ -556,22 +555,22 @@ class TestQueueLifecycle:
         """Scenario-8 (production path): the R19 client override must clear
         ``is_cpu_fallback`` so the hotswap wrapper at routes.py:871 fires.
 
-        Without this clear, a request that initially resolves to Lifeboat
-        (because another specialist occupies the GPU) followed by a
-        client-named specialist (e.g. Scholar) would inherit
-        ``is_cpu_fallback=True`` and the hotswap wrapper would suppress
-        the cold-start.  The specialist port is never started and the
-        stream ends in 'All connection attempts failed'.  This is the
-        live bug the verify report caught (2026-07-19, REQ-8).
+        The GPU-occupied fallback no longer sets ``is_cpu_fallback`` (CPU
+        Lifeboat was removed), but the override path keeps the defensive
+        clear: if a route ever arrives carrying the flag, the client-named
+        specialist (e.g. Scholar) must not inherit it, or the hotswap
+        wrapper would suppress the cold-start and the stream would end in
+        'All connection attempts failed'.  This is the live bug the verify
+        report caught (2026-07-19, REQ-8).
         """
-        # Classifier returns a Lifeboat fallback because another specialist
-        # is on the GPU.  This is the path that previously inherited
-        # is_cpu_fallback=True into the override.
-        lifeboat_route = RouteDecision(
-            model_key="lifeboat",
-            port=13090,
+        # Manual fixture simulating a base route that carries a stale CPU
+        # flag.  The production fallback path never produces this anymore,
+        # but the override must still defensively clear it.
+        initial_route = RouteDecision(
+            model_key="professional",
+            port=13001,
             is_cpu_fallback=True,
-            hardware_path="cpu",
+            hardware_path="gpu",
             priority=2,
             intent="CHAT",
             project_id="general",
@@ -600,7 +599,7 @@ class TestQueueLifecycle:
             new=AsyncMock(return_value=_classification("CHAT")),
         ), patch(
             "routes.resolve_route_for_lane_a",
-            new=AsyncMock(return_value=lifeboat_route),
+            new=AsyncMock(return_value=initial_route),
         ), patch(
             "routes._event_stream_with_model_startup",
             side_effect=_capture_hotswap_entry,

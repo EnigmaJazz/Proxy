@@ -41,8 +41,6 @@ from constants import (
 from llm import (
     stream_llm,
     call_llm,
-    call_model_chat,
-    translate_to_deepseek_r1,
     openrouter_cloud_escalation,
     _inject_provider_metadata,
 )
@@ -60,7 +58,6 @@ from routing import (
     TOOL_KEYWORDS,
     CPU_MODELS,
 )
-from auditing import ShadowAuditor
 from text_to_structured import ToolCallTextToStructured
 
 logger = get_logger("proxy.routes")
@@ -292,9 +289,9 @@ async def chat_completions(request: Request) -> StreamingResponse:
     3. Lane A: classify with 2B Front Desk → intent, priority, project, is_factual.
     4. Lane B: bypass frontdesk, intent=CODE, priority=1.
     5. Semantic cache check for factual queries.
-    6. Resolve route (GPU-aware with Lifeboat fallback for CHAT/TOOL).
+    6. Resolve route (CHAT/TOOL → professional; heavy intents enqueued).
     7. Handle embedded commands (/pause, /resume, /cloud).
-    8. Stream response via SSE, with cooling lifecycle and optional shadow auditing.
+    8. Stream response via SSE, with cooling lifecycle.
     """
     state = request.app.state
     db = state.database
@@ -358,7 +355,7 @@ async def chat_completions(request: Request) -> StreamingResponse:
         is_dream = is_dream_process(raw_text)
 
         effective_domain = model_domain if model_domain in (
-            "coder", "architect", "reasoning", "professional", "creative", "scholar",
+            "coder", "architect", "professional", "creative", "scholar",
         ) else "standard"
 
         # Tool loop detection — strip tools on detected loops to prevent
@@ -500,7 +497,6 @@ async def chat_completions(request: Request) -> StreamingResponse:
                 processed_messages=processed_messages,
                 requested_model="architect",
                 hardware_path=hardware_path,
-                auditor_active=False,
                 proxy_preamble=proxy_preamble,
             ),
             media_type="text/event-stream",
@@ -511,7 +507,7 @@ async def chat_completions(request: Request) -> StreamingResponse:
     # Check if the conversation already has tool calls in progress (from
     # a previous Worker interaction in this session).  If so, skip frontdesk
     # classification entirely and keep Worker — reclassifying mid-tool-flow
-    # causes wrongful model switches (CODE → Professional, TOOL → Lifeboat)
+    # causes wrongful model switches (CODE → Professional, TOOL → Worker)
     # that break the tool execution chain.
     # Check if the LAST message in the conversation is a tool_call or tool
     # result (mid-tool-flow).  Only skip frontdesk when the model is actively
@@ -622,9 +618,8 @@ async def chat_completions(request: Request) -> StreamingResponse:
             bypass_frontdesk=True,
         )
     else:
-        # Lane A: GPU-aware routing with Lifeboat fallback.
-        # Pass has_tool_history so Lifeboat is skipped when the conversation
-        # already contains tool_calls (Lifeboat's template rejects them).
+        # Lane A: GPU-aware routing.  CHAT/TOOL contention with a
+        # specialist routes to Professional unconditionally.
         route = await resolve_route_for_lane_a(
             classification, systemd,
             has_tool_history=has_tool_calls,
@@ -639,7 +634,7 @@ async def chat_completions(request: Request) -> StreamingResponse:
     # Also clears route.is_cpu_fallback: the override is an explicit client
     # request, not a fallback — the hotswap wrapper at routes.py:871
     # suppresses the cold-start when this flag is True, which would break
-    # transitions like "Lifeboat fallback (GPU busy with coder) → explicit
+    # transitions like "GPU busy with coder → explicit
     # Scholar request".  Without this line, the specialist port is never
     # started and the stream ends in 'All connection attempts failed'.
     client_named_model = False
@@ -671,8 +666,8 @@ async def chat_completions(request: Request) -> StreamingResponse:
     # ---- Update application state -------------------------------------------
     state.active_priority = route.priority
     # Only update active_heavy_model for GPU routes — never clear to None
-    # when routing to CPU/lifeboat, because a heavy GPU model may still be
-    # actively streaming for an ongoing generation.  Clearing it would
+    # when routing to a CPU-only model, because a heavy GPU model may still
+    # be actively streaming for an ongoing generation.  Clearing it would
     # trigger cleanup logic that kills the in-progress stream.
     if route.hardware_path == "gpu":
         state.active_heavy_model = route.model_key
@@ -717,15 +712,6 @@ async def chat_completions(request: Request) -> StreamingResponse:
             model_override=requested_model if requested_model != "auto" else None,
         )
 
-    # ---- Determine if shadow auditing is active ------------------------------
-    auditor_active = ShadowAuditor.should_audit(route.intent, route.is_lane_b, tools)
-
-    # ---- Translate system→user for reasoning models -------------------------
-    # (Only if the target model is DeepSeek R1 — structural translation only)
-    payload_messages = processed_messages
-    if route.model_key == "reasoning":
-        payload_messages = translate_to_deepseek_r1(processed_messages)
-
     # ---- Build payload for target model ------------------------------------
     # When tools are present, filter out ReAct-era stop sequences
     # ("Observation:", "```output") that can cause premature termination
@@ -740,7 +726,7 @@ async def chat_completions(request: Request) -> StreamingResponse:
         ]
 
     payload = {
-        "messages": payload_messages,
+        "messages": processed_messages,
         "temperature": parameters["temperature"],
         "top_p": parameters["top_p"],
         "max_tokens": parameters["max_tokens"],
@@ -824,9 +810,9 @@ async def chat_completions(request: Request) -> StreamingResponse:
     # ---- Determine cooling hardware path -----------------------------------
     # Resolve from the cooling module's classification.  This ensures
     # hybrid models (architect, coder, creative, professional, scholar)
-    # write to BOTH CPU and GPU IPC files, CPU-only models (lifeboat,
-    # reasoning, frontdesk) write only to CPU, and GPU-only models
-    # (worker, chatter) write only to GPU.
+    # write to BOTH CPU and GPU IPC files, CPU-only models (frontdesk)
+    # write only to CPU, and GPU-only models (worker, chatter) write
+    # only to GPU.
     from cooling import CoolingStateMachine
     hardware_path = CoolingStateMachine.hardware_path_for_model(route.model_key)
 
@@ -849,13 +835,12 @@ async def chat_completions(request: Request) -> StreamingResponse:
 
     # ---- Build & return the SSE stream --------------------------------------
     logger.info(
-        "Routing to %s (lane=%s intent=%s priority=%d cpu_fallback=%s audit=%s)",
+        "Routing to %s (lane=%s intent=%s priority=%d cpu_fallback=%s)",
         route.model_key,
         "lane_b" if route.is_lane_b else "lane_a",
         route.intent,
         route.priority,
         route.is_cpu_fallback,
-        auditor_active,
     )
 
     return StreamingResponse(
@@ -869,7 +854,6 @@ async def chat_completions(request: Request) -> StreamingResponse:
             processed_messages=processed_messages,
             requested_model=requested_model,
             hardware_path=hardware_path,
-            auditor_active=auditor_active,
             proxy_preamble=proxy_preamble,
             client_named_model=client_named_model,
             session_id=_resolve_session_id(processed_messages),
@@ -896,7 +880,6 @@ async def _event_stream(
     processed_messages: list,
     requested_model: str,
     hardware_path: str,
-    auditor_active: bool,
     proxy_preamble: list[str] | None = None,
     client_named_model: bool = False,
     session_id: str = "",  # SHA-256[:16]:<first_seen_unix> for cross-request loop detection
@@ -905,12 +888,9 @@ async def _event_stream(
     Core SSE streaming generator.
 
     1. Prefill burst cooling.
-    2. If auditing is active, start the ShadowAuditor.
-    3. Stream chunks from the LLM via ``stream_llm``.
-    4. On first chunk: step down cooling to GENERATION.
-    5. Feed chunks to auditor if active.
-    6. On [DONE]: complete job in DB, baseline cooling, stop auditor.
-    7. On audit FATAL: Graceful Guillotine → clean stream termination.
+    2. Stream chunks from the LLM via ``stream_llm``.
+    3. On first chunk: step down cooling to GENERATION.
+    4. On [DONE]: complete job in DB, baseline cooling.
     """
     db = state.database
     systemd = state.systemd
@@ -921,28 +901,9 @@ async def _event_stream(
     # don't pass a session_id yet.
     loop_key = session_id or job_id
 
-    audit_fatal_triggered = False
-    audit_fatal_reason = ""
-
-    # ---- Setup fatal callback for auditor -----------------------------------
-    async def _on_audit_fatal(jid: str, reason: str):
-        nonlocal audit_fatal_triggered, audit_fatal_reason
-        audit_fatal_triggered = True
-        audit_fatal_reason = reason
-
     # ---- Prefill burst cooling ---------------------------------------------
     if cooler:
         await cooler.prefill_burst(hardware_path)
-
-    # ---- Start shadow auditor if active ------------------------------------
-    auditor = state.auditor if auditor_active else None
-    if auditor and auditor_active:
-        auditor.start(
-            job_id=job_id,
-            project_id=project_id,
-            messages=processed_messages,
-            on_fatal=_on_audit_fatal,
-        )
 
     first_chunk_seen = False
     full_content: list[str] = []
@@ -989,11 +950,6 @@ async def _event_stream(
             port=route.port,
             headers=fwd_headers,
         ):
-            # ---- Check for auditor fatal mid-stream --------------------------
-            if audit_fatal_triggered:
-                yield await _graceful_guillotine_chunk(job_id, audit_fatal_reason)
-                return
-
             # ---- First chunk: step down cooling ------------------------------
             if not first_chunk_seen:
                 first_chunk_seen = True
@@ -1011,10 +967,6 @@ async def _event_stream(
                 if delta_content:
                     full_content.append(delta_content)
                     accumulated += delta_content
-
-            # ---- Feed to shadow auditor (non-blocking) ------------------------
-            if auditor and auditor_active and delta_content:
-                auditor.feed_chunk(delta_content)
 
             # ---- Persist chunk to database ------------------------------------
             if db and delta_content:
@@ -1257,10 +1209,6 @@ async def _event_stream(
         yield "data: [DONE]\n\n"
 
     finally:
-        # ---- Stop auditor ----------------------------------------------------
-        if auditor and auditor_active:
-            auditor.stop()
-
         # ---- Baseline cooling -----------------------------------------------
         if cooler:
             cooler.baseline_idle()
@@ -1288,7 +1236,6 @@ async def _event_stream_with_model_startup(
     processed_messages: list,
     requested_model: str,
     hardware_path: str,
-    auditor_active: bool,
     proxy_preamble: list[str] | None = None,
     client_named_model: bool = False,
     session_id: str = "",
@@ -1297,12 +1244,12 @@ async def _event_stream_with_model_startup(
     Wrapper around ``_event_stream`` that ensures heavy GPU models are
     started and ready before attempting to stream.
 
-    For lightweight / CPU-resident models (chatter, worker, frontdesk,
-    lifeboat, reasoning) this is a passthrough — the model should already
-    be running.  For heavy GPU models (professional, coder, creative,
-    scholar, architect), this performs a hot-swap if the model is not
-    already the active heavy model, and streams a "loading" feedback
-    message to keep the frontend connection alive during cold start.
+    For lightweight / CPU-resident models (chatter, worker, frontdesk)
+    this is a passthrough — the model should already be running.  For
+    heavy GPU models (professional, coder, creative, scholar,
+    architect), this performs a hot-swap if the model is not already
+    the active heavy model, and streams a "loading" feedback message
+    to keep the frontend connection alive during cold start.
 
     The backup version handled this inside queue_worker → manage_heavy_model
     which ran systemd start + wait_for_port_readiness BEFORE streaming.
@@ -1425,7 +1372,6 @@ async def _event_stream_with_model_startup(
         processed_messages=processed_messages,
         requested_model=requested_model,
         hardware_path=hardware_path,
-        auditor_active=auditor_active,
         proxy_preamble=proxy_preamble,
         client_named_model=client_named_model,
         session_id=session_id,
@@ -1441,46 +1387,6 @@ async def _event_stream_with_model_startup(
             logger.debug("Saved KV cache for project '%s' model '%s'", project_id, model_key)
         except Exception:
             logger.debug("Cache save failed for %s (non-critical)", cache_filename)
-
-
-# ---------------------------------------------------------------------------
-# Graceful Guillotine — cleanly terminate a stream after an audit failure
-# ---------------------------------------------------------------------------
-
-async def _graceful_guillotine_chunk(
-    job_id: str,
-    reason: str,
-) -> str:
-    """
-    Generate the final SSE events that cleanly terminate a stream after
-    a confirmed audit failure.
-
-    Emits a standards-compliant finish: a custom ``kinver.proxy.audit_halt``
-    event with the reason (so clients can surface it in a system UI), then
-    a final model chunk with ``finish_reason: "stop"`` and no synthetic
-    ``delta.content`` injection.  This complies with the OpenAI streaming
-    contract and with the Glass Pipe Rule: the proxy never mutates
-    in-flight tool_calls JSON or terminates with a non-standard finish
-    reason.
-    """
-    # Final model chunk: empty content delta, standard finish_reason.
-    # This is the only way to close the stream without violating R1.
-    stop_chunk = {
-        "id": f"chatcmpl-{job_id[:8]}",
-        "object": "chat.completion.chunk",
-        "created": int(time.time()),
-        "model": "proxy-audit-halt",
-        "choices": [{
-            "index": 0,
-            "delta": {},
-            "finish_reason": "stop",
-        }],
-    }
-    audit_event = _make_proxy_event(
-        "kinver.proxy.audit_halt",
-        {"reason": reason, "job_id": job_id, "ts": int(time.time())},
-    )
-    return f"{audit_event}data: {json.dumps(stop_chunk)}\n\ndata: [DONE]\n\n"
 
 
 # ---------------------------------------------------------------------------
@@ -1617,8 +1523,8 @@ def _make_proxy_event(event: str, payload: dict) -> str:
     Build a top-level SSE event line for proxy-injected signals.
 
     Returns the full ``event:`` + ``data:`` frame so consumers can
-    distinguish params_replaced/status/tool_stripped/audit_halt events
-    from ordinary model chunks.
+    distinguish params_replaced/status/tool_stripped events from
+    ordinary model chunks.
     """
     return f"event: {event}\ndata: {json.dumps(payload)}\n\n"
 
@@ -1662,10 +1568,8 @@ def _build_triage_message(
     # Determine the human-readable model description
     model_descriptions = {
         "frontdesk":     "Front Desk (2B classifier)",
-        "lifeboat":      "Lifeboat (8B CPU fallback)",
         "chatter":       "Chatter (9B fast chat)",
         "worker":        "Worker (9B tool-capable)",
-        "reasoning":     "Auditor (8B DeepSeek-R1 reasoning)",
         "professional":  "Professional (35B MoE)",
         "coder":         "Coder (27B Dense)",
         "creative":      "Creative (long-form)",

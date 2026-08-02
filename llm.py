@@ -6,10 +6,8 @@ Handles:
 - Non-streaming convenience wrapper (``call_llm``)
 - Token counting & estimation
 - Multi-provider failover (local Systemd → OpenRouter cloud)
-- Automatic DeepSeek-R1 reasoning-prompt translation (structural only)
 - Transparent provider metadata injection
 - Legacy completions endpoint (``call_model``) for CPU-bound classifiers
-- Legacy chat endpoint (``call_model_chat``) for lifeboat/worker fallback
 
 IMPORTANT DESIGN RULE (Glass Pipe Rule):
     This module MUST NOT inject, alter, or sanitize the text content of
@@ -25,7 +23,7 @@ All network calls are async (httpx) and designed to run under uvloop.
 
 Usage::
 
-    from llm import stream_llm, call_llm, translate_to_deepseek_r1
+    from llm import stream_llm, call_llm
 
     async for chunk in stream_llm("worker", payload):
         yield chunk
@@ -80,7 +78,7 @@ def estimate_tokens(text: str) -> int:
 # Role prompt loading (PROXY-INTERNAL USE ONLY)
 #
 #   These prompts MUST NOT be injected into frontend-initiated requests.
-#   They are reserved for proxy-internal classifiers (frontdesk, auditor,
+#   They are reserved for proxy-internal classifiers (frontdesk,
 #   loop-breaker) that the proxy controls entirely.
 # ---------------------------------------------------------------------------
 
@@ -100,53 +98,6 @@ def load_role_prompt(role_name: str) -> str:
             return f.read()
     except FileNotFoundError:
         return f"You are the {role_name} AI."
-
-
-# ---------------------------------------------------------------------------
-# Prompt translation: OpenAI system array → DeepSeek-R1 user blocks
-#
-#   This is a STRUCTURAL-ONLY translation.  The original message TEXT is
-#   preserved verbatim.  Only the role is changed from "system" to "user"
-#   and the messages are collapsed into a single preamble block.
-# ---------------------------------------------------------------------------
-
-def translate_to_deepseek_r1(messages: list[dict]) -> list[dict]:
-    """
-    Collapse standard OpenAI ``system`` messages into a single ``user``
-    preamble for reasoning models (DeepSeek R1) that don't support the
-    system role.
-
-    Preserves the original message text verbatim — only the structural
-    wrapping changes.  This is required by the Glass Pipe Rule.
-
-    Parameters
-    ----------
-    messages : list[dict]
-        The original message array with standard roles.
-
-    Returns
-    -------
-    list[dict]
-        Messages with system roles collapsed into a leading user block.
-        If there are no system messages, the input is returned unchanged.
-    """
-    system_texts: list[str] = []
-    others: list[dict] = []
-
-    for msg in messages:
-        if msg.get("role") == "system":
-            system_texts.append(msg.get("content", ""))
-        else:
-            others.append(msg)
-
-    if not system_texts:
-        return others
-
-    # Collapse all system messages into a single user preamble
-    combined = "[System Instructions]\n\n" + "\n\n".join(system_texts)
-
-    # Prepend as the first user message
-    return [{"role": "user", "content": combined}] + others
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +247,7 @@ async def stream_llm(
                             # Determine hardware path from endpoint
                             if endpoint == "cloud":
                                 pass  # No local cooling for cloud
-                            elif endpoint in ("reasoning", "lifeboat", "frontdesk"):
+                            elif endpoint == "frontdesk":
                                 # CPU-bound models
                                 await set_cooling("cpu", CoolingPreset.GENERATION)
                             else:
@@ -430,7 +381,7 @@ async def call_model(
     max_tokens: int = 2048,
 ) -> str:
     """
-    Legacy completions endpoint for utility AI (frontdesk, auditor).
+    Legacy completions endpoint for utility AI (frontdesk).
     Strictly forces ``thinking_budget_tokens=0`` to prevent reasoning
     overhead on CPU-bound classifiers.
 
@@ -489,68 +440,6 @@ async def call_model(
             return response.json().get("content", "")
         except Exception:
             logger.exception("call_model failed on port %d", port)
-            return ""
-
-
-# ---------------------------------------------------------------------------
-# Legacy chat completions (CPU lifeboat / worker fallback — non-streaming)
-# ---------------------------------------------------------------------------
-
-async def call_model_chat(
-    port: int,
-    messages: list[dict],
-    tools: Optional[list[dict]] = None,
-    profile: str = "analytical",
-    max_tokens: int = 8192,
-) -> str:
-    """
-    Structured Chat endpoint for Worker / Lifeboat fallback.
-
-    IMPORTANT: The caller is responsible for providing the correct
-    messages.  ``load_role_prompt`` is NOT called here — this function
-    passes messages through verbatim (Glass Pipe Rule).
-
-    Parameters
-    ----------
-    port : int
-        TCP port of the llama.cpp server.
-    messages : list[dict]
-        The message array (already assembled by the caller).
-    tools : list[dict] or None
-        Optional OpenAI tool definitions.
-    profile : str
-        ``"analytical"`` or ``"deterministic"``.
-    max_tokens : int
-        Maximum tokens to generate.
-
-    Returns
-    -------
-    str
-        The generated message content, or ``""`` on failure.
-    """
-    payload: Dict[str, Any] = {
-        "messages": messages,
-        "temperature": 0.2,
-        "max_tokens": max_tokens,
-        "stop": STOP_SEQS,
-        "thinking_budget_tokens": 0,
-    }
-    if tools:
-        payload["tools"] = tools
-    if profile == "deterministic":
-        payload.update({"temperature": 0.0})
-
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(
-                f"http://127.0.0.1:{port}/v1/chat/completions",
-                json=payload,
-                timeout=300,
-            )
-            data = response.json()
-            return data["choices"][0]["message"]["content"]
-        except Exception as exc:
-            logger.error("call_model_chat error on port %d: %s", port, exc)
             return ""
 
 

@@ -4,7 +4,6 @@ tools.py - Native Tool Executor & Web Search for Kinver Hub.
 Handles:
 - Live web search via local SearXNG instance with FlashRank CPU reranking
 - Article ingestion via Trafilatura (HTML → Markdown)
-- Lifeboat Reflexion loop for search result synthesis & self-audit
 - Central tool registry router (called by proxy.py for native tool execution)
 - Response compression to protect limited LLM context windows
 
@@ -13,9 +12,8 @@ instance is statically compiled and bound to localhost:8081.
 
 IMPORTANT (Glass Pipe Rule):
     Tool execution does NOT inject ``load_role_prompt`` into frontend
-    messages.  Proxy-internal prompts (lifeboat synthesis, auditor
-    evaluation) are generated within this module and are not derived
-    from user-supplied text.
+    messages.  Proxy-internal prompts are generated within this module
+    and are not derived from user-supplied text.
 
 Usage::
 
@@ -85,7 +83,8 @@ async def execute_tool(
     database : Database or None
         Optional database handle for caching search results.
     systemd : SystemdController or None
-        Used to resolve the lifeboat/reasoning model ports.
+        Optional systemd controller (unused by the current web_search
+        implementation).
 
     Returns
     -------
@@ -124,24 +123,7 @@ async def execute_tool(
         if raw_markdown.startswith("[Search"):
             return raw_markdown  # Error already formatted
 
-        # Step 2: Synthesize results via Lifeboat Reflexion loop
-        if stream_feedback_callback:
-            await stream_feedback_callback(
-                job, "Synthesizing research via RAM-resident Lifeboat & Reasoning...",
-            )
-
-        if systemd is not None:
-            lifeboat_port = await systemd.get_port("lifeboat")
-            reasoning_port = await systemd.get_port("reasoning")
-        else:
-            # Fallback ports
-            lifeboat_port = 8090
-            reasoning_port = 8085
-
-        summary = await lifeboat_reflexion_loop(
-            raw_markdown, query, depth, lifeboat_port, reasoning_port,
-        )
-        return summary
+        return raw_markdown
 
     return f"[Error: Native tool '{name}' not recognized.]"
 
@@ -255,103 +237,6 @@ async def _scrape_article(
     except Exception:
         logger.debug("Article scrape failed for %s", url)
     return None
-
-
-# ---------------------------------------------------------------------------
-# Lifeboat Reflexion loop — CPU-bound summarization + self-audit
-# ---------------------------------------------------------------------------
-
-async def lifeboat_reflexion_loop(
-    raw_markdown: str,
-    query: str,
-    depth: str,
-    lifeboat_port: int = 8090,
-    reasoning_port: int = 8085,
-) -> str:
-    """
-    CPU-bound Reflexion loop: summarize search results and self-audit
-    using the Lifeboat and Reasoning models.
-
-    The Lifeboat model generates a summary.  The Reasoning model
-    evaluates it.  If the evaluation is not ``OK``, the feedback is
-    appended to the Lifeboat prompt and a new summary is generated.
-    Up to 3 attempts.
-
-    Parameters
-    ----------
-    raw_markdown : str
-        The raw search results in Markdown format.
-    query : str
-        The original user query.
-    depth : str
-        Search depth profile name.
-    lifeboat_port : int
-        TCP port of the Lifeboat model.
-    reasoning_port : int
-        TCP port of the Reasoning (Auditor) model.
-
-    Returns
-    -------
-    str
-        The best summary obtained across attempts.
-    """
-    from llm import call_model
-
-    cfg = DEPTH_CONFIG.get(depth.lower(), DEPTH_CONFIG["standard"])
-
-    # Build the initial Lifeboat prompt — this is PROXY-INTERNAL
-    lb_prompt = (
-        f"You are a research synthesizer. Summarize the search results below "
-        f"in a clear, factual manner. Limit your response to a maximum of "
-        f"{cfg['summary_words']} words. Prioritize raw facts over commentary.\n\n"
-        f"Query: {query}\n\n"
-        f"Search Results:\n{raw_markdown}"
-    )
-
-    best_summary = ""
-
-    for attempt in range(3):
-        # Generate summary via Lifeboat (CPU model)
-        summary = await call_model(
-            lifeboat_port,
-            lb_prompt,
-            profile="analytical",
-            max_tokens=1024,
-        )
-
-        if not summary:
-            continue
-
-        best_summary = summary
-
-        # Evaluate the summary via Reasoning model
-        auditor_prompt = (
-            "You are a search result auditor. Evaluate the summary below "
-            "against the original search context. Reply with exactly:\n"
-            "- OK (if the summary is accurate and complete)\n"
-            "- FEEDBACK: <specific issues to fix>\n\n"
-            f"Original Context:\n{raw_markdown[:2000]}...\n\n"
-            f"Summary to Evaluate:\n{summary}"
-        )
-
-        evaluation = await call_model(
-            reasoning_port,
-            auditor_prompt,
-            profile="deterministic",
-            max_tokens=80,
-        )
-
-        if evaluation.strip().upper().startswith("OK"):
-            return summary
-
-        # Append feedback and retry
-        lb_prompt += (
-            f"\n\n[Previous attempt feedback: {evaluation.strip()}. "
-            "Please rewrite the summary to address these issues.]"
-        )
-
-    # Return the best attempt even if none passed audit
-    return best_summary if best_summary else "[Search synthesis failed after 3 attempts.]"
 
 
 # ---------------------------------------------------------------------------

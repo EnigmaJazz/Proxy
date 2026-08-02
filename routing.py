@@ -2,8 +2,7 @@
 routing.py - Lane A/B dispatch, frontdesk classifier & semantic loop detection.
 
 This module is the brain of the proxy's request routing.  It decides
-which model should handle a given request and whether the GPU is free
-or a CPU fallback (Lifeboat) is needed.
+which model should handle a given request based on GPU availability.
 
 Key responsibilities:
 - **Lane discrimination**: IDE keys (``sk-ide-pass`` header) → Lane B,
@@ -11,9 +10,10 @@ Key responsibilities:
 - **Frontdesk classification**: Lane A requests are first classified by
   the 2B frontdesk model (JSON-GBNF) to determine intent, priority,
   project, and whether the query is factual (cacheable).
-- **GPU-aware routing**: For CHAT/TOOL intents, if the GPU is busy with
-  a heavy model, route to CPU Lifeboat immediately without pausing
-  the queue.  Heavy intents (CODE/SCHOLAR/etc.) go to the queue.
+- **GPU-aware routing**: For CHAT/TOOL intents, lightweight requests
+  route to "professional" unconditionally when the GPU is busy with a
+  different specialist.  Heavy intents (CODE/SCHOLAR/etc.) go to the
+  queue.
 - **Tool-loop detection**: Uses database-backed semantic search
   (sqlite-vec) with a difflib fallback to detect repetitive tool calls
   and prevent agentic death spirals.
@@ -224,7 +224,7 @@ ROUTE_MAP: Dict[str, str] = {
 HEAVY_MODELS: set[str] = {"professional", "coder", "creative", "scholar", "architect"}
 
 # CPU-only models (always resident, never hot-swapped)
-CPU_MODELS: set[str] = {"reasoning", "lifeboat", "frontdesk"}
+CPU_MODELS: set[str] = {"frontdesk"}
 
 # ---------------------------------------------------------------------------
 # RouteDecision dataclass
@@ -244,8 +244,8 @@ class RouteDecision:
     port : int
         The TCP port the model listens on.
     is_cpu_fallback : bool
-        True if this route uses the CPU Lifeboat model because the GPU
-        is occupied.
+        Always False in the current routing model.  Kept as a field
+        for API stability; no path sets it to True.
     hardware_path : str
         ``"cpu"``, ``"gpu"``, or ``"none"`` (for cloud) — used by the
         cooling state machine.
@@ -521,7 +521,7 @@ def resolve_model(intent: str, is_lane_b: bool = False) -> str:
 
 
 # ---------------------------------------------------------------------------
-# GPU-aware routing for Lane A (Lifeboat fallback logic)
+# GPU-aware routing for Lane A (contention → Professional)
 # ---------------------------------------------------------------------------
 
 async def resolve_route_for_lane_a(
@@ -533,12 +533,13 @@ async def resolve_route_for_lane_a(
     Determine the target model for a Lane A request, taking GPU
     occupancy into account.
 
-    **CHAT / TOOL with GPU busy**: Falls back to CPU Lifeboat immediately.
-    The queue is NOT paused — these requests are handled synchronously
-    without GPU contention.
+    **CHAT / TOOL with GPU busy**: Routes to "professional"
+    unconditionally.  Lightweight requests never fall back to a CPU
+    model and are never enqueued — they are handled synchronously
+    against the GPU.
 
-    **Heavy intents (CODE/SCHOLAR/PROFESSIONAL/CREATIVE/ARCHITECT)**:
-    These require the GPU and are enqueued.  The queue worker handles
+    **Heavy intents (CODE/SCHOLAR/PROFESSIONAL/CREATIVE/ARCHITECT)**
+    require the GPU and are enqueued.  The queue worker handles
     ordering and escalation.
 
     Parameters
@@ -562,37 +563,26 @@ async def resolve_route_for_lane_a(
 
     model_key = ROUTE_MAP.get(intent, "professional")
 
-    # ---- CHAT / TOOL — route to resident Professional when available ----
-    professional_available = (
-        not systemd.is_gpu_occupied()
-        or systemd.active_heavy_model == "professional"
-    )
+    # ---- CHAT / TOOL — lightweight requests always route to Professional
+    # Unconditionally: a CHAT/TOOL request routes to "professional" even
+    # when the GPU is occupied by a different specialist.  There is no
+    # CPU fallback and nothing is enqueued for these intents.
     if intent == "CHAT" and complexity == "low":
-        model_key = "professional" if professional_available else "lifeboat"
+        model_key = "professional"
     elif intent == "TOOL":
-        model_key = (
-            "professional"
-            if professional_available or has_tool_history
-            else "lifeboat"
-        )
+        model_key = "professional"
     else:
         model_key = ROUTE_MAP.get(intent, "professional")
     port = await systemd.get_port(model_key)
-    is_cpu_fallback = model_key == "lifeboat"
-    hardware_path = "cpu" if is_cpu_fallback else "gpu"
+    is_cpu_fallback = False
+    hardware_path = "gpu"
     tools_required = tools_required or (intent == "TOOL" and has_tool_history)
 
     if intent in ("CHAT", "TOOL"):
-        if is_cpu_fallback:
-            logger.info(
-                "Routing %s → lifeboat (GPU occupied by %s, port %d)",
-                intent, systemd.active_heavy_model, port,
-            )
-        else:
-            logger.info(
-                "Routing %s → professional (GPU free/resident, port %d)",
-                intent, port,
-            )
+        logger.info(
+            "Routing %s → professional (port %d)",
+            intent, port,
+        )
         return RouteDecision(
             model_key=model_key,
             port=port,

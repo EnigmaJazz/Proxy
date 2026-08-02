@@ -9,8 +9,7 @@ The proxy's behavior is a balance between two concerns:
 
 2. **Glass Pipe compliance** (AGENTS.md Rule 1, memory #3): the proxy
    never mutates in-flight ``tool_calls`` JSON or terminates with a
-   non-standard ``finish_reason``.  The Graceful Guillotine (audit
-   halt) emits a custom SSE event + a standards-compliant finish.
+   non-standard ``finish_reason``.
 
 The original concern that ``delta.content`` proxy messages would corrupt
 tool-calling was a red herring — the actual cause of the tool-call
@@ -92,7 +91,6 @@ class _StreamCapture:
 async def r1_client() -> Any:
     """Yield an httpx async client against the real app with state stubbed."""
     from tests.conftest import (
-        _NoOpAuditor,
         _NoOpCooling,
         _NoOpDatabase,
         _NoOpSystemd,
@@ -102,7 +100,6 @@ async def r1_client() -> Any:
     proxy.app.state.systemd = _NoOpSystemd()
     proxy.app.state.cooler = _NoOpCooling()
     proxy.app.state.hardware = None
-    proxy.app.state.auditor = _NoOpAuditor()
     proxy.app.state.active_heavy_model = None
     proxy.app.state.active_priority = 3
     proxy.app.state.requests_served = 0
@@ -160,7 +157,7 @@ class TestProxyMessagesAsContent:
     """Triage and loading messages are emitted as ``delta.content`` so the
     user sees feedback during the long model-loading delay.  The Glass
     Pipe rule about not injecting content applies to in-flight payloads
-    (audit halts, tool_calls mutation); user-facing status messages are
+    (tool_calls mutation); user-facing status messages are
     the proxy's legitimate response to the user.
     """
 
@@ -214,47 +211,6 @@ class TestProxyMessagesAsContent:
             f"expected triage to be emitted as a data: chunk with "
             f"delta.content; events: {events!r}"
         )
-
-    @pytest.mark.asyncio
-    async def test_no_audit_override_finish_reason(self) -> None:
-        """The Graceful Guillotine must terminate with ``finish_reason: "stop"``,
-        not the non-standard ``"audit_override"``.  OpenAI clients treat
-        unknown finish reasons as errors.
-
-        This is the R1 violation that is still in scope after the
-        triage/loading revert.
-        """
-        from routes import _graceful_guillotine_chunk
-
-        chunk_text = await _graceful_guillotine_chunk("test-job-id", "test reason")
-        events = _parse_sse_events(chunk_text)
-
-        # The first event is the audit_halt custom event
-        assert events[0][0] == "kinver.proxy.audit_halt", (
-            f"expected kinver.proxy.audit_halt event, got {events[0]!r}"
-        )
-        assert events[0][1].get("reason") == "test reason"
-
-        # The final model chunk must have finish_reason: "stop"
-        model_chunks = [e for e in events if not e[0]]
-        assert model_chunks, "expected a final model chunk"
-        final_chunk = model_chunks[-1]
-        choices = final_chunk[1].get("choices", [])
-        assert choices, "expected choices in final chunk"
-        assert choices[0].get("finish_reason") == "stop", (
-            f"Graceful Guillotine must terminate with finish_reason='stop', "
-            f"got {choices[0].get('finish_reason')!r}"
-        )
-
-        # CRITICAL: no delta.content injection in the final chunk.
-        # The R1 violation was injecting synthetic content; the fix is
-        # to terminate cleanly with no content delta.
-        for ch in choices:
-            delta = ch.get("delta", {})
-            assert not delta.get("content"), (
-                f"Graceful Guillotine must not inject delta.content; "
-                f"got {delta!r}"
-            )
 
 
 # ---------------------------------------------------------------------------

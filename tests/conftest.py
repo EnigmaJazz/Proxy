@@ -129,36 +129,14 @@ class _NoOpCooling:
         return "hybrid"
 
 
-class _NoOpAuditor:
-    """Disabled shadow auditor that never triggers a halt."""
-
-    def __init__(self, *args, **kwargs) -> None:
-        pass
-
-    @staticmethod
-    def should_audit(*args, **kwargs) -> bool:
-        return False
-
-    def start(self, *args, **kwargs) -> None:
-        pass
-
-    def feed_chunk(self, *args, **kwargs) -> None:
-        pass
-
-    def stop(self) -> None:
-        pass
-
-
 # Patch the modules *before* proxy.py imports them.
 import database  # noqa: E402
 import systemd  # noqa: E402
 import cooling  # noqa: E402
-import auditing  # noqa: E402
 
 database.Database = _NoOpDatabase  # type: ignore[misc]
 systemd.SystemdController = _NoOpSystemd  # type: ignore[misc]
 cooling.CoolingStateMachine = _NoOpCooling  # type: ignore[misc]
-auditing.ShadowAuditor = _NoOpAuditor  # type: ignore[misc]
 
 # ---------------------------------------------------------------------------
 # 3. Now it is safe to import the real FastAPI app
@@ -177,7 +155,6 @@ async def app_client() -> AsyncIterator[httpx.AsyncClient]:
     proxy.app.state.systemd = _NoOpSystemd()
     proxy.app.state.cooler = _NoOpCooling()
     proxy.app.state.hardware = None
-    proxy.app.state.auditor = _NoOpAuditor()
     proxy.app.state.active_heavy_model = None
     proxy.app.state.active_priority = 3
     proxy.app.state.requests_served = 0

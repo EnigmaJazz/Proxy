@@ -240,7 +240,7 @@ class CoolingStateMachine:
         """
         Determine the cooling hardware path for a given model key.
 
-        - CPU-only models (reasoning, lifeboat, frontdesk): ``"cpu"``
+        - CPU-only models (frontdesk): ``"cpu"``
         - Hybrid models (architect, coder, creative, professional, scholar):
           ``"hybrid"`` — these models use partial CPU offloading alongside
           GPU compute and benefit from full-system cooling on both channels.
@@ -250,14 +250,14 @@ class CoolingStateMachine:
         Parameters
         ----------
         model_key : str
-            The key from ``LLAMA_ENDPOINTS`` (e.g. ``"professional"``, ``"reasoning"``).
+            The key from ``LLAMA_ENDPOINTS`` (e.g. ``"professional"``, ``"frontdesk"``).
 
         Returns
         -------
         str
             ``"cpu"``, ``"gpu"``, or ``"none"``.
         """
-        cpu_models = {"reasoning", "lifeboat", "frontdesk"}
+        cpu_models = {"frontdesk"}
         hybrid_models = {"architect", "coder", "creative", "professional", "scholar"}
         if model_key in cpu_models:
             return "cpu"

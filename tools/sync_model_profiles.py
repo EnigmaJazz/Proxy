@@ -38,7 +38,6 @@ DEFAULT_PROFILES_PATH = CONFIG_ROOT / "model_profiles.yaml"
 # profiles). Numeric baselines were retired when GGUF became the ground-truth
 # source of context_window.
 _MODEL_INTENTS: dict[str, tuple[str, ...]] = {
-    "reasoning": ("code",),
     "coder": ("code",),
     "professional": ("chat", "code"),
     "architect": ("code",),
@@ -47,7 +46,6 @@ _MODEL_INTENTS: dict[str, tuple[str, ...]] = {
     "worker": ("code",),
     "chatter": ("chat",),
     "frontdesk": ("chat",),
-    "lifeboat": ("chat",),
 }
 
 _INTENT_DEFAULTS: dict[str, dict[str, Any]] = {

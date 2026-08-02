@@ -101,9 +101,6 @@ LLAMA_ENDPOINTS: dict[str, str] = {
     "creative":     "http://127.0.0.1:8087/v1/chat/completions",
     "architect":    "http://127.0.0.1:8088/v1/chat/completions",
     "coder":        "http://127.0.0.1:8089/v1/chat/completions",
-    # CPU-only models (never hot-swapped)
-    "reasoning":    "http://127.0.0.1:8085/v1/chat/completions",
-    "lifeboat":     "http://127.0.0.1:8090/v1/chat/completions",
     # Cloud failover
     "cloud":        "https://openrouter.ai/api/v1/chat/completions",
 }

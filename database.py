@@ -11,7 +11,6 @@ Schema
 - **jobs**: Primary queue table with priority preemption tiers,
   partial-stream tracking, and multi-attempt failure counters.
 - **projects**: Persistent project awareness for cache segmentation.
-- **audit_log**: Shadow auditor evaluation records (verdict, override flags).
 - **semantic_cache**: Factual-query cache powered by sqlite-vec.
 - **lessons_learned**: Project-specific validated patterns for
   knowledge-cutoff bypass.
@@ -99,21 +98,6 @@ MIGRATIONS: list[str] = [
     )
     """,
 
-    # ---- audit_log table ----------------------------------------------------
-    """
-    CREATE TABLE IF NOT EXISTS audit_log (
-        id              INTEGER PRIMARY KEY AUTOINCREMENT,
-        job_id          TEXT NOT NULL,
-        chunk_offset    INTEGER NOT NULL,
-        flagged_text    TEXT NOT NULL,
-        verdict         TEXT NOT NULL,
-        overridden      INTEGER NOT NULL DEFAULT 0,
-        override_reason TEXT,
-        created_at      TEXT NOT NULL,
-        FOREIGN KEY (job_id) REFERENCES jobs(id)
-    )
-    """,
-
     # ---- semantic_cache table ------------------------------------------------
     """
     CREATE TABLE IF NOT EXISTS semantic_cache (
@@ -157,7 +141,6 @@ MIGRATIONS: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_jobs_state_priority ON jobs(state, priority)",
     "CREATE INDEX IF NOT EXISTS idx_jobs_project ON jobs(project_id)",
     "CREATE INDEX IF NOT EXISTS idx_stream_chunks_job ON stream_chunks(job_id, seq)",
-    "CREATE INDEX IF NOT EXISTS idx_audit_log_job ON audit_log(job_id)",
     "CREATE INDEX IF NOT EXISTS idx_semantic_cache_hash ON semantic_cache(query_hash)",
     "CREATE INDEX IF NOT EXISTS idx_lessons_project ON lessons_learned(project_id)",
 ]
@@ -589,8 +572,7 @@ class Database:
         Search the lessons_learned table for patterns that validate
         *flagged_text* within *project_id*.
 
-        Returns True if a matching lesson is found (auditor veto override),
-        False otherwise.
+        Returns True if a matching lesson is found, False otherwise.
 
         NOTE: Full semantic search requires sqlite-vec.  If the extension
         is unavailable this falls back to a simple substring match.
@@ -635,32 +617,6 @@ class Database:
             )
             await self._conn.commit()
             return cursor.lastrowid
-
-    # ------------------------------------------------------------------
-    # Audit log operations
-    # ------------------------------------------------------------------
-
-    async def record_audit(
-        self,
-        job_id: str,
-        chunk_offset: int,
-        flagged_text: str,
-        verdict: str,
-        overridden: bool = False,
-        override_reason: str = "",
-    ) -> None:
-        """
-        Persist a shadow auditor evaluation.
-        """
-        await self._execute_write(
-            """INSERT INTO audit_log
-               (job_id, chunk_offset, flagged_text, verdict, overridden, override_reason, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (
-                job_id, chunk_offset, flagged_text[:2000], verdict,
-                int(overridden), override_reason, self._now_iso(),
-            ),
-        )
 
     # ------------------------------------------------------------------
     # Stream chunk cleanup (called after job completion)

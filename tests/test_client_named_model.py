@@ -35,7 +35,6 @@ from routing import RouteDecision
 async def r19_client() -> Any:
     """Yield an httpx async client against the real app with state stubbed."""
     from tests.conftest import (
-        _NoOpAuditor,
         _NoOpCooling,
         _NoOpDatabase,
         _NoOpSystemd,
@@ -45,7 +44,6 @@ async def r19_client() -> Any:
     proxy.app.state.systemd = _NoOpSystemd()
     proxy.app.state.cooler = _NoOpCooling()
     proxy.app.state.hardware = None
-    proxy.app.state.auditor = _NoOpAuditor()
     proxy.app.state.active_heavy_model = None
     proxy.app.state.active_priority = 3
     proxy.app.state.requests_served = 0

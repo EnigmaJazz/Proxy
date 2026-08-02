@@ -20,7 +20,6 @@ project-specific.
 - `constants.py` — single source of truth for endpoints, hardware limits, field sets
 - `llm.py` — stream_llm, call_llm, chat-template translation
 - `database.py` — SQLite job queue (enqueue/complete/fail/stream chunks)
-- `auditing.py` — ShadowAuditor (read-only watcher, no payload mutation)
 - `cooling.py` — CoolingStateMachine (CPU/GPU IPC files for fans)
 - `systemd.py` — model service discovery + hotswap
 - `tools.py` — tool registry, web search/fetch, FlashRank reranker

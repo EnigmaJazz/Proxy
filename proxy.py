@@ -3,8 +3,8 @@ proxy.py - Kinver AI Proxy server entry-point.
 
 This is the main entry point for the Kinver Hub Hybrid API Gateway.
 It assembles all components (database, systemd controller, cooling
-state machine, hardware governor, shadow auditor) and exposes the
-OpenAI-compatible API via FastAPI on port 13000.
+state machine, hardware governor) and exposes the OpenAI-compatible
+API via FastAPI on port 13000.
 
 Architecture:
 - uvloop event loop for maximum async performance
@@ -18,7 +18,7 @@ Glass Pipe Rule:
     system prompts or user messages sent by external frontends.
     Prompting is strictly the responsibility of the client software.
     The proxy may only generate prompts for its own internal routing
-    tasks (frontdesk classification, auditor evaluation).
+    tasks (frontdesk classification).
 
 Usage::
 
@@ -96,7 +96,6 @@ from llm import (
     clear_model_cache,
     openrouter_cloud_escalation,
 )
-from auditing import ShadowAuditor
 from routing import RouteDecision
 from profile_loader import load_model_profiles, ModelProfileTable
 
@@ -127,8 +126,6 @@ class AppState:
         3-stage predictive cooling state machine.
     hardware : HardwareGovernor
         GPU workload isolation and thermal monitoring.
-    auditor : ShadowAuditor
-        Non-blocking background output auditor.
     server_start_ts : float
         Monotonic timestamp of server start (for uptime calculation).
     active_priority : int
@@ -152,7 +149,6 @@ class AppState:
         self.systemd: Optional[SystemdController] = None
         self.cooler: Optional[CoolingStateMachine] = None
         self.hardware: Optional[HardwareGovernor] = None
-        self.auditor: Optional[ShadowAuditor] = None
         self.server_start_ts: float = time.time()
         self.active_priority: int = 3  # IDLE
         self.active_heavy_model: Optional[str] = None
@@ -219,15 +215,14 @@ async def lifespan(app: FastAPI):
     2. Initialise SystemdController
     3. Initialise CoolingStateMachine, write BASELINE
     4. Initialise HardwareGovernor
-    5. Initialise ShadowAuditor
+    5. Load model profiles
     6. Spawn background tasks (thermal monitor, queue worker, ZRAM keepalive)
     7. Restore pending jobs from database
 
     On shutdown:
     1. Cancel background tasks
-    2. Stop auditor
-    3. Write BASELINE cooling
-    4. Close database
+    2. Write BASELINE cooling
+    3. Close database
     """
     state: AppState = app.state  # type: ignore[attr-defined]
     logger.info("Kinver Hybrid API Gateway starting (uvloop=%s)", uvloop is not None)
@@ -250,15 +245,7 @@ async def lifespan(app: FastAPI):
     hw = HardwareGovernor()
     state.hardware = hw
 
-    # ---- 5. Shadow Auditor -------------------------------------------------
-    auditor = ShadowAuditor(
-        database=db,
-        systemd=systemd,
-        hardware_governor=hw,
-    )
-    state.auditor = auditor
-
-    # ---- 5.5 Model profiles (R18) ------------------------------------------
+    # ---- 5. Model profiles (R18) -------------------------------------------
     state.model_profiles = load_model_profiles(
         PROJECT_ROOT / "config" / "model_profiles.yaml"
     )
@@ -292,9 +279,6 @@ async def lifespan(app: FastAPI):
                 await task
             except asyncio.CancelledError:
                 pass
-
-        # Stop auditor
-        auditor.stop()
 
         # Baseline cooling
         cooler.baseline_idle()
@@ -493,13 +477,12 @@ async def _cleanup_idle_heavy(
 
 async def zram_keepalive_worker(state: AppState) -> None:
     """
-    Periodically pings core CPU-resident models (frontdesk, reasoning,
-    chatter, lifeboat) to prevent Linux from swapping them out of RAM
-    to ZRAM.
+    Periodically pings core CPU-resident models (frontdesk, chatter)
+    to prevent Linux from swapping them out of RAM to ZRAM.
 
     Runs every 240 seconds (4 minutes).
     """
-    core_domains = ["frontdesk", "reasoning", "chatter", "lifeboat"]
+    core_domains = ["frontdesk", "chatter"]
     systemd = state.systemd
 
     if systemd is None:
@@ -571,7 +554,7 @@ app = FastAPI(
     title="Kinver Hub Hybrid API Gateway",
     description=(
         "High-performance, stateful AI proxy with GPU-aware routing, "
-        "shadow auditing, and predictive cooling for AMD hardware."
+        "and predictive cooling for AMD hardware."
     ),
     version="3.0.0",
     lifespan=lifespan,

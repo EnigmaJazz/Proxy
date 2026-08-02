@@ -370,8 +370,8 @@ TOOL_KEYWORDS: frozenset[str] = frozenset({
 # ---------------------------------------------------------------------------
 # ROUTE_MAP: classified intent → local model endpoint key
 #
-#   CHAT      → chatter  (9B, fast chat model)
-#   TOOL      → worker   (9B, tool-capable model)
+#   CHAT      → professional (35B MoE)
+#   TOOL      → professional (35B MoE, handles tool_calls natively)
 #   CODE      → professional (35B MoE, heavy coding model)
 #   SCHOLAR   → scholar  (deep research)
 #   PROFESSIONAL → professional (professional writing / 35B MoE)

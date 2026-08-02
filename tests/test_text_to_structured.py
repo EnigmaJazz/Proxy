@@ -256,6 +256,29 @@ class TestFeedMultiChunk:
         assert json.loads(emits[1]["tool_calls"][0]["function"]["arguments"]) == {"x": 1}
         assert json.loads(emits[3]["tool_calls"][0]["function"]["arguments"]) == {"y": 2}
 
+    def test_two_tool_calls_get_distinct_indices(self) -> None:
+        """Consecutive text tool calls must carry distinct per-stream
+        indices.  OpenAI clients (nanobot-ai) accumulate
+        ``delta.tool_calls`` by ``index``; a hardcoded index of 0 would
+        merge every converted call into one buffer and concatenate
+        their argument strings (the "got str" retry loop)."""
+        sm = ToolCallTextToStructured()
+        text = (
+            "<tool_call><function=a><parameter=x>1</parameter></function></tool_call>"
+            "<tool_call><function=b><parameter=y>2</parameter></function></tool_call>"
+        )
+        emits = sm.feed(text)
+        calls = [e["tool_calls"][0] for e in emits if "tool_calls" in e]
+        assert [c["index"] for c in calls] == [0, 1]
+        assert calls[0]["id"] != calls[1]["id"]
+        assert json.loads(calls[0]["function"]["arguments"]) == {"x": 1}
+        assert json.loads(calls[1]["function"]["arguments"]) == {"y": 2}
+
+    def test_parse_inner_index_parameter(self) -> None:
+        text = "<function=a><parameter=x>1</parameter></function>"
+        assert _parse_tool_call_inner(text, "call_1", 3)["index"] == 3
+        assert _parse_tool_call_inner(text, "call_1")["index"] == 0
+
     def test_tool_call_split_at_partial_prefix(self) -> None:
         """The model might emit chunks that split inside the open tag
         itself: e.g. chunk 1 ends with '<t' and chunk 2 starts with

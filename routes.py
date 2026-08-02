@@ -948,8 +948,17 @@ async def _event_stream(
     # the client (e.g. '{"query":...}{"query":...}') which breaks JSON
     # parsing in OpenAI-compatible clients (nanobot-ai "got str" error).
     # Text-converted calls (the state machine) are NOT in this set: their
-    # finish-time emission is their only delivery.
+    # delivery happens at conversion time in one chunk (see
+    # tts_tool_call_indices below), so they need no finish-time emission.
     streamed_tool_call_indices: set[int] = set()
+    # Indices of text-converted tool calls (ToolCallTextToStructured).
+    # The state machine emits the complete tool_call in one chunk at
+    # conversion time (with a unique per-call index), so the finish-time
+    # status/emission below must NOT repeat them: a second copy would be
+    # concatenated onto the first by per-index-accumulating clients and
+    # break JSON parsing, and a duplicate status line would confuse the
+    # user.
+    tts_tool_call_indices: set[int] = set()
 
     # ---- Yield proxy-injected preamble events -----------------------------
     # These events (e.g. params_replaced) are emitted before the triage
@@ -1026,6 +1035,7 @@ async def _event_stream(
                     if "tool_calls" in tts and tts["tool_calls"]:
                         for tc in tts["tool_calls"]:
                             idx = tc.get("index", 0)
+                            tts_tool_call_indices.add(idx)
                             if idx not in pending_tool_calls:
                                 pending_tool_calls[idx] = {
                                     "id": tc.get("id", ""),
@@ -1127,8 +1137,12 @@ async def _event_stream(
                         looped_indices.add(idx)
                 # Emit status for non-looped tool calls (the loop warning
                 # is emitted by the loop-detection branch below).
+                # Text-converted calls got their status line at conversion
+                # time, so skip them here to avoid duplicate lines.
                 for idx, tc in pending_tool_calls.items():
                     if idx in looped_indices:
+                        continue
+                    if idx in tts_tool_call_indices:
                         continue
                     status_msg = _format_status(tc)
                     if status_msg:
@@ -1152,11 +1166,15 @@ async def _event_stream(
                 # sole signal to the client.  Calls already relayed
                 # verbatim (native structured tool_calls) are also not
                 # re-emitted here: doing so would duplicate the arguments
-                # at the client.
+                # at the client.  Text-converted calls are already fully
+                # delivered by the state machine in one chunk, so they are
+                # not re-emitted either.
                 for idx, tc in pending_tool_calls.items():
                     if idx in looped_indices:
                         continue
                     if idx in streamed_tool_call_indices:
+                        continue
+                    if idx in tts_tool_call_indices:
                         continue
                     tc_chunk = {
                         "id": chunk.get("id"),

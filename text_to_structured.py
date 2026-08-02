@@ -86,7 +86,9 @@ def _format_status(tool_call: dict[str, Any]) -> str:
     return f"🔧 {name}({json.dumps(args, ensure_ascii=False)})"
 
 
-def _parse_tool_call_inner(text: str, call_id: str) -> dict[str, Any] | None:
+def _parse_tool_call_inner(
+    text: str, call_id: str, index: int = 0,
+) -> dict[str, Any] | None:
     """Parse the text between ``<tool_call>`` and ``</tool_call>``.
 
     Returns a dict suitable for inclusion in ``delta.tool_calls``:
@@ -97,6 +99,11 @@ def _parse_tool_call_inner(text: str, call_id: str) -> dict[str, Any] | None:
             "type": "function",
             "function": {"name": "exec_shell", "arguments": "{...}"}
         }
+
+    ``index`` must be the per-stream tool-call index so OpenAI clients
+    that accumulate ``delta.tool_calls`` by ``index`` keep parallel
+    calls separate.  A hardcoded 0 would merge every converted call
+    into one buffer on the client side, concatenating their arguments.
 
     Returns ``None`` if the text doesn't contain a recognizable
     ``<function=NAME>`` block (in which case the caller should fall
@@ -122,7 +129,7 @@ def _parse_tool_call_inner(text: str, call_id: str) -> dict[str, Any] | None:
         args[key] = value
 
     return {
-        "index": 0,
+        "index": index,
         "id": call_id,
         "type": "function",
         "function": {
@@ -214,7 +221,9 @@ class ToolCallTextToStructured:
                     break
                 # Parse and emit the tool call, then exit tool-call mode.
                 inner = self._buffer[:close_idx]
-                parsed = _parse_tool_call_inner(inner, self._next_call_id())
+                parsed = _parse_tool_call_inner(
+                    inner, self._next_call_id(), self._call_counter - 1,
+                )
                 if parsed is None:
                     # Malformed — fall back to emitting the raw text as
                     # content. This way the user still sees the model's

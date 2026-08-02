@@ -21,7 +21,7 @@ as content for user feedback.
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Optional
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -73,7 +73,15 @@ class _StreamCapture:
         self.endpoint: str | None = None
         self.payload: dict[str, Any] | None = None
 
-    async def __call__(self, *, endpoint, payload, port=0, headers=None, **kwargs):
+    async def __call__(
+        self,
+        *,
+        endpoint: str,
+        payload: dict[str, Any],
+        port: int = 0,
+        headers: Optional[dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
         self.endpoint = endpoint
         self.payload = payload
         yield {
@@ -179,6 +187,7 @@ class TestProxyMessagesAsContent:
                 json={
                     "model": "auto",
                     "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
                 },
                 headers={"Authorization": "Bearer agent-key"},
             )

@@ -327,12 +327,15 @@ async def chat_completions(request: Request) -> Response:
     requested_model = body.get("model", "auto").lower()
     tools = body.get("tools", None)
     # The proxy always streams to llama.cpp internally, but a client that
-    # requested ``stream: false`` expects a JSON ChatCompletion body back
-    # (OpenAI non-streaming semantics).  nanobot's dream/heartbeat cron
-    # calls the provider non-streaming, so without this the OpenAI SDK
-    # would receive raw SSE text as the assistant message and parse zero
-    # tool_calls.  See ``_collect_chat_completion``.
-    client_stream = bool(body.get("stream", True))
+    # did NOT request streaming expects a JSON ChatCompletion body back
+    # (OpenAI non-streaming semantics — the default when ``stream`` is
+    # omitted or false).  nanobot's dream/heartbeat cron calls the
+    # provider non-streaming, and the OpenAI SDK only sends
+    # ``"stream": true`` when streaming is requested, so the request
+    # body arrives WITHOUT the field.  Without this default the proxy
+    # returned raw SSE text, the SDK stored it as the assistant message,
+    # and zero tool_calls were parsed.  See ``_collect_chat_completion``.
+    client_stream = bool(body.get("stream", False))
     temperature = body.get("temperature", 0.7)
     top_p = body.get("top_p", 1.0)
     max_tokens = body.get("max_tokens", 4096)

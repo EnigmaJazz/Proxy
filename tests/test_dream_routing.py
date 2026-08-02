@@ -435,12 +435,17 @@ async def test_dream_non_streaming_returns_json_chat_completion(
 
 
 @pytest.mark.asyncio
-async def test_non_streaming_still_streams_by_default(dream_client: Any) -> None:
-    """Clients that omit ``stream`` keep the existing SSE behavior.
+async def test_stream_omitted_returns_json_chat_completion(
+    dream_client: Any,
+) -> None:
+    """A client that omits ``stream`` gets a JSON ChatCompletion, not SSE.
 
-    The proxy's SSE-always contract must not change for clients that do
-    not send the field (OpenAI's default is false, but this proxy
-    historically returns SSE and every working client relies on it).
+    OpenAI semantics: the chat-completions default is non-streaming, so
+    an omitted ``stream`` field means the client expects one JSON body.
+    nanobot's non-streaming provider path omits the field entirely (the
+    SDK only sends ``"stream": true`` when streaming), which is exactly
+    what the dream/heartbeat cron does — this test pins that the JSON
+    path fires without an explicit ``stream: false``.
     """
     capture = _StreamCapture()
     with patch("routes.stream_llm", new=capture), \
@@ -455,6 +460,8 @@ async def test_non_streaming_still_streams_by_default(dream_client: Any) -> None
         )
 
     assert resp.status_code == 200
-    assert "text/event-stream" in resp.headers.get("content-type", "")
-    assert _params_replaced(_parse_sse_events(resp.text))["model"] == "professional"
+    assert "text/event-stream" not in resp.headers.get("content-type", "")
+    body = resp.json()
+    assert body["object"] == "chat.completion"
+    assert body["choices"][0]["message"]["role"] == "assistant"
 

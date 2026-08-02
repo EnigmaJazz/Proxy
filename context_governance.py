@@ -32,7 +32,7 @@ Constraints (deliberate):
 from __future__ import annotations
 
 import hashlib
-import logging
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -44,9 +44,43 @@ from constants import (
     SNIP_SAFETY_BUFFER_TOKENS,
     TOOL_RESULT_PREVIEW_CHARS,
     TOOL_RESULTS_DIR_NAME,
+    get_logger,
 )
 
-logger = logging.getLogger("kinver.context_governance")
+logger = get_logger("kinver.context_governance")
+
+
+# The proxy emits its streaming status (triage, loading, tool-status) as
+# visible ``delta.content`` prefixed with this sentinel.  The prefix makes
+# those chunks identifiable so the OUTBOUND filter below can drop them from
+# the model-copy: the user sees the status inline, but the model never sees
+# its own status echoed back (the triage-echo degeneration).
+STATUS_SENTINEL = "\u200b"  # zero-width space
+
+
+def strip_proxy_status(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop proxy-owned status content from the OUTBOUND model-copy.
+
+    The proxy emits triage/loading/tool-status as visible ``delta.content``
+    so frontends show feedback during loading and tool gaps.  Those chunks
+    get stored by the client as assistant messages, so before forwarding we
+    drop any assistant message whose content starts with ``STATUS_SENTINEL``
+    (and carries no tool_calls).  The model therefore never sees its own
+    status echoed back, while the user's chat still shows the feedback.
+
+    Loop-warning chunks are deliberately NOT sentinel-prefixed: they are
+    model-directed corrective signals and must reach the next turn.
+    """
+    return [
+        msg
+        for msg in messages
+        if not (
+            msg.get("role") == "assistant"
+            and isinstance(msg.get("content"), str)
+            and msg.get("content").startswith(STATUS_SENTINEL)
+            and not msg.get("tool_calls")
+        )
+    ]
 
 
 def default_tool_results_root() -> Path:
@@ -195,10 +229,26 @@ def _offload_or_truncate(
     return f"{content[:cap]}\n\n…[tool result truncated: {len(content)} chars, showing first {cap}]"
 
 
+_OFFLOAD_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _sanitize_offload_id(tool_call_id: str) -> str:
+    """Return a filesystem-safe basename for a tool_call_id.
+
+    The id is client-controlled conversation data; a crafted value such as
+    ``../../.ssh/authorized_keys`` must never escape the session bucket.
+    Unusable ids fall back to a content hash so legitimate offloads still
+    persist.
+    """
+    if _OFFLOAD_ID_RE.fullmatch(tool_call_id):
+        return tool_call_id
+    return hashlib.sha256(tool_call_id.encode("utf-8")).hexdigest()[:16]
+
+
 def _write_offload(content: str, session_key: str, tool_call_id: str, workspace: Path) -> Path:
     bucket = workspace / session_key
     bucket.mkdir(parents=True, exist_ok=True)
-    path = bucket / f"{tool_call_id}.txt"
+    path = bucket / f"{_sanitize_offload_id(tool_call_id)}.txt"
     path.write_text(content, encoding="utf-8")
     _trim_offload_dir(workspace)
     return path

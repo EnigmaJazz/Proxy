@@ -42,7 +42,11 @@ from constants import (
     RUNTIME_CONTEXT_WINDOWS,
     get_logger,
 )
-from context_governance import apply_context_governance
+from context_governance import (
+    STATUS_SENTINEL,
+    apply_context_governance,
+    strip_proxy_status,
+)
 from llm import (
     stream_llm,
     openrouter_cloud_escalation,
@@ -297,7 +301,7 @@ async def list_models(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
-def _govern_messages(
+async def _govern_messages(
     request: Request,
     messages: list[dict[str, Any]],
     model_key: str,
@@ -307,15 +311,24 @@ def _govern_messages(
 
     Governed messages replace the model-copy only; the client's stored
     conversation and the DB audit copy are never touched.  Opt out per
-    request with ``X-Proxy-Context-Governance: off``.
+    request with ``X-Proxy-Context-Governance: off`` (the opt-out applies
+    to the budget transforms only — the proxy-status strip below is the
+    echo fix and always runs).
+
+    The budget transform may offload oversized tool results to disk, so
+    it runs in a worker thread (async-safe; never blocks the event loop).
     """
+    # Always strip proxy-owned status content (sentinel-prefixed) so the
+    # model never sees its own triage/loading/tool-status echoed back.
+    messages = strip_proxy_status(messages)
     header = request.headers.get("x-proxy-context-governance", "")
     if header.strip().lower() == "off":
         return messages
     context_window = RUNTIME_CONTEXT_WINDOWS.get(model_key)
     if not context_window:
         return messages
-    return apply_context_governance(
+    return await asyncio.to_thread(
+        apply_context_governance,
         messages,
         model_key=model_key,
         context_window=context_window,
@@ -517,7 +530,7 @@ async def chat_completions(request: Request) -> Response:
                 caller_type="AGENTIC",
             )
         payload = {
-            "messages": _govern_messages(
+            "messages": await _govern_messages(
                 request,
                 processed_messages,
                 model_key="professional",
@@ -797,7 +810,7 @@ async def chat_completions(request: Request) -> Response:
         ]
 
     payload = {
-        "messages": _govern_messages(
+        "messages": await _govern_messages(
             request,
             processed_messages,
             model_key=route.model_key,
@@ -1031,13 +1044,14 @@ async def _event_stream(
 
     # ---- Yield triage metadata as first SSE chunk ---------------------------
     # Let the frontend know which model was selected and why, so users
-    # Emitted as a custom kinver.proxy.status event so the model never
-    # sees the routing announcement (see _make_status_event).  The
-    # event is invisible to OpenAI-compatible clients (nanobot renders
-    # nothing) but remains filterable via ``model: proxy-system``.
-    # Previously emitted as delta.content for inline visibility, which
-    # polluted every assistant turn with "🔍 Proxy triage" text the
-    # model started to echo back at length.
+    # see the routing announcement during the model-loading gap.  Emitted
+    # as sentinel-prefixed delta.content via _make_status_chunk: visible
+    # inline, but stripped from the OUTBOUND model-copy on the next
+    # request (strip_proxy_status) so the model never echoes it back.
+    # Previously emitted as custom events, which the model never saw but
+    # which ALSO made the status invisible to nanobot — users lost all
+    # feedback during loading/tool gaps.  The sentinel restores inline
+    # visibility without the echo degeneration.
     #
     # Mid-tool-flow requests (last message is a tool call or a tool
     # result) skip the triage entirely: the model is continuing a chain
@@ -1049,7 +1063,7 @@ async def _event_stream(
     ) or last_msg.get("role") == "tool"
     triage_msg = _build_triage_message(route, client_named_model=client_named_model)
     if not mid_tool_flow:
-        yield _make_status_event(triage_msg, kind="triage")
+        yield _make_status_chunk(triage_msg, kind="triage")
 
     try:
         async for chunk in stream_llm(
@@ -1215,7 +1229,7 @@ async def _event_stream(
                         continue
                     status_msg = _format_status(tc)
                     if status_msg:
-                        yield _make_status_event(
+                        yield _make_status_chunk(
                             status_msg + "\n",
                             kind="tool_status",
                         )
@@ -1275,14 +1289,12 @@ async def _event_stream(
                         f"take a fundamentally different approach. "
                         f"(Arguments: {args_repr})"
                     )
-                    # Status event (invisible to clients) so the loop
-                    # warning never lands in the conversation the model
-                    # sees.  The structured event below carries the
-                    # machine-readable facts.
-                    yield _make_status_event(
-                        warning + "\n",
-                        kind="tool_loop_warning",
-                    )
+                    # Emit the loop warning as plain content (NO sentinel)
+                    # so it reaches the model's next turn as a corrective
+                    # signal — and the user sees why the tool did not run.
+                    # The structured event below carries the machine-
+                    # readable facts for observability.
+                    yield f"data: {json.dumps(_make_system_chunk(warning + '\n'))}\n\n"
                     # Also emit a custom event for observability (the
                     # user's tools, log shippers, etc. can pick this up
                     # without parsing content).
@@ -1378,14 +1390,13 @@ async def _event_stream_with_model_startup(
             label = MODEL_LABELS.get(model_key, model_key)
 
             # Send loading feedback so the frontend doesn't timeout.
-            # Emitted as a kinver.proxy.status event (see _make_status_event):
-            # the user's client may render it, but it never enters delta.content,
-            # so it cannot pollute the model's input history or be echoed back.
+            # Emitted as sentinel-prefixed delta.content (visible inline,
+            # stripped from the model-copy by strip_proxy_status).
             loading_msg = (
                 f"🔃 [Proxy: Loading {label}, please wait..."
                 f"(cold start may take 30-120 seconds)]"
             )
-            yield _make_status_event(loading_msg, kind="loading")
+            yield _make_status_chunk(loading_msg, kind="loading")
 
             try:
                 # Before loading a heavy GPU model, stop any lightweight
@@ -1452,7 +1463,7 @@ async def _event_stream_with_model_startup(
                         f"💾 [Proxy: Restored project cache "
                         f"'{project_id}' for {label}]"
                     )
-                    yield _make_status_event(cache_msg, kind="cache")
+                    yield _make_status_chunk(cache_msg, kind="cache")
                 except httpx.HTTPError:
                     logger.debug(
                         "Cache restore skipped for %s (non-critical)",
@@ -1700,12 +1711,12 @@ async def _stream_cached_response(
 # ---------------------------------------------------------------------------
 
 def _make_system_chunk(content: str) -> dict[str, Any]:
-    """
-    Create an SSE chunk dict styled as a system message for proxy
+    """Create an SSE chunk dict styled as a system message for proxy
     status updates used by the command endpoints (pause, resume,
-    cloud status).  Streaming conversation status (triage, loading,
-    tool status, loop warnings) uses _make_status_event instead —
-    never delta.content.
+    cloud status) and the model-directed tool-loop warning.  Streaming
+    conversation status (triage, loading, tool status, cache) uses
+    _make_status_chunk instead — sentinel-prefixed content that is
+    visible inline but stripped from the OUTBOUND model-copy.
     """
     return {
         "id": f"sys-{int(time.time())}",
@@ -1731,32 +1742,39 @@ def _make_proxy_event(event: str, payload: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(payload)}\n\n"
 
 
-def _make_status_event(content: str, kind: str = "status") -> str:
-    """
-    Emit proxy-injected UX (triage, loading, tool status, loop
-    warnings) as a custom ``kinver.proxy.status`` SSE event, never as
-    ``delta.content``.
+def _make_status_chunk(content: str, kind: str = "status") -> str:
+    """Render proxy-injected UX (triage, loading, tool status, cache) as
+    visible ``delta.content`` with the ``STATUS_SENTINEL`` prefix.
 
-    These messages were historically sent as content chunks so Telegram
-    rendered them inline.  The cost proved fatal: every assistant turn
-    in a long conversation starts with "🔍 Proxy triage: ...", the
-    model imitates that pattern at length (observed: one request whose
-    entire 8.9 KB output was repeated triage text), and the
-    conversation degenerates into the "routing loop with no output"
-    symptom.  Custom events are ignored by OpenAI-compatible clients
-    (nanobot renders nothing), never stored as assistant content, and
-    therefore never fed back to the model.  The payload keeps
-    ``model: "proxy-system"`` so the stream=false collector and log
-    shippers can still filter it.
+    Status is emitted as regular content so frontends render it inline
+    during loading and tool gaps (the original UX requirement), but it
+    carries two markers that keep it out of the model's input:
+
+    - the sentinel prefix lets ``strip_proxy_status`` drop the chunk from
+      the OUTBOUND model-copy on the next request, so the model never
+      sees its own status echoed back (the triage-echo degeneration that
+      produced the "routing loop with no output" symptom);
+    - ``model: "proxy-system"`` keeps the stream=false collector from
+      gluing status into the JSON ChatCompletion (the dream path).
+
+    Loop warnings are NOT sent through this helper — they are
+    model-directed corrective signals and must reach the next turn, so
+    they are emitted as plain content via ``_make_system_chunk``.
     """
-    return _make_proxy_event(
-        "kinver.proxy.status",
-        {
-            "kind": kind,
-            "model": "proxy-system",
-            "content": content,
-        },
-    )
+    return f"data: {json.dumps({
+        'id': f'chatcmpl-status-{int(time.time())}',
+        'object': 'chat.completion.chunk',
+        'created': int(time.time()),
+        'model': 'proxy-system',
+        'choices': [{
+            'index': 0,
+            'delta': {
+                'role': 'assistant',
+                'content': f'{STATUS_SENTINEL}{content}',
+            },
+            'finish_reason': None,
+        }],
+    })}\n\n"
 
 
 # ---------------------------------------------------------------------------

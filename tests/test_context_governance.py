@@ -15,7 +15,11 @@ import pytest
 import pytest_asyncio
 
 import proxy
-from context_governance import apply_context_governance
+from context_governance import (
+    STATUS_SENTINEL,
+    apply_context_governance,
+    strip_proxy_status,
+)
 from tests.conftest import _NoOpCooling, _NoOpDatabase, _NoOpSystemd
 from tests.test_r1_sse_format import _make_profile_table
 
@@ -32,7 +36,9 @@ def _classification() -> dict[str, Any]:
     }
 
 
-def _tool_messages(result: str, name: str = "exec") -> list[dict[str, Any]]:
+def _tool_messages(
+    result: str, name: str = "exec", tool_call_id: str = "call_1"
+) -> list[dict[str, Any]]:
     return [
         {"role": "user", "content": "run the report"},
         {
@@ -40,13 +46,13 @@ def _tool_messages(result: str, name: str = "exec") -> list[dict[str, Any]]:
             "content": None,
             "tool_calls": [
                 {
-                    "id": "call_1",
+                    "id": tool_call_id,
                     "type": "function",
                     "function": {"name": name, "arguments": "{}"},
                 }
             ],
         },
-        {"role": "tool", "tool_call_id": "call_1", "name": name, "content": result},
+        {"role": "tool", "tool_call_id": tool_call_id, "name": name, "content": result},
         {"role": "user", "content": "what did you find?"},
     ]
 
@@ -109,6 +115,28 @@ class TestResultBudget:
         )
         assert governed[2]["content"] == "short ok"
 
+    def test_traversal_tool_call_id_cannot_escape_bucket(self, tmp_path: Path) -> None:
+        # A crafted tool_call_id must never escape the session bucket when the
+        # offload path is built (arbitrary-write guard).
+        messages = _tool_messages("z" * 40_000, tool_call_id="../../escape")
+        governed = apply_context_governance(
+            messages,
+            model_key="professional",
+            context_window=65_536,
+            workspace=tmp_path,
+        )
+        tool_msg = governed[2]
+        assert "saved to" in tool_msg["content"]
+        # The reference resolves inside the workspace, never outside it.
+        assert "../" not in tool_msg["content"].split("saved to ")[1].split("]")[0]
+        written = list(tmp_path.rglob("*.txt"))
+        assert len(written) == 1
+        assert written[0].parent != tmp_path
+        assert written[0].name != "escape.txt"
+        assert str(written[0].resolve()).startswith(str(tmp_path.resolve()))
+        # Nothing was written next to the workspace.
+        assert not (tmp_path.parent / "escape.txt").exists()
+
 
 class TestStructuralCleanup:
     def test_drops_orphan_tool_result(self) -> None:
@@ -154,6 +182,63 @@ class TestStructuralCleanup:
         )
         assistant = [m for m in governed if m["role"] == "assistant"][0]
         assert [tc["id"] for tc in assistant["tool_calls"]] == ["call_ok"]
+
+
+class TestStripProxyStatus:
+    """The OUTBOUND status filter: proxy-owned sentinel content must
+    never reach the model, while every legitimate message survives.
+    """
+
+    def _status_messages(self) -> list[dict[str, Any]]:
+        return [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": f"{STATUS_SENTINEL}🔍 Proxy triage: classified as TOOL"},
+            {"role": "assistant", "content": f"{STATUS_SENTINEL}🔧 Calling exec: `ls`"},
+            {"role": "assistant", "content": "the real answer"},
+        ]
+
+    def test_strips_sentinel_status_from_outbound(self) -> None:
+        cleaned = strip_proxy_status(self._status_messages())
+        contents = [m["content"] for m in cleaned]
+        assert contents == ["hello", "the real answer"]
+
+    def test_keeps_loop_warning_without_sentinel(self) -> None:
+        # Loop warnings are model-directed corrections — NOT sentinel
+        # prefixed — so they must survive the strip and reach the model.
+        messages = self._status_messages() + [
+            {"role": "assistant", "content": "⚠️ Tool loop detected: exec. Use that result..."}
+        ]
+        cleaned = strip_proxy_status(messages)
+        assert any("Tool loop detected" in m["content"] for m in cleaned)
+
+    def test_never_strips_model_tool_calls(self) -> None:
+        messages = [
+            {"role": "user", "content": "list files"},
+            {
+                "role": "assistant",
+                "content": f"{STATUS_SENTINEL}🔧 Calling exec: `ls`",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "exec", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "done"},
+        ]
+        cleaned = strip_proxy_status(messages)
+        assert any(m.get("tool_calls") for m in cleaned)
+        assert any(m["role"] == "tool" for m in cleaned)
+
+    def test_never_strips_user_content_with_sentinel(self) -> None:
+        # A user who literally types the sentinel prefix at the start of
+        # their own message must never lose it.
+        messages = [
+            {"role": "user", "content": f"{STATUS_SENTINEL}my own message"},
+        ]
+        cleaned = strip_proxy_status(messages)
+        assert cleaned == messages
 
 
 class TestBudgetSnip:
@@ -322,3 +407,28 @@ class TestEndpointGovernance:
         sent = capture.payload["messages"]
         tool_msg = next(m for m in sent if m["role"] == "tool")
         assert tool_msg["content"] == "x" * 20_000
+
+    @pytest.mark.asyncio
+    async def test_outbound_payload_strips_proxy_status(self, governance_client) -> None:
+        """Sentinel-prefixed proxy status in the request history must be
+        stripped from the OUTBOUND model-copy — even when the budget
+        governance is opted out, because the strip is the echo-loop fix,
+        not a budget optimization.
+        """
+        messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": f"{STATUS_SENTINEL}🔍 Proxy triage: classified as TOOL"},
+            {"role": "assistant", "content": "the real answer"},
+        ]
+        for extra in ({}, {"X-Proxy-Context-Governance": "off"}):
+            response, capture = await self._post(
+                governance_client,
+                messages,
+                extra_headers=extra or None,
+            )
+            sent = capture.payload["messages"]
+            assert all(
+                not (m.get("content", "") or "").startswith(STATUS_SENTINEL)
+                for m in sent
+            ), f"sentinel status leaked into outbound: {sent!r}"
+            assert any("the real answer" in m["content"] for m in sent)

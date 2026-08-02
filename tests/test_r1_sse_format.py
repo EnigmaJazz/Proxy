@@ -4,19 +4,20 @@ The proxy's behavior is a balance between two concerns:
 
 1. **User feedback during long delays** (cold starts, hotswaps): the user
    wants to see what's happening.  Triage and loading messages are
-   emitted as ``delta.content`` chunks so nanobot-ai and similar clients
-   render them inline in the chat.
+   emitted as ``kinver.proxy.status`` SSE events so clients CAN render
+   them, but they never enter ``delta.content``.
 
 2. **Glass Pipe compliance** (AGENTS.md Rule 1, memory #3): the proxy
    never mutates in-flight ``tool_calls`` JSON or terminates with a
    non-standard ``finish_reason``.
 
-The original concern that ``delta.content`` proxy messages would corrupt
-tool-calling was a red herring — the actual cause of the tool-call
-XML-in-chat bug was Qwen 3.5's extended-thinking mode (60-100 chunks
-of ``reasoning_content`` adjacent to the tool call).  The thinking
-disable is the actual fix; the triage/loading messages are now back
-as content for user feedback.
+Proxy-injected status (triage, loading, tool status, loop warnings) is
+emitted ONLY as custom SSE events — never as ``delta.content``.
+Emission as content was tried for inline Telegram visibility, but it
+polluted every assistant turn with "🔍 Proxy triage" text that the
+model began echoing back at length (observed: a request whose entire
+output was repeated triage text), degenerating long conversations into
+the routing loop with no usable output.
 """
 from __future__ import annotations
 
@@ -95,6 +96,64 @@ class _StreamCapture:
         }
 
 
+class _ToolCallCapture:
+    """Stream stand-in emitting one native structured tool call + finish."""
+
+    def __init__(self) -> None:
+        self.endpoint: Optional[str] = None
+        self.payload: Optional[dict[str, Any]] = None
+
+    async def __call__(
+        self,
+        *,
+        endpoint: str,
+        payload: dict[str, Any],
+        port: int = 0,
+        headers: Optional[dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        self.endpoint = endpoint
+        self.payload = payload
+        yield {
+            "id": "cmpl-tool1",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "professional",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_native_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "exec",
+                                    "arguments": '{"command": "ls"}',
+                                },
+                            },
+                        ],
+                    },
+                    "finish_reason": None,
+                },
+            ],
+        }
+        yield {
+            "id": "cmpl-tool1",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "professional",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "tool_calls",
+                },
+            ],
+        }
+
+
 @pytest_asyncio.fixture
 async def r1_client() -> Any:
     """Yield an httpx async client against the real app with state stubbed."""
@@ -162,19 +221,23 @@ def _parse_sse_events(response_text: str) -> list[tuple[str, dict[str, Any]]]:
 # ---------------------------------------------------------------------------
 
 class TestProxyMessagesAsContent:
-    """Triage and loading messages are emitted as ``delta.content`` so the
-    user sees feedback during the long model-loading delay.  The Glass
-    Pipe rule about not injecting content applies to in-flight payloads
-    (tool_calls mutation); user-facing status messages are
-    the proxy's legitimate response to the user.
+    """Proxy-injected status arrives as ``kinver.proxy.status`` events —
+    never as ``delta.content`` (content pollution caused the model to
+    echo triage text and degenerate on long conversations).
     """
 
     @pytest.mark.asyncio
-    async def test_triage_emitted_as_content_delta(self, r1_client) -> None:
-        """The first SSE chunk after the model starts should be a
-        ``data: {delta.content: "🔍 Proxy triage: ..."}`` chunk that
-        nanobot-ai renders inline.  This gives the user feedback
-        during the long routing/hotswap delay.
+    async def test_triage_emitted_as_status_event(self, r1_client) -> None:
+        """The routing announcement must arrive as a custom
+        ``kinver.proxy.status`` SSE event, never as ``delta.content``.
+
+        Triage text was previously emitted as content so Telegram
+        rendered it inline, but every assistant turn in a long
+        conversation then started with "🔍 Proxy triage: ..." and the
+        model began echoing that pattern at length — the "routing loop
+        with no output" symptom.  As a custom event it is invisible to
+        OpenAI-compatible clients, never stored as assistant content,
+        and therefore never fed back to the model.
         """
         capture = _StreamCapture()
         with patch("routes.stream_llm", new=capture), \
@@ -196,29 +259,27 @@ class TestProxyMessagesAsContent:
         assert response.status_code == 200, text
         events = _parse_sse_events(text)
 
-        # The triage message must appear as a data: chunk (delta.content),
-        # not as a custom event.  The triage is the first non-empty data:
-        # chunk and uses ``model: "proxy-system"`` to mark its origin.
+        # The triage must appear as a kinver.proxy.status EVENT, and
+        # must NOT appear as delta.content in any data: chunk.
         triage_found = False
         for event_name, event_data in events:
-            if event_name:  # skip custom events
-                continue
-            choices = event_data.get("choices", [])
-            for ch in choices:
-                delta = ch.get("delta", {})
-                content = delta.get("content", "")
-                if "🔍 Proxy triage" in content:
+            if event_name == "kinver.proxy.status":
+                if "🔍 Proxy triage" in event_data.get("content", ""):
                     triage_found = True
                     assert event_data.get("model") == "proxy-system", (
-                        f"triage should be marked as proxy-system, "
+                        f"triage event should be marked as proxy-system, "
                         f"got {event_data.get('model')!r}"
                     )
-                    break
-            if triage_found:
-                break
+            else:
+                for ch in event_data.get("choices", []):
+                    content = ch.get("delta", {}).get("content", "")
+                    assert "🔍 Proxy triage" not in content, (
+                        f"triage must not leak into delta.content; "
+                        f"events: {events!r}"
+                    )
         assert triage_found, (
-            f"expected triage to be emitted as a data: chunk with "
-            f"delta.content; events: {events!r}"
+            f"expected triage as kinver.proxy.status event; "
+            f"events: {events!r}"
         )
 
     @pytest.mark.asyncio
@@ -256,7 +317,12 @@ class TestProxyMessagesAsContent:
         events = _parse_sse_events(text)
 
         for event_name, event_data in events:
-            if event_name:
+            # No triage event AND no triage content on mid-tool-flow.
+            if event_name == "kinver.proxy.status":
+                assert "Proxy triage" not in event_data.get("content", ""), (
+                    f"mid-tool-flow request must not re-emit triage; "
+                    f"events: {events!r}"
+                )
                 continue
             for ch in event_data.get("choices", []):
                 content = ch.get("delta", {}).get("content", "")
@@ -264,6 +330,75 @@ class TestProxyMessagesAsContent:
                     f"mid-tool-flow request must not re-emit triage; "
                     f"events: {events!r}"
                 )
+
+    @pytest.mark.asyncio
+    async def test_tool_status_emitted_as_event_not_content(
+        self,
+        r1_client: Any,
+    ) -> None:
+        """Per-tool-call status ("🔧 exec: ...") must arrive as a
+        ``kinver.proxy.status`` event, never as ``delta.content``.
+
+        Tool-status lines were emitted as content for Telegram
+        visibility, adding a "🔧 exec: ..." line to every tool turn.
+        Like triage, that text pollutes the assistant history the model
+        later sees; it belongs on the event channel only.
+        """
+        capture = _ToolCallCapture()
+        with patch("routes.stream_llm", new=capture), \
+             patch(
+                 "routes.classify_with_frontdesk",
+                 new=AsyncMock(return_value=_classification(intent="TOOL", tools_required=True)),
+             ):
+            response = await r1_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "auto",
+                    "messages": [{"role": "user", "content": "list the files"}],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "exec",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {"command": {"type": "string"}},
+                                },
+                            },
+                        },
+                    ],
+                    "stream": True,
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            text = (await response.aread()).decode()
+
+        assert response.status_code == 200, text
+        events = _parse_sse_events(text)
+
+        status_found = False
+        for event_name, event_data in events:
+            if event_name == "kinver.proxy.status":
+                if "🔧 exec: `ls`" in event_data.get("content", ""):
+                    status_found = True
+                    assert event_data.get("kind") == "tool_status", (
+                        f"expected tool_status kind; events: {events!r}"
+                    )
+                    assert event_data.get("model") == "proxy-system", (
+                        f"tool status must be marked proxy-system; "
+                        f"events: {events!r}"
+                    )
+            else:
+                for ch in event_data.get("choices", []):
+                    content = ch.get("delta", {}).get("content", "")
+                    assert "🔧" not in content, (
+                        f"tool status must not leak into delta.content; "
+                        f"events: {events!r}"
+                    )
+        assert status_found, (
+            f"expected tool status as kinver.proxy.status event; "
+            f"events: {events!r}"
+        )
 
 
 # ---------------------------------------------------------------------------

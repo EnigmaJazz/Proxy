@@ -213,6 +213,13 @@ class Database:
         job_id = str(uuid.uuid4())
         now = self._now_iso()
 
+        # Lazy project creation: the documented contract says the project
+        # slug is created when provided, and the ``jobs.project_id`` FK
+        # requires the row to exist before the INSERT (the dream path
+        # enqueues with ``project_id="soul"`` without creating it first).
+        if project_id:
+            project_id = await self.get_or_create_project(project_id)
+
         await self._execute_write(
             """INSERT INTO jobs (
                 id, priority, state, intent, project_id,

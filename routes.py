@@ -25,7 +25,7 @@ import subprocess
 import time
 import uuid
 import httpx
-from typing import TYPE_CHECKING, Any, AsyncIterator
+from typing import TYPE_CHECKING, Any, AsyncIterator, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -470,7 +470,7 @@ async def chat_completions(request: Request) -> StreamingResponse:
                 priority=3,
                 intent="ARCHITECT",
                 project_id="soul",
-                tools_json=None,
+                tools_json=json.dumps(tools) if tools else None,
                 parameters_json=json.dumps(parameters),
                 lane="lane_a",
                 is_lane_b=False,
@@ -485,6 +485,8 @@ async def chat_completions(request: Request) -> StreamingResponse:
         }
         if "thinking_budget_tokens" in parameters:
             payload["thinking_budget_tokens"] = parameters["thinking_budget_tokens"]
+        if tools:
+            payload["tools"] = tools
 
         proxy_preamble: list[str] = []
         if entry is not None:
@@ -898,7 +900,7 @@ async def _event_stream(
     processed_messages: list[dict[str, Any]],
     requested_model: str,
     hardware_path: str,
-    proxy_preamble: list[str] | None = None,
+    proxy_preamble: Optional[list[str]] = None,
     client_named_model: bool = False,
     session_id: str = "",  # SHA-256[:16]:<first_seen_unix> for cross-request loop detection
 ) -> AsyncIterator[str]:
@@ -1256,7 +1258,7 @@ async def _event_stream_with_model_startup(
     processed_messages: list[dict[str, Any]],
     requested_model: str,
     hardware_path: str,
-    proxy_preamble: list[str] | None = None,
+    proxy_preamble: Optional[list[str]] = None,
     client_named_model: bool = False,
     session_id: str = "",
 ) -> AsyncIterator[str]:

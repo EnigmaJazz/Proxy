@@ -7,7 +7,7 @@ profile resolution, and SSE params_replaced event after the switch.
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Optional
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -16,6 +16,7 @@ import pytest_asyncio
 
 import proxy
 from profile_loader import ModelProfileTable
+from tests.conftest import _NoOpDatabase
 
 
 def _make_profile_table() -> ModelProfileTable:
@@ -49,9 +50,17 @@ class _StreamCapture:
 
     def __init__(self) -> None:
         self.endpoint: str | None = None
-        self.payload: dict[str, Any] | None = None
+        self.payload: Optional[dict[str, Any]] = None
 
-    async def __call__(self, *, endpoint, payload, port=0, headers=None, **kwargs):
+    async def __call__(
+        self,
+        *,
+        endpoint: str,
+        payload: dict[str, Any],
+        port: int = 0,
+        headers: Optional[dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
         self.endpoint = endpoint
         self.payload = payload
         yield {
@@ -162,3 +171,57 @@ async def test_non_dream_chat_uses_chat_profile(dream_client: Any) -> None:
     params = _params_replaced(_parse_sse_events(resp.text))
     assert params["model"] == "professional"
     assert params["values"]["temperature"] == 0.7
+
+
+class _RecordingDatabase(_NoOpDatabase):  # type: ignore[misc]
+    """Capture the last enqueue_job kwargs for assertions."""
+
+    def __init__(self) -> None:
+        self.last_enqueue: Optional[dict[str, Any]] = None
+
+    async def enqueue_job(self, **kwargs: Any) -> str:
+        self.last_enqueue = kwargs
+        return "job-id"
+
+
+@pytest.mark.asyncio
+async def test_dream_forwards_tools_to_model(dream_client: Any) -> None:
+    """The dream path must forward client tools to the model and record them.
+
+    Regression: the dream payload used to omit ``tools`` entirely, so
+    professional received the memory-consolidation prompt with no tool
+    definitions, emitted bare ``[read_file]`` text stubs, and stopped
+    without executing anything.
+    """
+    capture = _StreamCapture()
+    db = _RecordingDatabase()
+    proxy.app.state.database = db
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    with patch("routes.stream_llm", new=capture), \
+         patch("routes.is_dream_process", new=AsyncMock(return_value=True)):
+        resp = await dream_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "auto",
+                "messages": [
+                    {"role": "user", "content": "extract new facts from conversation history"},
+                ],
+                "stream": True,
+                "tools": tools,
+            },
+        )
+
+    assert resp.status_code == 200
+    assert capture.payload is not None
+    assert capture.payload.get("tools") == tools
+    assert db.last_enqueue is not None
+    assert json.loads(db.last_enqueue["tools_json"]) == tools
+

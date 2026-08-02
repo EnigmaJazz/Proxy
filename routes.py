@@ -38,6 +38,7 @@ from constants import (
     CPU_MODELS,
     TOOL_KEYWORDS,
     _HEAVY_MODEL_KEYS,
+    MODEL_LABELS,
     get_logger,
 )
 from llm import (
@@ -112,7 +113,7 @@ def _loop_state(app: FastAPI) -> dict[str, dict[str, Any]]:
     return state.loop_detection_state
 
 
-def _session_state(app: FastAPI) -> dict[str, dict]:
+def _session_state(app: FastAPI) -> dict[str, dict[str, Any]]:
     """Lazy accessor for the cross-request session map on ``app.state``."""
     state = app.state
     if not hasattr(state, "session_state"):
@@ -1000,8 +1001,19 @@ async def _event_stream(
     # the actual cause of the tool-call XML-in-chat bug was Qwen 3.5's
     # thinking mode emitting reasoning_content adjacent to the tool
     # call, which the proxy now disables via chat_template_kwargs.
+    #
+    # Mid-tool-flow requests (last message is a tool call or a tool
+    # result) skip the triage chunk: the model is continuing a chain it
+    # already started, so re-announcing the route adds noise to the
+    # visible conversation AND feeds the model's own input with repeated
+    # "Proxy triage" text that it starts to echo back at length.
+    last_msg = processed_messages[-1] if processed_messages else {}
+    mid_tool_flow = (
+        last_msg.get("role") == "assistant" and "tool_calls" in last_msg
+    ) or last_msg.get("role") == "tool"
     triage_msg = _build_triage_message(route, client_named_model=client_named_model)
-    yield f"data: {json.dumps(_make_system_chunk(triage_msg))}\n\n"
+    if not mid_tool_flow:
+        yield f"data: {json.dumps(_make_system_chunk(triage_msg))}\n\n"
 
     try:
         async for chunk in stream_llm(
@@ -1345,14 +1357,7 @@ async def _event_stream_with_model_startup(
         active_heavy = systemd.active_heavy_model
         if active_heavy != model_key:
             # ---- Model not running — start it with loading feedback ----------
-            model_labels = {
-                "professional": "Professional (35B MoE)",
-                "coder": "Coder (27B Dense)",
-                "creative": "Creative (long-form)",
-                "scholar": "Scholar (deep research)",
-                "architect": "Architect (multi-stage planning)",
-            }
-            label = model_labels.get(model_key, model_key)
+            label = MODEL_LABELS.get(model_key, model_key)
 
             # Send loading feedback so the frontend doesn't timeout.
             # Emitted as delta.content via _make_system_chunk so the user
@@ -1743,16 +1748,7 @@ def _build_triage_message(
         A single-line informational message, no trailing newline.
     """
     # Determine the human-readable model description
-    model_descriptions = {
-        "frontdesk":     "Front Desk (2B classifier)",
-        "chatter":       "Chatter (9B fast chat)",
-        "professional":  "Professional (35B MoE)",
-        "coder":         "Coder (27B Dense)",
-        "creative":      "Creative (long-form)",
-        "scholar":       "Scholar (deep research)",
-        "architect":     "Architect (multi-stage planning)",
-    }
-    model_label = model_descriptions.get(
+    model_label = MODEL_LABELS.get(
         route.model_key,
         route.model_key.capitalize(),
     )

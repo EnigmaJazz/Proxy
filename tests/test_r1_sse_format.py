@@ -70,8 +70,8 @@ class _StreamCapture:
     """Async-generator stand-in for ``stream_llm`` that yields minimal chunks."""
 
     def __init__(self) -> None:
-        self.endpoint: str | None = None
-        self.payload: dict[str, Any] | None = None
+        self.endpoint: Optional[str] = None
+        self.payload: Optional[dict[str, Any]] = None
 
     async def __call__(
         self,
@@ -220,6 +220,50 @@ class TestProxyMessagesAsContent:
             f"expected triage to be emitted as a data: chunk with "
             f"delta.content; events: {events!r}"
         )
+
+    @pytest.mark.asyncio
+    async def test_triage_skipped_on_mid_tool_flow(self, r1_client) -> None:
+        """Mid-tool-flow requests (last message is a tool result) must NOT
+        re-emit the triage chunk.
+
+        Every tool iteration in an agentic chain previously re-announced
+        the route, polluting the visible conversation with repeated
+        "Proxy triage" lines AND feeding the model's own input text that
+        it started to echo back at length.  The triage is only useful
+        when a NEW user turn begins.
+        """
+        capture = _StreamCapture()
+        with patch("routes.stream_llm", new=capture):
+            response = await r1_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "auto",
+                    "messages": [
+                        {"role": "assistant", "content": "",
+                         "tool_calls": [
+                             {"id": "call_1", "type": "function",
+                              "function": {"name": "exec", "arguments": "{\"command\": \"ls\"}"}},
+                         ]},
+                        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+                    ],
+                    "stream": True,
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            text = (await response.aread()).decode()
+
+        assert response.status_code == 200, text
+        events = _parse_sse_events(text)
+
+        for event_name, event_data in events:
+            if event_name:
+                continue
+            for ch in event_data.get("choices", []):
+                content = ch.get("delta", {}).get("content", "")
+                assert "Proxy triage" not in content, (
+                    f"mid-tool-flow request must not re-emit triage; "
+                    f"events: {events!r}"
+                )
 
 
 # ---------------------------------------------------------------------------

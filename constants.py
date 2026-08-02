@@ -400,6 +400,19 @@ CPU_MODELS: set[str] = {"frontdesk"}
 # the always-on Chatter model, so it is a superset of HEAVY_MODELS).
 _HEAVY_MODEL_KEYS: set[str] = {"professional", "coder", "creative", "scholar", "architect", "chatter"}
 
+# Human-readable model labels for user-facing triage/status messages.
+# Single source of truth shared by _build_triage_message and the
+# cold-start feedback in the streaming path.
+MODEL_LABELS: dict[str, str] = {
+    "frontdesk":    "Front Desk (2B classifier)",
+    "chatter":      "Chatter (9B fast chat)",
+    "professional": "Professional (35B MoE)",
+    "coder":        "Coder (27B Dense)",
+    "creative":     "Creative (long-form)",
+    "scholar":      "Scholar (deep research)",
+    "architect":    "Architect (multi-stage planning)",
+}
+
 # Maximum tool call repetitions allowed per domain before breaking the loop
 LOOP_LIMITS: dict[str, int] = {
     "scholar":      6,

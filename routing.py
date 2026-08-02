@@ -598,33 +598,36 @@ async def detect_tool_loops(
                         "args": tc["function"]["arguments"],
                     })
 
-    if not historical_calls:
-        return False, ""
-
-    # ---- Check role limit (absolute count) -----------------------------------
-    if len(historical_calls) >= max_loops:
-        return True, f"Role limit of {max_loops} tool calls reached"
-
-    # ---- Check for repetitive calls (near-identical args) --------------------
     if len(historical_calls) < 2:
         return False, ""
 
+    # ---- Check for consecutive repetitive calls (death spiral) -------------
+    # A loop is the model repeating the SAME tool with near-identical args
+    # back-to-back.  Count the trailing run of matching calls.  A long
+    # conversation that used many DIFFERENT tools is legitimate and must not
+    # trip the detector — the old absolute role-limit check (total call
+    # count >= limit) stripped tools from every request once the conversation
+    # crossed N calls, which broke every long agentic session (the model
+    # could no longer call tools and degenerated into text stubs / empty
+    # output, producing exactly the "loops with no output" symptom).
     latest_call = historical_calls[-1]
-    for prev_call in historical_calls[:-1]:
-        if latest_call["name"] != prev_call["name"]:
-            continue
-
-        # Use difflib for string similarity on arguments
+    run = 1
+    for prev_call in reversed(historical_calls[:-1]):
+        if prev_call["name"] != latest_call["name"]:
+            break
         ratio = difflib.SequenceMatcher(
             None,
             latest_call["args"],
             prev_call["args"],
         ).ratio()
-
-        if ratio > 0.85:
+        if ratio < 0.85:
+            break
+        run += 1
+        if run >= max_loops:
             reason = (
                 f"Repetitive tool call detected: "
-                f"'{latest_call['name']}' with {ratio:.0%} similar args"
+                f"'{latest_call['name']}' called {run} times in a row "
+                f"with {ratio:.0%} similar args"
             )
             logger.warning("Tool loop detected: %s", reason)
 

@@ -143,6 +143,42 @@ async def test_dream_routes_to_professional_code_profile(dream_client: Any) -> N
 
 
 @pytest.mark.asyncio
+async def test_dream_params_replaced_only_lists_applied_fields(
+    dream_client: Any,
+) -> None:
+    """The params_replaced event must not advertise profile fields the
+    dream payload never forwards (top_p is resolved but not sent).
+
+    Regression: the event reported every key from the resolved profile
+    (``replaced_fields = list(entry.values.keys())``), so it claimed
+    top_p/seed/response_format were applied when the payload only
+    carried temperature, max_tokens, and thinking_budget_tokens.
+    """
+    capture = _StreamCapture()
+    with patch("routes.stream_llm", new=capture), \
+         patch("routes.is_dream_process", new=AsyncMock(return_value=True)):
+        resp = await dream_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "auto",
+                "messages": [
+                    {"role": "user", "content": "extract new facts from conversation history"},
+                ],
+                "stream": True,
+            },
+        )
+
+    assert resp.status_code == 200
+    params = _params_replaced(_parse_sse_events(resp.text))
+    assert set(params["replaced"]) == {
+        "temperature",
+        "max_tokens",
+        "thinking_budget_tokens",
+    }
+    assert "top_p" not in params["replaced"]
+
+
+@pytest.mark.asyncio
 async def test_non_dream_chat_uses_chat_profile(dream_client: Any) -> None:
     """A normal request goes through the frontdesk path, not the dream one."""
     capture = _StreamCapture()

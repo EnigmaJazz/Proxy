@@ -55,7 +55,7 @@ from routing import (
     extract_project_context,
     is_dream_process,
 )
-from text_to_structured import ToolCallTextToStructured
+from text_to_structured import ToolCallTextToStructured, _format_status
 
 if TYPE_CHECKING:
     from proxy import AppState
@@ -99,7 +99,7 @@ _LOOP_DETECTION_MAX_JOBS = 1000  # cap on tracked sessions (LRU eviction)
 _LOOP_DETECTION_SESSION_TTL = 3600  # session state expires after 1 hour of inactivity
 
 
-def _loop_state(app: FastAPI) -> dict[str, list[str]]:
+def _loop_state(app: FastAPI) -> dict[str, dict[str, Any]]:
     """Lazy accessor for the cross-request tool-loop state.
 
     The state lives on ``app.state`` (Rule 6 — no module-level mutable
@@ -211,7 +211,11 @@ def _check_tool_loop(
     Resets the window when a different signature is seen.
     """
     loop_state = _loop_state(app)
-    history = loop_state.setdefault(session_id, [])
+    entry = loop_state.setdefault(
+        session_id, {"signatures": [], "last_seen": time.time()}
+    )
+    entry["last_seen"] = time.time()
+    history = entry["signatures"]
     if history and history[-1] != signature:
         # Different tool call — reset the consecutive-run window.
         history.clear()
@@ -221,20 +225,16 @@ def _check_tool_loop(
         del history[0 : len(history) - _LOOP_DETECTION_WINDOW]
     # LRU-ish cap on total sessions tracked.
     if len(loop_state) > _LOOP_DETECTION_MAX_JOBS:
-        # Drop the oldest session_id to bound memory.
-        oldest_key = min(
-            loop_state,
-            key=lambda k: _session_state(app).get(k, {}).get("last_seen", 0),
-        )
+        # Drop the session with the oldest last_seen to bound memory.
+        # Each entry carries its own last_seen so the eviction is
+        # self-contained: loop keys are session_ids ("hash:ts") or
+        # job_ids, which do NOT match the _session_state key space
+        # (bare first-message hash).
+        oldest_key = min(loop_state, key=lambda k: loop_state[k]["last_seen"])
         loop_state.pop(oldest_key, None)
     return len(history) >= _LOOP_DETECTION_WINDOW and all(
         s == signature for s in history
     )
-
-
-def _clear_tool_loop(session_id: str, app: FastAPI) -> None:
-    """Drop a session's loop-detection state (called on stream end)."""
-    _loop_state(app).pop(session_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -500,7 +500,9 @@ async def chat_completions(request: Request) -> Response:
 
         proxy_preamble: list[str] = []
         if entry is not None:
-            replaced_fields = list(entry.values.keys())
+            # Only report fields actually forwarded to the model — the
+            # dream payload carries a subset of the R11 profile set.
+            replaced_fields = [f for f in entry.values if f in payload]
             params_replaced_payload = {
                 "kind": "params_replaced",
                 "ts": int(time.time()),
@@ -1149,7 +1151,6 @@ async def _event_stream(
                 if choices else None
             )
             if finish_reason and pending_tool_calls:
-                from text_to_structured import _format_status
                 looped_indices: set[int] = set()
                 for idx, tc in pending_tool_calls.items():
                     sig = _tool_call_signature(tc)

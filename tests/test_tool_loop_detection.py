@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import types
 
+from typing import Any
+
 from routes import (
     _check_tool_loop,
-    _clear_tool_loop,
     _first_user_message_content,
+    _loop_state,
     _resolve_session_id,
     _tool_call_signature,
 )
@@ -93,14 +95,31 @@ class TestCheckToolLoop:
         _check_tool_loop("job-1", "exec:ls", app)
         assert _check_tool_loop("job-2", "exec:ls", app) is False
 
-    def test_clear_tool_loop_resets_state(self) -> None:
+    def test_eviction_drops_oldest_session(self, monkeypatch: Any) -> None:
+        """The LRU eviction must drop the session with the oldest
+        last_seen, not an arbitrary one.
+
+        Regression: the old code looked up ``last_seen`` in
+        ``_session_state`` — a different key space (bare first-message
+        hash vs full session_id/job_id) — so every lookup missed and
+        ``min()`` evicted the first key instead of the oldest session.
+        Here the first key (s1) has the NEWEST last_seen, so the two
+        behaviours pick different victims.
+        """
+        monkeypatch.setattr("routes._LOOP_DETECTION_MAX_JOBS", 2)
         app = _fresh_app()
-        _check_tool_loop("job-1", "exec:ls", app)
-        _check_tool_loop("job-1", "exec:ls", app)
-        _check_tool_loop("job-1", "exec:ls", app)
-        _clear_tool_loop("job-1", app)
-        # After clearing, the next call is fresh.
-        assert _check_tool_loop("job-1", "exec:ls", app) is False
+        _check_tool_loop("s1", "exec:ls", app)  # first key
+        _check_tool_loop("s2", "exec:ls", app)
+        state = _loop_state(app)
+        # Force distinct last_seen so eviction is deterministic.
+        state["s1"]["last_seen"] = 200.0  # newest
+        state["s2"]["last_seen"] = 100.0  # oldest
+        # Third session pushes past the cap → s2 (oldest) is evicted.
+        _check_tool_loop("s3", "exec:ls", app)
+        state = _loop_state(app)
+        assert "s1" in state
+        assert "s2" not in state
+        assert "s3" in state
 
     def test_handles_alternating_calls(self) -> None:
         app = _fresh_app()
@@ -136,7 +155,7 @@ class TestCheckToolLoop:
         # Same call with different grep pattern → different sig, not a
         # loop.  This matches the actual runaway pattern where the
         # model varies its grep patterns.
-        _clear_tool_loop("job-1", app)
+        app = _fresh_app()  # fresh state instead of the removed _clear_tool_loop
         v1 = 'exec:{"command":"cat /proc/self/status | grep NoNew"}'
         v2 = 'exec:{"command":"cat /proc/self/status | grep NoNewPrivs"}'
         for _ in range(2):

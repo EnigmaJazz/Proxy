@@ -325,3 +325,136 @@ async def test_native_tool_calls_not_double_emitted(dream_client: Any) -> None:
         f"tool_call arguments doubled or corrupted: {joined!r}"
     )
 
+
+@pytest.mark.asyncio
+async def test_dream_non_streaming_returns_json_chat_completion(
+    dream_client: Any,
+) -> None:
+    """A dream request with stream=false gets a JSON ChatCompletion, not SSE.
+
+    Regression: nanobot's dream/heartbeat cron calls the provider
+    non-streaming (stream: false), but the proxy always streamed SSE.
+    The OpenAI SDK then returned the raw SSE text as a plain string,
+    parsed zero tool_calls, and the agent loop executed nothing — the
+    memory files stayed untouched.  The collector must assemble one JSON
+    body with the model's content and per-index tool_calls.
+    """
+
+    class _ToolAndContentStream:
+        """Fake stream_llm yielding content plus a native structured tool call."""
+
+        async def __call__(
+            self,
+            *,
+            endpoint: str,
+            payload: dict[str, Any],
+            port: int = 0,
+            headers: Optional[dict[str, Any]] = None,
+            **kwargs: Any,
+        ) -> Any:
+            yield {
+                "model": "professional",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "content": "I will check the file.",
+                    },
+                    "finish_reason": None,
+                }],
+            }
+            yield {
+                "model": "professional",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_abc123",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": "{\"path\":",
+                            },
+                        }],
+                    },
+                    "finish_reason": None,
+                }],
+            }
+            yield {
+                "model": "professional",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "function": {"arguments": "\"/a.txt\"}"},
+                        }],
+                    },
+                    "finish_reason": None,
+                }],
+            }
+            yield {
+                "model": "professional",
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "tool_calls",
+                }],
+            }
+
+    stream = _ToolAndContentStream()
+    with patch("routes.stream_llm", new=stream), \
+         patch("routes.is_dream_process", new=AsyncMock(return_value=True)):
+        resp = await dream_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "auto",
+                "messages": [{"role": "user", "content": "consolidate memory"}],
+                "stream": False,
+                "tools": [
+                    {"type": "function", "function": {"name": "read_file"}},
+                ],
+            },
+        )
+
+    assert resp.status_code == 200
+    assert "text/event-stream" not in resp.headers.get("content-type", "")
+    body = resp.json()
+    assert body["object"] == "chat.completion"
+    assert body["model"] == "professional"
+    choice = body["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["content"] == "I will check the file."
+    calls = choice["message"]["tool_calls"]
+    assert len(calls) == 1
+    assert calls[0]["id"] == "call_abc123"
+    assert calls[0]["function"]["name"] == "read_file"
+    assert calls[0]["function"]["arguments"] == '{"path":"/a.txt"}'
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_still_streams_by_default(dream_client: Any) -> None:
+    """Clients that omit ``stream`` keep the existing SSE behavior.
+
+    The proxy's SSE-always contract must not change for clients that do
+    not send the field (OpenAI's default is false, but this proxy
+    historically returns SSE and every working client relies on it).
+    """
+    capture = _StreamCapture()
+    with patch("routes.stream_llm", new=capture), \
+         patch("routes.is_dream_process", new=AsyncMock(return_value=True)):
+        resp = await dream_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "auto",
+                "messages": [{"role": "user", "content": "extract facts"}],
+                # no "stream" key at all
+            },
+        )
+
+    assert resp.status_code == 200
+    assert "text/event-stream" in resp.headers.get("content-type", "")
+    assert _params_replaced(_parse_sse_events(resp.text))["model"] == "professional"
+

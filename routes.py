@@ -27,7 +27,7 @@ import uuid
 import httpx
 from typing import TYPE_CHECKING, Any, AsyncIterator, Optional
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse, JSONResponse
 
 from constants import (
@@ -293,7 +293,7 @@ async def list_models(request: Request) -> JSONResponse:
 # POST /v1/chat/completions
 # ---------------------------------------------------------------------------
 
-async def chat_completions(request: Request) -> StreamingResponse:
+async def chat_completions(request: Request) -> Response:
     """
     OpenAI-compatible chat completions endpoint.
 
@@ -326,6 +326,13 @@ async def chat_completions(request: Request) -> StreamingResponse:
 
     requested_model = body.get("model", "auto").lower()
     tools = body.get("tools", None)
+    # The proxy always streams to llama.cpp internally, but a client that
+    # requested ``stream: false`` expects a JSON ChatCompletion body back
+    # (OpenAI non-streaming semantics).  nanobot's dream/heartbeat cron
+    # calls the provider non-streaming, so without this the OpenAI SDK
+    # would receive raw SSE text as the assistant message and parse zero
+    # tool_calls.  See ``_collect_chat_completion``.
+    client_stream = bool(body.get("stream", True))
     temperature = body.get("temperature", 0.7)
     top_p = body.get("top_p", 1.0)
     max_tokens = body.get("max_tokens", 4096)
@@ -507,16 +514,21 @@ async def chat_completions(request: Request) -> StreamingResponse:
         from cooling import CoolingStateMachine
         hardware_path = CoolingStateMachine.hardware_path_for_model("professional")
         session_id = _resolve_session_id(processed_messages, request.app)
+        stream_gen = _event_stream_with_model_startup(
+            state=state, app=request.app, route=route, payload=payload, fwd_headers={},
+            job_id=job_id, project_id="soul",
+            processed_messages=processed_messages,
+            requested_model="professional",
+            hardware_path=hardware_path,
+            proxy_preamble=proxy_preamble,
+            session_id=session_id,
+        )
+        if not client_stream:
+            # Non-streaming client (e.g. nanobot dream/heartbeat): return
+            # a JSON ChatCompletion assembled from the SSE stream.
+            return JSONResponse(await _collect_chat_completion(stream_gen))
         return StreamingResponse(
-            _event_stream_with_model_startup(
-                state=state, app=request.app, route=route, payload=payload, fwd_headers={},
-                job_id=job_id, project_id="soul",
-                processed_messages=processed_messages,
-                requested_model="professional",
-                hardware_path=hardware_path,
-                proxy_preamble=proxy_preamble,
-                session_id=session_id,
-            ),
+            stream_gen,
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
@@ -862,22 +874,27 @@ async def chat_completions(request: Request) -> StreamingResponse:
         route.is_cpu_fallback,
     )
 
+    stream_gen = _event_stream_with_model_startup(
+        state=state,
+        app=request.app,
+        route=route,
+        payload=payload,
+        fwd_headers=fwd_headers,
+        job_id=job_id,
+        project_id=project_id,
+        processed_messages=processed_messages,
+        requested_model=requested_model,
+        hardware_path=hardware_path,
+        proxy_preamble=proxy_preamble,
+        client_named_model=client_named_model,
+        session_id=_resolve_session_id(processed_messages, request.app),
+    )
+    if not client_stream:
+        # Non-streaming client: return a JSON ChatCompletion assembled
+        # from the SSE stream (see ``_collect_chat_completion``).
+        return JSONResponse(await _collect_chat_completion(stream_gen))
     return StreamingResponse(
-        _event_stream_with_model_startup(
-            state=state,
-            app=request.app,
-            route=route,
-            payload=payload,
-            fwd_headers=fwd_headers,
-            job_id=job_id,
-            project_id=project_id,
-            processed_messages=processed_messages,
-            requested_model=requested_model,
-            hardware_path=hardware_path,
-            proxy_preamble=proxy_preamble,
-            client_named_model=client_named_model,
-            session_id=_resolve_session_id(processed_messages, request.app),
-        ),
+        stream_gen,
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -1150,7 +1167,10 @@ async def _event_stream(
                             "id": chunk.get("id"),
                             "object": "chat.completion.chunk",
                             "created": chunk.get("created"),
-                            "model": chunk.get("model"),
+                            # Proxy-injected UX (tool status), not model
+                            # output: mark it so non-streaming collectors
+                            # and clients can filter it out.
+                            "model": "proxy-system",
                             "system_fingerprint": chunk.get("system_fingerprint"),
                             "choices": [{
                                 "index": choices[0].get("index", 0),
@@ -1219,7 +1239,8 @@ async def _event_stream(
                         "id": chunk.get("id"),
                         "object": "chat.completion.chunk",
                         "created": chunk.get("created"),
-                        "model": chunk.get("model"),
+                        # Proxy-injected loop warning, not model output.
+                        "model": "proxy-system",
                         "system_fingerprint": chunk.get("system_fingerprint"),
                         "choices": [{
                             "index": choices[0].get("index", 0),
@@ -1439,6 +1460,106 @@ async def _event_stream_with_model_startup(
             logger.debug("Saved KV cache for project '%s' model '%s'", project_id, model_key)
         except httpx.HTTPError:
             logger.debug("Cache save failed for %s (non-critical)", cache_filename)
+
+
+async def _collect_chat_completion(
+    stream: AsyncIterator[str],
+) -> dict[str, Any]:
+    """
+    Collect the proxy's SSE event stream into a JSON ChatCompletion.
+
+    The proxy always streams internally (SSE), but a client that
+    requested ``stream: false`` expects one JSON body with OpenAI
+    non-streaming semantics.  Without this wrapper, the OpenAI SDK
+    receives the raw SSE text as a plain string, parses zero
+    tool_calls, and the agent loop executes nothing (the nanobot
+    dream/heartbeat failure).
+
+    Model content deltas are concatenated into ``message.content``,
+    streamed tool_calls are accumulated per index into
+    ``message.tool_calls``, and proxy-injected status chunks
+    (triage/loading/system) plus ``kinver.proxy.*`` preamble events are
+    filtered out — they are streaming UX, not model output.  An error
+    chunk in the stream is surfaced as an OpenAI-shaped error body.
+    """
+    content_parts: list[str] = []
+    tool_calls: dict[int, dict[str, Any]] = {}
+    finish_reason: Optional[str] = None
+    usage: Optional[dict[str, Any]] = None
+    model_name = "proxy"
+    error: Optional[dict[str, Any]] = None
+
+    async for raw in stream:
+        for line in raw.splitlines():
+            if not line.startswith("data: "):
+                continue
+            try:
+                obj = json.loads(line[len("data: "):])
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(obj, dict):
+                continue
+            if "error" in obj:
+                error = obj["error"]
+                continue
+            # Accept any chunk carrying a ``choices`` list.  Native model
+            # chunks are relayed verbatim and may omit the ``object``
+            # field, so keying on ``object == "chat.completion.chunk"``
+            # would silently drop their tool_calls.
+            if not isinstance(obj.get("choices"), list):
+                continue
+            if obj.get("model") == "proxy-system":
+                continue
+            model_name = obj.get("model", model_name)
+            for choice in obj.get("choices") or []:
+                delta = choice.get("delta") or {}
+                if delta.get("content"):
+                    content_parts.append(delta["content"])
+                for tc in delta.get("tool_calls") or []:
+                    idx = tc.get("index", 0)
+                    slot = tool_calls.setdefault(idx, {
+                        "id": "",
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    })
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        slot["function"]["name"] = fn["name"]
+                    if fn.get("arguments"):
+                        slot["function"]["arguments"] += fn["arguments"]
+                if choice.get("finish_reason"):
+                    finish_reason = choice["finish_reason"]
+            if "usage" in obj:
+                usage = obj["usage"]
+
+    if error is not None:
+        return {"error": error}
+
+    message: dict[str, Any] = {
+        "role": "assistant",
+        "content": "".join(content_parts),
+    }
+    if tool_calls:
+        message["tool_calls"] = [
+            tool_calls[idx] for idx in sorted(tool_calls)
+        ]
+
+    body: dict[str, Any] = {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model_name,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason or "stop",
+        }],
+    }
+    if usage is not None:
+        body["usage"] = usage
+    return body
 
 
 # ---------------------------------------------------------------------------

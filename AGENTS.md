@@ -22,7 +22,9 @@ project-specific.
 - `database.py` — SQLite job queue (enqueue/complete/fail/stream chunks)
 - `cooling.py` — CoolingStateMachine (CPU/GPU IPC files for fans)
 - `systemd.py` — model service discovery + hotswap
-- `tools.py` — tool registry, web search/fetch, FlashRank reranker
+- `tools/web_search.py` — native web search pipeline (SearXNG → Trafilatura → FlashRank)
+- `search_enrichment.py` — enrich thin frontend search_web results on the OUTBOUND copy
+- `tools.py` — legacy tool registry (shadowed by the `tools/` package; kept for reference)
 - `profile_loader.py` — ModelProfileTable (R17/R18)
 - `tools/sync_model_profiles.py` — filesystem-grounded profile scanner (R18)
 
@@ -41,6 +43,20 @@ project-specific.
    mutates the client's stored conversation or the DB audit copy, and is per-request
    opt-out via `X-Proxy-Context-Governance: off`. This is a mechanical budget
    optimization, not an intent alteration.
+
+   **Documented carve-out — search-result enrichment** (`proxy/search_enrichment.py`):
+   frontends own tool execution and often return thin `search_web` results (a JSON
+   array of `{title, link, snippet}`) that the model cannot answer from. When a
+   search-type tool result on the OUTBOUND copy is thin, the proxy MAY append its own
+   rich search (SearXNG + FlashRank + article scrape via `tools/web_search.py`) to
+   that result. It never replaces client content, never touches user or assistant
+   text, never mutates the client's stored conversation or the DB audit copy, fires
+   only for thin search-type results, is idempotent (an already-enriched result is
+   never re-enriched), and is per-request opt-out via
+   `X-Proxy-Search-Enrichment: off`. Failures degrade to the original result. This is
+   a content-availability fix for frontends whose own search returns thin snippets;
+   explicit user-approved extension of the R1 carve-out (2026-08-03, proxy-only
+   changes).
 
 2. **No payload injection in flight**: the proxy never injects synthetic assistant
    content deltas (triage/loading messages, audit overrides) into in-flight

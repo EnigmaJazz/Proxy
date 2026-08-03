@@ -47,6 +47,7 @@ from context_governance import (
     apply_context_governance,
     strip_proxy_status,
 )
+from search_enrichment import enrich_thin_search_results
 from llm import (
     stream_llm,
     openrouter_cloud_escalation,
@@ -321,6 +322,14 @@ async def _govern_messages(
     # Always strip proxy-owned status content (sentinel-prefixed) so the
     # model never sees its own triage/loading/tool-status echoed back.
     messages = strip_proxy_status(messages)
+    # Search-result enrichment (explicit user-approved R1 carve-out
+    # extension): frontends execute search_web themselves and often return
+    # thin SEO snippets; when that happens, append the proxy's own rich
+    # search (SearXNG + FlashRank + article scrape) to the thin tool result
+    # on the OUTBOUND copy so the model can answer from live data.  Opt out
+    # per request with ``X-Proxy-Search-Enrichment: off``.
+    if request.headers.get("x-proxy-search-enrichment", "").strip().lower() != "off":
+        messages = await enrich_thin_search_results(messages)
     header = request.headers.get("x-proxy-context-governance", "")
     if header.strip().lower() == "off":
         return messages

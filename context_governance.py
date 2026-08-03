@@ -323,8 +323,6 @@ def _snip_to_budget(
             m.get("role") == "user" for m in remaining[i + 1:]
         ):
             break  # never drop the last user turn
-        if not group:
-            break
         del remaining[i : i + len(group)]
         total -= group_tokens
     return remaining

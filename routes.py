@@ -1109,6 +1109,11 @@ async def _event_stream(
             # stripping the XML text from delta.content.
             if delta_content:
                 tts_emits = text_to_structured.feed(delta_content)
+                # When tts_emits is empty, the state machine held the
+                # content back because a tool call started but hasn't
+                # closed yet: emit nothing for this chunk, and the next
+                # chunk will produce the emit when the tool call
+                # completes.
                 # Emit each tts_emit as a separate SSE chunk, preserving
                 # the original chunk's other fields (id, model, role,
                 # reasoning_content, finish_reason).
@@ -1188,13 +1193,6 @@ async def _event_stream(
                 # Emit the original chunk verbatim (it has tool_calls
                 # or other fields that need to pass through).
                 yield f"data: {json.dumps(chunk)}\n\n"
-            else:
-                # delta_content was non-empty but produced no tts emits
-                # (e.g., content was held back because a tool call started
-                # but hasn't closed yet).  Don't emit anything for this
-                # chunk — the next chunk will produce the emit when the
-                # tool call completes.
-                pass
 
             # ---- Emit status messages for completed tool calls -----------
             # When the model sets finish_reason (any non-null value), all

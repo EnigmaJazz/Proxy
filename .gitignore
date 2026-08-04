@@ -1,4 +1,5 @@
 .env
+.gga
 .venv
 *.log
 background_queue.json

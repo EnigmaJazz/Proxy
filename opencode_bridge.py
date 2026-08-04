@@ -170,7 +170,7 @@ async def opencode_chat(
 async def opencode_escalation(stage: int, prompt: str) -> str:
     """Fallback for the queue worker when local tiers are exhausted.
 
-    Directs the user prompt to the opencode build agent instead of
+    Directs the user prompt to the opencode gentle-orchestrator agent
     OpenRouter.  ``stage`` is informational (passed through to logging).
     """
     logger.info("OpenCode escalation (stage=%d): %r", stage, prompt[:200])

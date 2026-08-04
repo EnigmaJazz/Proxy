@@ -514,7 +514,7 @@ async def chat_completions(request: Request) -> Response:
 
     # model: "opencode" — client picked the opencode bridge model.  This
     # bypasses llama routing entirely: the task goes to the headless
-    # opencode serve backend (build agent).
+    # opencode serve backend (gentle-orchestrator SDD agent).
     if requested_model in BRIDGE_MODEL_KEYS:
         return await _handle_opencode_request(processed_messages, client_stream)
 
@@ -1773,7 +1773,7 @@ async def _handle_opencode_request(
 async def _handle_opencode_command(user_text: str) -> StreamingResponse:
     """Handle the /opencode command embedded in a user prompt.
 
-    Directs the remaining text to the opencode agent (build), mirroring
+    Directs the remaining text to the opencode agent (gentle-orchestrator), mirroring
     the /cloud command flow.
     """
     task_text = _OPENCODE_RE.sub("", user_text, count=1).strip()

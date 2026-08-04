@@ -103,7 +103,7 @@ class TestOpenCodeChat:
             {"type": "reasoning", "text": "thinking..."},
             {"type": "step-finish", "text": None},
         ]
-        result = await opencode_chat("write a test", agent="build")
+        result = await opencode_chat("write a test", agent="gentle-orchestrator")
         assert result == "DONE"
         urls = [u for _, u in fake_client.calls]
         assert any(u.endswith("/session") for u in urls)
@@ -150,7 +150,7 @@ class TestEscalation:
     async def test_escalation_returns_chat_text(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        async def _fake_chat(text: str, *, agent: str = "build") -> str:
+        async def _fake_chat(text: str, *, agent: str = "gentle-orchestrator") -> str:
             return f"handled:{text}"
 
         monkeypatch.setattr(opencode_bridge, "opencode_chat", _fake_chat)
@@ -177,7 +177,7 @@ class TestRoutesOpenCode:
     ) -> None:
         from routes import _handle_opencode_request
 
-        async def _fake_chat(text: str, *, agent: str = "build") -> str:
+        async def _fake_chat(text: str, *, agent: str = "gentle-orchestrator") -> str:
             assert text == "write a test"
             return "BRIDGE_DONE"
 
@@ -197,7 +197,7 @@ class TestRoutesOpenCode:
     ) -> None:
         from routes import _handle_opencode_request
 
-        async def _fake_chat(text: str, *, agent: str = "build") -> str:
+        async def _fake_chat(text: str, *, agent: str = "gentle-orchestrator") -> str:
             return "STREAMED_DONE"
 
         monkeypatch.setattr("routes.opencode_chat", _fake_chat)
@@ -225,7 +225,7 @@ class TestRoutesOpenCode:
 
         captured: list[str] = []
 
-        async def _fake_chat(text: str, *, agent: str = "build") -> str:
+        async def _fake_chat(text: str, *, agent: str = "gentle-orchestrator") -> str:
             captured.append(text)
             return "CMD_DONE"
 
@@ -234,4 +234,4 @@ class TestRoutesOpenCode:
         text = await _drain_stream(resp)
         assert captured == ["implement the parser"]
         assert "CMD_DONE" in text
-        assert "OpenCode (build agent)" in text
+        assert "OpenCode (gentle-orchestrator agent)" in text

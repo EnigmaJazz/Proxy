@@ -160,9 +160,10 @@ OPENCODE_SERVE_URL: str = "http://127.0.0.1:18900"
 # must not rely on PATH resolution.
 OPENCODE_BIN: str = "~/.opencode/bin/opencode"
 
-# Agent used by the bridge for direct coding tasks (opencode's built-in
-# build agent has the full bash/edit/read/write toolset).
-OPENCODE_AGENT: str = "build"
+# Agent used by the bridge for coding tasks.  The Gentle AI SDD
+# orchestrator coordinates the full SDD cycle (and handles direct tasks)
+# instead of opencode's plain build agent.
+OPENCODE_AGENT: str = "gentle-orchestrator"
 
 # How long to wait for the opencode agent to finish a task.
 OPENCODE_SERVE_TIMEOUT: float = 600.0

@@ -147,6 +147,36 @@ ALL_MODEL_KEYS: tuple[str, ...] = tuple(
 )
 
 # ---------------------------------------------------------------------------
+# OpenCode bridge (routes requests to a headless opencode serve backend)
+# ---------------------------------------------------------------------------
+
+# Headless opencode serve backend (opencode_bridge.py).  A client that
+# picks model "opencode" (or embeds /opencode) directs the request to the
+# opencode agent instead of a local llama model.
+OPENCODE_SERVE_URL: str = "http://127.0.0.1:18900"
+
+# Absolute path to the opencode binary.  systemd services run with a
+# minimal PATH that does not include ~/.opencode/bin, so the bridge spawn
+# must not rely on PATH resolution.
+OPENCODE_BIN: str = "~/.opencode/bin/opencode"
+
+# Agent used by the bridge for direct coding tasks (opencode's built-in
+# build agent has the full bash/edit/read/write toolset).
+OPENCODE_AGENT: str = "build"
+
+# How long to wait for the opencode agent to finish a task.
+OPENCODE_SERVE_TIMEOUT: float = 600.0
+
+# Bridge model keys exposed to clients, validated alongside ALL_MODEL_KEYS.
+# "opencode" routes to the opencode serve bridge instead of llama.cpp.
+BRIDGE_MODEL_KEYS: frozenset[str] = frozenset({"opencode"})
+
+# Queue-worker escalation backend after local tiers are exhausted:
+# "opencode" → headless opencode serve (build agent);
+# "openrouter" → legacy OpenRouter failover (llm.openrouter_cloud_escalation).
+CLOUD_ESCALATION_BACKEND: str = "opencode"
+
+# ---------------------------------------------------------------------------
 # Systemd service discovery
 # ---------------------------------------------------------------------------
 

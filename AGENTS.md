@@ -24,6 +24,7 @@ project-specific.
 - `systemd.py` — model service discovery + hotswap
 - `tools/web_search.py` — native web search pipeline (SearXNG → Trafilatura → FlashRank)
 - `search_enrichment.py` — enrich thin frontend search_web results on the OUTBOUND copy
+- `opencode_bridge.py` — route requests to a headless opencode serve backend (`model: "opencode"`, `/opencode`, queue-worker escalation)
 - `tools.py` — legacy tool registry (shadowed by the `tools/` package; kept for reference)
 - `profile_loader.py` — ModelProfileTable (R17/R18)
 - `tools/sync_model_profiles.py` — filesystem-grounded profile scanner (R18)

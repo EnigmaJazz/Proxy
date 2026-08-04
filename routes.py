@@ -35,10 +35,13 @@ from constants import (
     OPENAI_FORWARD_FIELDS,
     R11_AUTHORITY_FIELDS,
     ALL_MODEL_KEYS,
+    BRIDGE_MODEL_KEYS,
     CPU_MODELS,
     TOOL_KEYWORDS,
     _HEAVY_MODEL_KEYS,
     MODEL_LABELS,
+    OPENCODE_AGENT,
+    OPENCODE_SERVE_TIMEOUT,
     RUNTIME_CONTEXT_WINDOWS,
     get_logger,
 )
@@ -52,6 +55,7 @@ from llm import (
     stream_llm,
     openrouter_cloud_escalation,
 )
+from opencode_bridge import opencode_chat
 from routing import (
     RouteDecision,
     discriminate_caller,
@@ -76,6 +80,7 @@ logger = get_logger("proxy.routes")
 _PAUSE_RE = re.compile(r"(?i)\s*/pause(?:\s+(\d+))?\s*$")
 _RESUME_RE = re.compile(r"(?i)\s*/resume\s*$")
 _CLOUD_RE = re.compile(r"/cloud")
+_OPENCODE_RE = re.compile(r"/opencode")
 
 # ---------------------------------------------------------------------------
 # Tool-loop detection (defense in depth against model reasoning loops)
@@ -493,6 +498,17 @@ async def chat_completions(request: Request) -> Response:
     # /cloud
     if user_text and _CLOUD_RE.search(user_text.lower()):
         return await _handle_cloud_command(user_text)
+
+    # /opencode — direct the request to the opencode agent instead of a
+    # local model (the programmatic escape hatch for coding tasks).
+    if user_text and _OPENCODE_RE.search(user_text.lower()):
+        return await _handle_opencode_command(user_text)
+
+    # model: "opencode" — client picked the opencode bridge model.  This
+    # bypasses llama routing entirely: the task goes to the headless
+    # opencode serve backend (build agent).
+    if requested_model in BRIDGE_MODEL_KEYS:
+        return await _handle_opencode_request(processed_messages, client_stream)
 
     # ---- Dream/soul fast-path: bypass frontdesk, route to professional ----
     if is_dream:
@@ -1672,6 +1688,105 @@ async def _handle_cloud_command(user_text: str) -> StreamingResponse:
             "choices": [{
                 "index": 0,
                 "delta": {"content": cloud_resp},
+                "finish_reason": None,
+            }],
+        }
+        yield f"data: {json.dumps(chunk)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(_stream(), media_type="text/event-stream")
+
+
+# ---------------------------------------------------------------------------
+# OpenCode bridge handlers
+# ---------------------------------------------------------------------------
+
+async def _handle_opencode_request(
+    messages: list[dict[str, Any]],
+    client_stream: bool,
+) -> Response:
+    """Handle ``model: "opencode"`` — direct the task to the opencode agent.
+
+    Extracts the latest user message as the task text and runs it through
+    the headless opencode serve backend (``opencode_bridge.opencode_chat``).
+    Returns a streamed SSE response (or a JSON ChatCompletion for
+    non-streaming clients, mirroring the proxy's stream-omitted default).
+    """
+    task_text = ""
+    for msg in reversed(messages):
+        content = msg.get("content")
+        if msg.get("role") == "user" and isinstance(content, str) and content.strip():
+            task_text = content.strip()
+            break
+    if not task_text:
+        return JSONResponse(
+            {"error": "opencode model requires a user message"},
+            status_code=400,
+        )
+
+    async def _stream() -> AsyncIterator[str]:
+        status_msg = (
+            f"_⏳ [Proxy: Directing to OpenCode ({OPENCODE_AGENT} agent)...]_\n\n"
+        )
+        yield f"data: {json.dumps(_make_system_chunk(status_msg))}\n\n"
+        resp_text = await opencode_chat(task_text, agent=OPENCODE_AGENT)
+        chunk = {
+            "id": f"chatcmpl-{int(time.time())}",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": "opencode",
+            "choices": [{
+                "index": 0,
+                "delta": {"content": resp_text},
+                "finish_reason": None,
+            }],
+        }
+        yield f"data: {json.dumps(chunk)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    if client_stream:
+        return StreamingResponse(_stream(), media_type="text/event-stream")
+
+    resp_text = await opencode_chat(task_text, agent=OPENCODE_AGENT)
+    return JSONResponse({
+        "id": f"chatcmpl-{int(time.time())}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": "opencode",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": resp_text},
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    })
+
+
+async def _handle_opencode_command(user_text: str) -> StreamingResponse:
+    """Handle the /opencode command embedded in a user prompt.
+
+    Directs the remaining text to the opencode agent (build), mirroring
+    the /cloud command flow.
+    """
+    task_text = _OPENCODE_RE.sub("", user_text, count=1).strip()
+    if not task_text:
+        task_text = user_text.strip()
+
+    async def _stream() -> AsyncIterator[str]:
+        status_msg = (
+            f"_⏳ [Proxy: Routing concurrently to OpenCode ({OPENCODE_AGENT} agent)...]_\n\n"
+        )
+        yield f"data: {json.dumps(_make_system_chunk(status_msg))}\n\n"
+
+        resp_text = await opencode_chat(task_text, agent=OPENCODE_AGENT)
+        chunk = {
+            "id": f"chatcmpl-{int(time.time())}",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": "opencode",
+            "choices": [{
+                "index": 0,
+                "delta": {"content": resp_text},
                 "finish_reason": None,
             }],
         }

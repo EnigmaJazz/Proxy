@@ -88,6 +88,11 @@ from hardware import (
 from llm import (
     openrouter_cloud_escalation,
 )
+from opencode_bridge import (
+    ensure_opencode_serve,
+    opencode_escalation,
+)
+from constants import CLOUD_ESCALATION_BACKEND
 from profile_loader import load_model_profiles, ModelProfileTable
 
 # Route handlers (imported from routes.py)
@@ -242,6 +247,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         PROJECT_ROOT / "config" / "model_profiles.yaml"
     )
 
+    # ---- 5b. OpenCode serve backend (best-effort) --------------------------
+    # The bridge (model "opencode", /opencode, queue-worker escalation)
+    # needs a headless opencode serve listening on OPENCODE_SERVE_URL.
+    # Spawn it here when missing; never block startup on it.
+    if CLOUD_ESCALATION_BACKEND == "opencode":
+        await ensure_opencode_serve()
+
     # ---- 6. Background tasks -----------------------------------------------
     # Thermal monitor (reads sensors, enforces shutdown thresholds)
     thermal_task = asyncio.create_task(
@@ -372,7 +384,14 @@ async def queue_worker(state: AppState) -> None:
                 user_text = " ".join(
                     m["content"] for m in messages if m.get("role") == "user"
                 )
-                cloud_resp = await openrouter_cloud_escalation(failure_count, user_text)
+                if CLOUD_ESCALATION_BACKEND == "opencode":
+                    logger.info(
+                        "Job %s escalated to opencode (failure_count=%d, local exhausted)",
+                        job["id"], failure_count,
+                    )
+                    cloud_resp = await opencode_escalation(failure_count, user_text)
+                else:
+                    cloud_resp = await openrouter_cloud_escalation(failure_count, user_text)
                 await db.complete_job(
                     job["id"],
                     finish_reason="cloud_escalation",

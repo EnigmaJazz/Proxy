@@ -299,6 +299,14 @@ async def list_models(request: Request) -> JSONResponse:
         "owned_by": "proxy-orchestrator",
         "port": 0,
     })
+    # Bridge model keys (opencode serve backend) — pickable like any model.
+    for key in sorted(BRIDGE_MODEL_KEYS):
+        models.append({
+            "id": key,
+            "object": "model",
+            "owned_by": "opencode-bridge",
+            "port": 0,
+        })
     return JSONResponse({"object": "list", "data": models})
 
 

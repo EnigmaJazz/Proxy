@@ -2052,9 +2052,21 @@ async def _opencode_task_response(task_text: str, client_stream: bool) -> Respon
             f"_⏳ [Proxy: Directing to OpenCode ({OPENCODE_AGENT} agent)...]_\n\n"
         )
         yield f"data: {json.dumps(_make_system_chunk(status_msg))}\n\n"
-        async for text_delta in opencode_chat_stream(task_text, agent=OPENCODE_AGENT):
+        async for kind, text_delta in opencode_chat_stream(task_text, agent=OPENCODE_AGENT):
             if not text_delta:
                 continue
+            if kind == "text":
+                delta = {"content": text_delta}
+            elif kind == "reasoning":
+                # Thinking goes in the dedicated reasoning_content field so
+                # frontends distinguish it from the actual answer instead of
+                # mixing it into the visible message.
+                delta = {"reasoning_content": text_delta}
+            else:
+                # Status feedback (tool progress, keepalive): sentinel-
+                # prefixed content — visible inline, stripped from future
+                # model copies.
+                delta = {"content": f"{STATUS_SENTINEL}{text_delta}"}
             chunk = {
                 "id": f"chatcmpl-{int(time.time())}",
                 "object": "chat.completion.chunk",
@@ -2062,7 +2074,7 @@ async def _opencode_task_response(task_text: str, client_stream: bool) -> Respon
                 "model": "opencode",
                 "choices": [{
                     "index": 0,
-                    "delta": {"content": text_delta},
+                    "delta": delta,
                     "finish_reason": None,
                 }],
             }

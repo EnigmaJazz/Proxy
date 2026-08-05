@@ -226,9 +226,9 @@ class TestRoutesOpenCode:
         async def _fake_stream(
             text: str, *, agent: str = "gentle-orchestrator",
             model_id: Optional[str] = None, provider_id: str = "kinver",
-        ) -> AsyncIterator[str]:
-            yield "STREAMED_"
-            yield "DONE"
+        ) -> AsyncIterator[tuple[str, str]]:
+            yield ("text", "STREAMED_")
+            yield ("text", "DONE")
 
         monkeypatch.setattr("routes.opencode_chat_stream", _fake_stream)
         resp = await _handle_opencode_request(
@@ -327,8 +327,11 @@ class TestChatStream:
         monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
 
         deltas = [d async for d in opencode_chat_stream("task")]
-        joined = "".join(deltas)
-        # Reasoning streamed as sentinel-prefixed feedback; user echo excluded.
+        kinds = [k for k, _ in deltas]
+        joined = "".join(t for _, t in deltas)
+        # Reasoning streamed with its own kind; user echo excluded.
+        assert "reasoning" in kinds
+        assert "text" in kinds
         assert "think about it" in joined
         assert "the echoed prompt" not in joined
         # Both assistant messages' text streamed.
@@ -353,4 +356,5 @@ class TestChatStream:
         monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
 
         deltas = [d async for d in opencode_chat_stream("task")]
-        assert any("session HTTP 500" in d for d in deltas)
+        joined = "".join(t for _, t in deltas)
+        assert any("session HTTP 500" in t for _, t in deltas)

@@ -49,7 +49,11 @@ logger = get_logger("kinver.opencode_bridge")
 _BRIDGE_SYSTEM_PROMPT = (
     "You are an API-backed coding assistant reached through a proxy bridge. "
     "Respond in English unless the user's message is written in another "
-    "language. Keep the final answer concise and in English."
+    "language. Keep the final answer concise and in English.\n\n"
+    "This is a ONE-SHOT request: there is no interactive user who can answer "
+    "follow-up questions. Do NOT ask clarifying questions or stop to wait for "
+    "input — make reasonable assumptions, state them briefly, and complete "
+    "the task end to end."
 )
 
 # Quiet period after a finished step before the bridge considers the
@@ -200,10 +204,10 @@ async def opencode_chat_stream(
     the blocking message POST, so the caller sees the agent's output as it is
     generated rather than one blob after minutes.  Yields incremental text
     part content for the assistant message; returns when the session goes
-    idle.  On failure yields an error string (never raises).
+    idle.  Yields (kind, text) tuples: "text" → assistant content, "reasoning" → thinking (separate delta field), "status" → sentinel-prefixed feedback.  On failure yields a status tuple (never raises).
     """
     if not await ensure_opencode_serve():
-        yield "[OpenCode Bridge Failed: opencode serve not reachable.]"
+        yield ("status", "[OpenCode Bridge Failed: opencode serve not reachable.]")
         return
     async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
         try:
@@ -211,11 +215,11 @@ async def opencode_chat_stream(
                 f"{OPENCODE_SERVE_URL}/session", json={}, timeout=30.0,
             )
             if resp.status_code != 200:
-                yield f"[OpenCode Bridge Error: session HTTP {resp.status_code}]"
+                yield ("status", f"[OpenCode Bridge Error: session HTTP {resp.status_code}]")
                 return
             session_id = resp.json().get("id")
             if not session_id:
-                yield "[OpenCode Bridge Error: session created without id]"
+                yield ("status", "[OpenCode Bridge Error: session created without id]")
                 return
             payload: dict[str, Any] = {
                 "agent": agent,
@@ -245,7 +249,7 @@ async def opencode_chat_stream(
                     timeout=30.0,
                 )
                 if async_resp.status_code != 204:
-                    yield f"[OpenCode Bridge Error: prompt HTTP {async_resp.status_code}]"
+                    yield ("status", f"[OpenCode Bridge Error: prompt HTTP {async_resp.status_code}]")
                     return
 
                 # An agentic session can produce several assistant messages
@@ -269,7 +273,7 @@ async def opencode_chat_stream(
                             return
                         # Keep the client connection alive during long tool
                         # phases (and show the agent is still working).
-                        yield "\u200b⏳ still working…"
+                        yield ("status", "⏳ still working…")
                         continue
                     if not line.startswith("data: "):
                         continue
@@ -290,7 +294,7 @@ async def opencode_chat_stream(
                         elif role == "assistant" and asst_mid is None:
                             asst_mid = mid
                             if info.get("error"):
-                                yield f"[OpenCode Bridge Error: {info['error']}]"
+                                yield ("status", f"[OpenCode Bridge Error: {info['error']}]")
                                 return
                     elif etype == "message.part.updated":
                         part = props.get("part") or {}
@@ -309,7 +313,7 @@ async def opencode_chat_stream(
                             prev = text_lens.get(pid, 0)
                             if len(text) > prev:
                                 text_lens[pid] = len(text)
-                                yield text[prev:]
+                                yield ("text", text[prev:])
                         elif ptype == "reasoning":
                             # Live thinking feedback (sentinel-prefixed so it
                             # is visible inline but stripped from future
@@ -318,7 +322,7 @@ async def opencode_chat_stream(
                             prev = text_lens.get(pid, 0)
                             if len(text) > prev:
                                 text_lens[pid] = len(text)
-                                yield f"\u200b{text[prev:]}"
+                                yield ("reasoning", text[prev:])
                         elif ptype == "tool":
                             # Tool execution feedback: show each tool the
                             # agent runs (sentinel-prefixed status).  The
@@ -329,11 +333,11 @@ async def opencode_chat_stream(
                             if name and state != tool_state.get(name):
                                 tool_state[name] = state
                                 if state == "running":
-                                    yield f"\u200b🔧 {name}…"
+                                    yield ("status", f"🔧 {name}…")
                                 elif state == "completed":
-                                    yield f"\u200b✅ {name} done"
+                                    yield ("status", f"✅ {name} done")
         except (httpx.HTTPError, OSError, ValueError) as exc:
-            yield f"[OpenCode Bridge Network Error: {str(exc)}]"
+            yield ("status", f"[OpenCode Bridge Network Error: {str(exc)}]")
 
 
 # ---------------------------------------------------------------------------

@@ -2190,6 +2190,10 @@ async def _handle_opencode_command(user_text: str) -> StreamingResponse:
     Directs the remaining text to the opencode agent (gentle-orchestrator), mirroring
     the /cloud command flow.
     """
+    logger.info(
+        "opencode /opencode command: task=%r source_len=%d",
+        user_text[:160], len(user_text),
+    )
     task_text = _OPENCODE_RE.sub("", user_text, count=1).strip()
     if not task_text:
         task_text = user_text.strip()

@@ -50,10 +50,10 @@ _BRIDGE_SYSTEM_PROMPT = (
     "You are an API-backed coding assistant reached through a proxy bridge. "
     "Respond in English unless the user's message is written in another "
     "language. Keep the final answer concise and in English.\n\n"
-    "This is a ONE-SHOT request: there is no interactive user who can answer "
-    "follow-up questions. Do NOT ask clarifying questions or stop to wait for "
-    "input — make reasonable assumptions, state them briefly, and complete "
-    "the task end to end."
+    "The user CAN answer a follow-up question in their next message, so if "
+    "the task is genuinely ambiguous and the decision materially changes the "
+    "result, you may ask ONE clarifying question and stop.  Otherwise make "
+    "reasonable assumptions, state them briefly, and complete the task."
 )
 
 # Quiet period after a finished step before the bridge considers the
@@ -122,7 +122,10 @@ async def ensure_opencode_serve() -> bool:
             await asyncio.sleep(0.5)
             if await is_opencode_serve_running():
                 return True
-    except (OSError, asyncio.CancelledError) as exc:
+    except asyncio.CancelledError:
+        # Cancellation must propagate (never swallow it).
+        raise
+    except OSError as exc:
         logger.error("Failed to spawn opencode serve: %s", exc)
     return False
 
@@ -197,30 +200,53 @@ async def opencode_chat_stream(
     agent: str = OPENCODE_AGENT,
     model_id: Optional[str] = None,
     provider_id: str = "kinver",
-) -> AsyncIterator[str]:
-    """Stream a task through headless opencode, yielding assistant text live.
+    session_map: Optional[dict[str, str]] = None,
+    session_key: Optional[str] = None,
+) -> AsyncIterator[tuple[str, str]]:
+    """Stream a task through headless opencode, yielding assistant content live.
 
     Uses ``prompt_async`` (no-wait send) + the ``/event`` SSE bus instead of
     the blocking message POST, so the caller sees the agent's output as it is
-    generated rather than one blob after minutes.  Yields incremental text
-    part content for the assistant message; returns when the session goes
-    idle.  Yields (kind, text) tuples: "text" → assistant content, "reasoning" → thinking (separate delta field), "status" → sentinel-prefixed feedback.  On failure yields a status tuple (never raises).
+    generated rather than one blob after minutes.  When ``session_map`` +
+    ``session_key`` are given, the opencode session is pinned per conversation:
+    follow-ups reuse the SAME agent session (it keeps its tool state and
+    remembers what it built), and a clarifying question yields
+    ("question", text) and stops — the session stays pinned so the next
+    request can post the user's answer and continue.
+
+    Yields (kind, text) tuples: "text" → assistant content, "reasoning" →
+    thinking (separate delta field), "status" → sentinel-prefixed feedback,
+    "question" → the agent is waiting for user input (stop streaming).
+    On failure yields a status tuple (never raises).
     """
     if not await ensure_opencode_serve():
         yield ("status", "[OpenCode Bridge Failed: opencode serve not reachable.]")
         return
     async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
         try:
-            resp = await client.post(
-                f"{OPENCODE_SERVE_URL}/session", json={}, timeout=30.0,
+            session_id = (
+                session_map.get(session_key)
+                if session_map and session_key else None
             )
-            if resp.status_code != 200:
-                yield ("status", f"[OpenCode Bridge Error: session HTTP {resp.status_code}]")
-                return
-            session_id = resp.json().get("id")
-            if not session_id:
-                yield ("status", "[OpenCode Bridge Error: session created without id]")
-                return
+            if session_id:
+                # Follow-up in the same conversation: reuse the pinned agent
+                # session so it retains its tool state and context.
+                logger.info(
+                    "opencode bridge resuming pinned session %s", session_id[:16],
+                )
+            else:
+                resp = await client.post(
+                    f"{OPENCODE_SERVE_URL}/session", json={}, timeout=30.0,
+                )
+                if resp.status_code != 200:
+                    yield ("status", f"[OpenCode Bridge Error: session HTTP {resp.status_code}]")
+                    return
+                session_id = resp.json().get("id")
+                if not session_id:
+                    yield ("status", "[OpenCode Bridge Error: session created without id]")
+                    return
+                if session_map is not None and session_key:
+                    session_map[session_key] = session_id
             payload: dict[str, Any] = {
                 "agent": agent,
                 "system": _BRIDGE_SYSTEM_PROMPT,
@@ -322,13 +348,80 @@ async def opencode_chat_stream(
                             prev = text_lens.get(pid, 0)
                             if len(text) > prev:
                                 text_lens[pid] = len(text)
-                                yield ("reasoning", text[prev:])
+                                delta = text[prev:]
+                                if delta.strip():
+                                    yield ("reasoning", delta)
                         elif ptype == "tool":
                             # Tool execution feedback: show each tool the
                             # agent runs (sentinel-prefixed status).  The
                             # event schema: part["tool"] is the name and
-                            # part["state"] is a dict with a "type" key.
+                            # part["state"] is a dict with a "status" key.
                             name = str(part.get("tool") or "")
+                            if name == "question":
+                                # The agent is asking the user a clarifying
+                                # question.  Stream the question text (with
+                                # its options) and stop: the session stays
+                                # pinned so the next request can post the
+                                # user's answer.  The event's part often
+                                # omits the input, so fetch the persisted
+                                # part to read state.input.questions[].
+                                qtext = ""
+                                opts: list[str] = []
+                                state = part.get("state") or {}
+                                inp = state.get("input") if isinstance(state, dict) else None
+                                if isinstance(inp, dict):
+                                    questions = inp.get("questions")
+                                    if isinstance(questions, list) and questions:
+                                        q0 = questions[0]
+                                        if isinstance(q0, dict):
+                                            qtext = str(q0.get("question") or "")
+                                            opts = [
+                                                str(o.get("label") or "")
+                                                for o in (q0.get("options") or [])
+                                                if isinstance(o, dict) and o.get("label")
+                                            ]
+                                    else:
+                                        qtext = str(inp.get("question") or "")
+                                else:
+                                    qtext = str(inp or "")
+                                if not qtext:
+                                    logger.info(
+                                        "question event missing input; part=%s mid=%s",
+                                        (part.get("id") or "")[:16],
+                                        (part.get("messageID") or "")[:16],
+                                    )
+                                    # The question part's input is persisted
+                                    # a moment AFTER the event fires (race);
+                                    # retry the fetch briefly.
+                                    for _attempt in range(6):
+                                        try:
+                                            msg_resp = await client.get(
+                                                f"{OPENCODE_SERVE_URL}/session/{session_id}/message/{part.get('messageID')}",
+                                                timeout=10.0,
+                                            )
+                                            for p2 in (msg_resp.json().get("parts") or []):
+                                                if p2.get("id") == part.get("id") and isinstance(p2.get("state"), dict):
+                                                    i2 = (p2.get("state") or {}).get("input")
+                                                    if isinstance(i2, dict):
+                                                        qs = i2.get("questions")
+                                                        if isinstance(qs, list) and qs and isinstance(qs[0], dict):
+                                                            qtext = str(qs[0].get("question") or "")
+                                                            opts = [
+                                                                str(o.get("label") or "")
+                                                                for o in (qs[0].get("options") or [])
+                                                                if isinstance(o, dict) and o.get("label")
+                                                            ]
+                                                        else:
+                                                            qtext = str(i2.get("question") or "")
+                                        except (httpx.HTTPError, ValueError):
+                                            pass
+                                        if qtext:
+                                            break
+                                        await asyncio.sleep(0.3)
+                                if opts:
+                                    qtext = f"{qtext} (Options: {' | '.join(opts)})"
+                                yield ("question", qtext or "Could you clarify?")
+                                return
                             state = str((part.get("state") or {}).get("status") or "")
                             if name and state != tool_state.get(name):
                                 tool_state[name] = state

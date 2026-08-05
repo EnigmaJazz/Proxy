@@ -154,6 +154,19 @@ def _coding_decision_state(app: FastAPI) -> dict[str, str]:
     return state.coding_decisions
 
 
+def _opencode_session_state(app: FastAPI) -> dict[str, str]:
+    """Lazy accessor for the pinned opencode agent sessions on ``app.state``.
+
+    Keyed by proxy ``session_id`` → opencode session id.  Pinning lets a
+    follow-up request RESUME the same agent session (it keeps its tool state
+    and can answer clarifying questions), instead of starting fresh each time.
+    """
+    state = app.state
+    if not hasattr(state, "opencode_sessions"):
+        state.opencode_sessions = {}
+    return state.opencode_sessions
+
+
 def _find_coding_question_index(messages: list[dict[str, Any]]) -> Optional[int]:
     """Index of the PENDING coding-decision question.
 
@@ -710,8 +723,32 @@ async def chat_completions(request: Request) -> Response:
     # model: "opencode" — client picked the opencode bridge model.  This
     # bypasses llama routing entirely: the task goes to the headless
     # opencode serve backend (gentle-orchestrator SDD agent).
+    session_key = _resolve_session_id(processed_messages, request.app)
     if requested_model in BRIDGE_MODEL_KEYS:
-        return await _handle_opencode_request(processed_messages, client_stream)
+        return await _handle_opencode_request(
+            processed_messages,
+            client_stream,
+            session_map=_opencode_session_state(request.app),
+            session_key=session_key,
+        )
+
+    # Pinned opencode session continuation: a previous opencode task in
+    # THIS conversation ended with a clarifying question (or is still
+    # active).  Route the follow-up to the SAME agent session so it can
+    # answer the question / continue with the new instruction.
+    pinned = _opencode_session_state(request.app).get(session_key)
+    if pinned:
+        answer = _last_user_text(processed_messages)
+        logger.info(
+            "Resuming pinned opencode session for %s (answer=%r)",
+            session_key[:16], answer[:60],
+        )
+        return await _opencode_task_response(
+            answer or "continue",
+            client_stream,
+            session_map=_opencode_session_state(request.app),
+            session_key=session_key,
+        )
 
     # ---- Dream/soul fast-path: bypass frontdesk, route to professional ----
     if is_dream:
@@ -927,10 +964,7 @@ async def chat_completions(request: Request) -> Response:
             # keywords.  Treat them as CODE so they continue on the
             # cached pathway (opencode or local) instead of dropping to
             # the plain chat model.
-            try:
-                session_id = _resolve_session_id(processed_messages, request.app)
-            except Exception:
-                session_id = None
+            session_id = _resolve_session_id(processed_messages, request.app)
             if session_id and session_id in _coding_decision_state(request.app):
                 logger.info(
                     "Cached coding decision — treating follow-up as CODE",
@@ -2033,13 +2067,22 @@ async def _handle_cloud_command(user_text: str) -> StreamingResponse:
 # OpenCode bridge handlers
 # ---------------------------------------------------------------------------
 
-async def _opencode_task_response(task_text: str, client_stream: bool) -> Response:
+async def _opencode_task_response(
+    task_text: str,
+    client_stream: bool,
+    session_map: Optional[dict[str, str]] = None,
+    session_key: Optional[str] = None,
+) -> Response:
     """Run a task through the opencode bridge and return the response.
 
     Streams an SSE response (or a JSON ChatCompletion for non-streaming
     clients, mirroring the proxy's stream-omitted default).  Shared by the
-    ``model: "opencode"`` route, the ``/opencode`` command, and the
-    coding-decision gate.
+    ``model: "opencode"`` route, the ``/opencode`` command, the
+    coding-decision gate, and pinned-session continuations.
+
+    When ``session_map``/``session_key`` are given the opencode agent session
+    is pinned per conversation so follow-ups resume the same agent (it keeps
+    its state and can answer clarifying questions).
     """
     if not task_text:
         return JSONResponse(
@@ -2052,7 +2095,13 @@ async def _opencode_task_response(task_text: str, client_stream: bool) -> Respon
             f"_⏳ [Proxy: Directing to OpenCode ({OPENCODE_AGENT} agent)...]_\n\n"
         )
         yield f"data: {json.dumps(_make_system_chunk(status_msg))}\n\n"
-        async for kind, text_delta in opencode_chat_stream(task_text, agent=OPENCODE_AGENT):
+        async for kind, text_delta in opencode_chat_stream(
+            task_text,
+            agent=OPENCODE_AGENT,
+            session_map=session_map,
+            session_key=session_key,
+        ):
+            stop_after = False
             if not text_delta:
                 continue
             if kind == "text":
@@ -2062,6 +2111,13 @@ async def _opencode_task_response(task_text: str, client_stream: bool) -> Respon
                 # frontends distinguish it from the actual answer instead of
                 # mixing it into the visible message.
                 delta = {"reasoning_content": text_delta}
+            elif kind == "question":
+                # The agent is asking a clarifying question: emit it as the
+                # visible content and END the stream.  The opencode session
+                # stays pinned, so the user's next reply resumes the same
+                # agent (see the pinned-session continuation routing).
+                delta = {"content": text_delta}
+                stop_after = True
             else:
                 # Status feedback (tool progress, keepalive): sentinel-
                 # prefixed content — visible inline, stripped from future
@@ -2079,6 +2135,8 @@ async def _opencode_task_response(task_text: str, client_stream: bool) -> Respon
                 }],
             }
             yield f"data: {json.dumps(chunk)}\n\n"
+            if stop_after:
+                break
         yield "data: [DONE]\n\n"
 
     if client_stream:
@@ -2102,6 +2160,8 @@ async def _opencode_task_response(task_text: str, client_stream: bool) -> Respon
 async def _handle_opencode_request(
     messages: list[dict[str, Any]],
     client_stream: bool,
+    session_map: Optional[dict[str, str]] = None,
+    session_key: Optional[str] = None,
 ) -> Response:
     """Handle ``model: "opencode"`` — direct the task to the opencode agent.
 
@@ -2115,7 +2175,12 @@ async def _handle_opencode_request(
         "opencode bridge request: task=%r msgs=%d",
         task_text[:160], len(messages),
     )
-    return await _opencode_task_response(task_text, client_stream)
+    return await _opencode_task_response(
+        task_text,
+        client_stream,
+        session_map=session_map,
+        session_key=session_key,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2206,7 +2271,10 @@ async def _apply_coding_decision_gate(
         task_messages = messages[:question_idx]  # task = convo up to the question
         if decision == "opencode":
             return await _opencode_task_response(
-                _last_user_text(task_messages), client_stream,
+                _last_user_text(task_messages),
+                client_stream,
+                session_map=_opencode_session_state(app),
+                session_key=session_id,
             )
         # professional: drop the question + answer; the flow continues to
         # the local code pathway with the original task as the last turn.
@@ -2218,7 +2286,12 @@ async def _apply_coding_decision_gate(
     if route.intent == "CODE" and not has_tool_calls:
         decision = decisions.get(session_id)
         if decision == "opencode":
-            return await _opencode_task_response(_last_user_text(messages), client_stream)
+            return await _opencode_task_response(
+                _last_user_text(messages),
+                client_stream,
+                session_map=_opencode_session_state(app),
+                session_key=session_id,
+            )
         if decision is None:
             question = (
                 f"{_CODING_QUESTION_PREFIX} Coding task detected — route to OpenCode "

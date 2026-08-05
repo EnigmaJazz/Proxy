@@ -226,6 +226,8 @@ class TestRoutesOpenCode:
         async def _fake_stream(
             text: str, *, agent: str = "gentle-orchestrator",
             model_id: Optional[str] = None, provider_id: str = "kinver",
+            session_map: Optional[dict[str, str]] = None,
+            session_key: Optional[str] = None,
         ) -> AsyncIterator[tuple[str, str]]:
             yield ("text", "STREAMED_")
             yield ("text", "DONE")

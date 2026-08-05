@@ -56,6 +56,9 @@ _BRIDGE_SYSTEM_PROMPT = (
 # agentic session complete (the final summary message follows the last
 # tool step within milliseconds; a step-finish alone is not the end).
 _EVENT_QUIET_TIMEOUT: float = 8.0
+# Faster quiet threshold once a step has finished: the next message (or
+# the end) arrives within milliseconds, so 3s of silence means done.
+_EVENT_FINAL_TIMEOUT: float = 3.0
 
 # Sentinel-prefixed proxy status the opencode client accumulates into the
 # assistant text (the proxy emits triage as the first SSE chunk).  The
@@ -255,13 +258,18 @@ async def opencode_chat_stream(
                 while True:
                     try:
                         line = await asyncio.wait_for(
-                            anext(ev_iter), timeout=_EVENT_QUIET_TIMEOUT,
+                            anext(ev_iter),
+                            timeout=_EVENT_FINAL_TIMEOUT if pending_done
+                            else _EVENT_QUIET_TIMEOUT,
                         )
                     except StopAsyncIteration:
                         return
                     except asyncio.TimeoutError:
                         if pending_done:
                             return
+                        # Keep the client connection alive during long tool
+                        # phases (and show the agent is still working).
+                        yield "\u200b⏳ still working…"
                         continue
                     if not line.startswith("data: "):
                         continue
@@ -313,14 +321,17 @@ async def opencode_chat_stream(
                                 yield f"\u200b{text[prev:]}"
                         elif ptype == "tool":
                             # Tool execution feedback: show each tool the
-                            # agent runs (sentinel-prefixed status).
-                            call = part.get("call") or {}
-                            name = str(call.get("name") or part.get("state") or "")
-                            state = str(part.get("state") or "")
+                            # agent runs (sentinel-prefixed status).  The
+                            # event schema: part["tool"] is the name and
+                            # part["state"] is a dict with a "type" key.
+                            name = str(part.get("tool") or "")
+                            state = str((part.get("state") or {}).get("status") or "")
                             if name and state != tool_state.get(name):
                                 tool_state[name] = state
                                 if state == "running":
                                     yield f"\u200b🔧 {name}…"
+                                elif state == "completed":
+                                    yield f"\u200b✅ {name} done"
         except (httpx.HTTPError, OSError, ValueError) as exc:
             yield f"[OpenCode Bridge Network Error: {str(exc)}]"
 

@@ -82,3 +82,26 @@ async def test_enqueue_job_slugs_display_name(db: Database) -> None:
     job = await db.get_job(job_id)
     assert job is not None
     assert job["project_id"] == "my-project"
+
+
+@pytest.mark.asyncio
+async def test_cancel_job_marks_cancelled_and_removes_from_pending(db: Database) -> None:
+    """A client-cancelled job must be excluded from the pending set and
+    must NOT count as a failure (no failure_count bump → no escalation).
+    """
+    job_id = await db.enqueue_job(
+        messages_json="[]",
+        priority=1,
+        intent="CODE",
+        project_id="general",
+    )
+    await db.cancel_job(job_id, reason="client_cancelled")
+
+    job = await db.get_job(job_id)
+    assert job is not None
+    assert job["state"] == "cancelled"
+    assert job["finish_reason"] == "client_cancelled"
+    assert job["failure_count"] == 0
+
+    pending = await db.get_pending_jobs()
+    assert all(j["id"] != job_id for j in pending)

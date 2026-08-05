@@ -18,6 +18,7 @@ Maintainers: James Stansfield
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import re
@@ -170,13 +171,29 @@ def _find_coding_question_index(messages: list[dict[str, Any]]) -> Optional[int]
 def _parse_coding_answer(text: str) -> str:
     """Map the user's reply to a routing decision.
 
-    ``"opencode"`` when the reply mentions opencode; otherwise the safe
-    default ``"professional"`` (the local code pathway).
+    ``"opencode"`` when the reply mentions opencode; ``"cancel"`` when it
+    aborts the task; otherwise the safe default ``"professional"`` (the
+    local code pathway).
     """
     lowered = (text or "").strip().lower()
+    if _is_cancel_answer(lowered):
+        return "cancel"
     if any(k in lowered for k in ("opencode", "/opencode")):
         return "opencode"
     return "professional"
+
+
+def _is_cancel_answer(text: str) -> bool:
+    """True when the reply aborts the pending coding task.
+
+    Exact-match on short abort phrases so a longer reply that merely
+    contains "stop" is not treated as a cancellation.
+    """
+    lowered = (text or "").strip().lower().rstrip(".!")
+    return lowered in (
+        "cancel", "cancel it", "cancel that", "never mind",
+        "nevermind", "abort", "stop", "stop it", "forget it",
+    )
 
 
 def _last_user_text(messages: list[dict[str, Any]]) -> str:
@@ -1293,6 +1310,10 @@ async def _event_stream(
     if not mid_tool_flow:
         yield _make_status_chunk(triage_msg, kind="triage")
 
+    # Terminal outcome of this stream: completed | failed | cancelled.
+    # Stays "unknown" if the generator is closed early (client disconnect
+    # delivered as GeneratorExit) so the finally block can mark the job.
+    outcome = "unknown"
     try:
         async for chunk in stream_llm(
             endpoint=route.model_key,
@@ -1533,6 +1554,7 @@ async def _event_stream(
                 pending_tool_calls = {}
 
         # ---- Stream completed successfully ----------------------------------
+        outcome = "completed"
         if db:
             await db.complete_job(
                 job_id,
@@ -1553,7 +1575,25 @@ async def _event_stream(
     # stream boundary: every stream error must be converted to a
     # client-visible SSE error chunk below. Narrowing this would silently
     # truncate client streams on unexpected bugs.
+    except asyncio.CancelledError:
+        # Client aborted the request (Stop button / task cancellation).
+        # Clean up the job so it is not left 'active' and re-processed on
+        # restart, then re-raise so the cancellation propagates and the
+        # stream actually stops.  The finally block resets cooling.
+        # NOTE: awaiting inside a CancelledError handler is interrupted by
+        # a re-delivered CancelledError, so the DB write must be shielded
+        # and its re-raised cancellation suppressed — otherwise the job is
+        # left in whatever state the queue worker's skip-mark set.
+        outcome = "cancelled"
+        logger.info("Job %s cancelled by client", job_id)
+        if db:
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.shield(
+                    db.cancel_job(job_id, reason="client_cancelled")
+                )
+        raise
     except Exception as exc:
+        outcome = "failed"
         logger.exception("Stream error for job %s: %s", job_id, exc)
         if db:
             await db.fail_job(job_id)
@@ -1568,6 +1608,16 @@ async def _event_stream(
         yield "data: [DONE]\n\n"
 
     finally:
+        # ---- Client-disconnect fallback -------------------------------------
+        # Some frameworks deliver a disconnect as GeneratorExit (the
+        # generator is closed) instead of task cancellation.  Neither the
+        # CancelledError nor the generic handler catches GeneratorExit, so
+        # detect it here: if the stream never reached a terminal outcome,
+        # the client went away mid-flight — mark the job cancelled.
+        if outcome == "unknown" and db:
+            logger.info("Job %s aborted (stream closed early)", job_id)
+            await db.cancel_job(job_id, reason="client_cancelled")
+
         # ---- Baseline cooling -----------------------------------------------
         if cooler:
             cooler.baseline_idle()
@@ -2056,6 +2106,13 @@ async def _apply_coding_decision_gate(
     if question_idx is not None:
         answer_text = _last_user_text(messages)
         decision = _parse_coding_answer(answer_text)
+        if decision == "cancel":
+            # The user aborted the coding task without choosing a route.
+            # Do NOT cache a decision — the next coding task prompts again.
+            logger.info("Coding decision for session %s: cancelled", session_id)
+            return await _plain_completion(
+                "⚡ Task cancelled.", client_stream,
+            )
         decisions[session_id] = decision
         logger.info("Coding decision for session %s: %s", session_id, decision)
         task_messages = messages[:question_idx]  # task = convo up to the question

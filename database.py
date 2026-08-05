@@ -327,6 +327,22 @@ class Database:
             logger.warning("Job %s failed (failure_count=%d)", job_id, new_count)
             return new_count
 
+    async def cancel_job(self, job_id: str, reason: str = "cancelled") -> None:
+        """Mark a job as cancelled (client aborted the in-flight request).
+
+        Sets state to 'cancelled' so it is never picked up by the queue
+        worker or re-processed on restart.  Does NOT increment
+        failure_count — a user abort is not a failure.
+        """
+        async with self._write_lock:
+            await self._conn.execute(
+                "UPDATE jobs SET state = 'cancelled', finish_reason = ?, "
+                "completed_at = ? WHERE id = ?",
+                (reason, self._now_iso(), job_id),
+            )
+            await self._conn.commit()
+            logger.info("Job %s cancelled (%s)", job_id, reason)
+
     async def escalate_job(self, job_id: str, new_tier: str) -> None:
         """
         Update the job's current model tier and reset state to 'queued'

@@ -102,6 +102,13 @@ class TestParsers:
         assert _parse_coding_answer("yes") == "professional"
         assert _parse_coding_answer("") == "professional"
 
+    def test_parse_answer_cancel(self) -> None:
+        assert _parse_coding_answer("cancel") == "cancel"
+        assert _parse_coding_answer("stop") == "cancel"
+        assert _parse_coding_answer("never mind") == "cancel"
+        # A longer reply containing "stop" is NOT a cancellation.
+        assert _parse_coding_answer("stop and route to local") == "professional"
+
     def test_gibberish_guard(self) -> None:
         assert _looks_like_gibberish("asdfghjkl12345!!!@@@") is True
         assert _looks_like_gibberish("asdfghjkl") is True
@@ -226,6 +233,45 @@ class TestCodingDecisionGate:
         # question + answer were dropped from the model copy.
         assert capture.payload is not None
         assert capture.payload["messages"][-1]["content"] == "write a parser"
+
+    @pytest.mark.asyncio
+    async def test_decision_answer_cancel_aborts_without_routing(self, gate_client) -> None:
+        """Answering "cancel" to the coding question aborts the task: no
+        bridge call, no model call, and no cached decision (the next coding
+        task prompts again).
+        """
+        capture = _StreamCapture()
+        with patch("routes.stream_llm", new=capture), \
+             patch(
+                 "routes.classify_with_frontdesk",
+                 new=AsyncMock(return_value=_classification()),
+             ), \
+             patch(
+                 "routes.opencode_chat",
+                 new=AsyncMock(return_value="SHOULD_NOT_RUN"),
+             ):
+            response = await gate_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "auto",
+                    "messages": [
+                        {"role": "user", "content": "write a parser"},
+                        {"role": "assistant", "content": QUESTION},
+                        {"role": "user", "content": "cancel"},
+                    ],
+                    "stream": False,
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            body = response.json()
+
+        assert "Task cancelled" in body["choices"][0]["message"]["content"]
+        assert capture.payload is None  # no model call
+        # The decision was NOT cached — the next coding task prompts again.
+        sid = _resolve_session_id(
+            [{"role": "user", "content": "write a parser"}], proxy.app
+        )
+        assert sid not in _coding_decision_state(proxy.app)
 
     @pytest.mark.asyncio
     async def test_cached_decision_skips_prompt(self, gate_client) -> None:
@@ -504,3 +550,152 @@ class TestFactualKeywordHeuristic:
         # (NoOp returns a miss) and the store fires on completion without
         # crashing (NoOp cache_store no-ops).  The request reached the model.
         assert capture.payload is not None
+
+
+# ---------------------------------------------------------------------------
+# Client-disconnect cancellation (_event_stream CancelledError handler)
+# ---------------------------------------------------------------------------
+
+class _CancelDb:
+    """Fake database recording completion/cancellation calls."""
+
+    def __init__(self) -> None:
+        self.cancelled: list[tuple[str, str]] = []
+        self.completed: list[tuple[str, str]] = []
+
+    async def complete_job(self, job_id: str, finish_reason: str = "stop", full_content: str = "") -> None:
+        self.completed.append((job_id, finish_reason))
+
+    async def cancel_job(self, job_id: str, reason: str = "cancelled") -> None:
+        self.cancelled.append((job_id, reason))
+
+    async def purge_stream_chunks(self, job_id: str) -> None:
+        pass
+
+    async def update_partial_content(self, job_id: str, content: str) -> None:
+        pass
+
+    async def record_stream_chunk(self, *args: Any) -> None:
+        pass
+
+
+class _CancelCooler:
+    def __init__(self) -> None:
+        self.baseline = 0
+
+    async def prefill_burst(self, path: str) -> None:
+        pass
+
+    def generation_hold(self, path: str) -> None:
+        pass
+
+    def baseline_idle(self) -> None:
+        self.baseline += 1
+
+
+class _CancelSystemd:
+    async def get_port(self, domain: str) -> int:
+        return 13109
+
+
+class TestClientDisconnectCancellation:
+    @pytest.mark.asyncio
+    async def test_cancelling_the_stream_marks_the_job_cancelled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When the client aborts (Stop button / disconnect), the generator
+        receives CancelledError: the job is marked cancelled (never left
+        'active' for the queue worker), cooling resets, and the cancellation
+        re-raises so the stream actually stops.
+        """
+        import asyncio
+        import types
+
+        from routes import _event_stream
+        from routing import RouteDecision
+
+        async def _endless_stream(**kwargs: Any) -> Any:
+            i = 0
+            while True:
+                yield {"choices": [{
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": f"chunk{i}"},
+                    "finish_reason": None,
+                }]}
+                i += 1
+                await asyncio.sleep(0.01)
+
+        monkeypatch.setattr("routes.stream_llm", _endless_stream)
+        db = _CancelDb()
+        cooler = _CancelCooler()
+        state = types.SimpleNamespace(
+            database=db, systemd=_CancelSystemd(), cooler=cooler,
+        )
+        route = RouteDecision(model_key="professional", port=13109, intent="CHAT")
+        gen = _event_stream(
+            state=state, app=state, route=route, payload={"messages": []},
+            fwd_headers={}, job_id="job-1", project_id="general",
+            processed_messages=[{"role": "user", "content": "x"}],
+            requested_model="auto", hardware_path="gpu",
+        )
+
+        async def consume() -> None:
+            async for _ in gen:
+                pass
+
+        task = asyncio.create_task(consume())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert db.cancelled == [("job-1", "client_cancelled")]
+        assert db.completed == []  # not marked completed, not failed
+        assert cooler.baseline == 1  # cooling reset in finally
+
+    @pytest.mark.asyncio
+    async def test_closing_the_stream_early_marks_the_job_cancelled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Some frameworks deliver a disconnect as GeneratorExit (the
+        generator is closed) rather than task cancellation.  The finally
+        fallback must catch that and mark the job cancelled.
+        """
+        import asyncio
+        import types
+
+        from routes import _event_stream
+        from routing import RouteDecision
+
+        async def _endless_stream(**kwargs: Any) -> Any:
+            while True:
+                yield {"choices": [{
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": "x"},
+                    "finish_reason": None,
+                }]}
+                await asyncio.sleep(0.01)
+
+        monkeypatch.setattr("routes.stream_llm", _endless_stream)
+        db = _CancelDb()
+        cooler = _CancelCooler()
+        state = types.SimpleNamespace(
+            database=db, systemd=_CancelSystemd(), cooler=cooler,
+        )
+        route = RouteDecision(model_key="professional", port=13109, intent="CHAT")
+        gen = _event_stream(
+            state=state, app=state, route=route, payload={"messages": []},
+            fwd_headers={}, job_id="job-2", project_id="general",
+            processed_messages=[{"role": "user", "content": "x"}],
+            requested_model="auto", hardware_path="gpu",
+        )
+
+        # Consume the triage chunk + one model chunk, then close the
+        # generator (GeneratorExit) mid-stream inside the try block.
+        await gen.__anext__()  # triage
+        await gen.__anext__()  # first model chunk
+        await gen.aclose()
+
+        assert db.cancelled == [("job-2", "client_cancelled")]
+        assert db.completed == []
+        assert cooler.baseline == 1

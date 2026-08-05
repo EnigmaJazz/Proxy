@@ -249,3 +249,4 @@ sdd/
 docs/
 .atl/.skill-registry.cache.json
 .atl/
+proxy.log.*

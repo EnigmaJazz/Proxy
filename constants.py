@@ -155,6 +155,12 @@ ALL_MODEL_KEYS: tuple[str, ...] = tuple(
 # opencode agent instead of a local llama model.
 OPENCODE_SERVE_URL: str = "http://127.0.0.1:18900"
 
+# Working directory for the headless opencode serve.  Deliberately OUTSIDE
+# the proxy repo: bridge sessions (gentle-orchestrator/build agents) write
+# files there, and running them in the repo polluted the proxy git tree
+# (stray artifacts + corrupt index objects).
+OPENCODE_WORKSPACE_DIR: str = "~/opencode-workspace"
+
 # Absolute path to the opencode binary.  systemd services run with a
 # minimal PATH that does not include ~/.opencode/bin, so the bridge spawn
 # must not rely on PATH resolution.

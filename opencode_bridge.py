@@ -24,6 +24,7 @@ assistant text.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 from typing import Any, Optional
 
@@ -34,6 +35,7 @@ from constants import (
     OPENCODE_BIN,
     OPENCODE_SERVE_TIMEOUT,
     OPENCODE_SERVE_URL,
+    OPENCODE_WORKSPACE_DIR,
     get_logger,
 )
 
@@ -79,6 +81,7 @@ async def ensure_opencode_serve() -> bool:
     if await is_opencode_serve_running():
         return True
     try:
+        os.makedirs(OPENCODE_WORKSPACE_DIR, exist_ok=True)
         port = OPENCODE_SERVE_URL.rsplit(":", 1)[-1]
         proc = await asyncio.create_subprocess_exec(
             OPENCODE_BIN,
@@ -88,6 +91,7 @@ async def ensure_opencode_serve() -> bool:
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
             start_new_session=True,
+            cwd=OPENCODE_WORKSPACE_DIR,
         )
         logger.info("Opened opencode serve (pid=%s) on %s", proc.pid, OPENCODE_SERVE_URL)
         # Wait briefly for the listener to come up.

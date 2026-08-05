@@ -310,6 +310,8 @@ async def opencode_chat_stream(
                             )
                         except (httpx.HTTPError, OSError):
                             pass
+                        if session_map is not None and session_key:
+                            session_map.pop(session_key, None)
                         yield ("status", "[OpenCode Bridge Error: timed out waiting for the agent]",)
                         return
                     try:

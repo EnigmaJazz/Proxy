@@ -50,6 +50,7 @@ from constants import (
     LOOP_LIMITS,
     ROUTE_MAP,
     _DREAM_FALLBACK_PHRASES,
+    _DREAM_SNIP_PHRASES,
     get_logger,
 )
 
@@ -158,6 +159,11 @@ async def is_dream_process(raw_text: str) -> bool:
         return False
 
     phrases = await asyncio.to_thread(_get_dream_phrases)
+    # Match against BOTH the phase1 template phrases and the in-repo SNIP
+    # variant set, so newer nanobot memory-consolidation formats (which
+    # annotate SNIP attributes instead of FILE/SKIP lines) are also routed
+    # as autonomous dreams instead of misrouted to the coding gate.
+    phrases = list(phrases) + list(_DREAM_SNIP_PHRASES)
     matches = 0
     for phrase in phrases:
         if phrase in raw_text:

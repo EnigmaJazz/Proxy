@@ -417,6 +417,19 @@ _DREAM_FALLBACK_PHRASES: list[str] = [
     "update memory files based on the analysis below",
 ]
 
+# SNIP-facts dream variant (nanobot memory consolidation): the newer
+# template asks to "extract key facts" and annotate SNIP attributes
+# (Signal, Novel, Important, Persistent) instead of the phase1 FILE/SKIP
+# lines above.  Matched in addition to the phase1 phrases so both dream
+# formats route to ARCHITECT (autonomous, no coding gate).
+_DREAM_SNIP_PHRASES: list[str] = [
+    "extract key facts from this conversation",
+    "annotate its memory attributes",
+    "only snip facts deserve",
+    "signal: would the user need to repeat this",
+    "persistent: still relevant after",
+]
+
 # Keywords that indicate a request likely needs tool access (web search,
 # file I/O, or system exec).  Over-detection is safe because TOOL-routed
 # requests reach the professional model, which handles plain chat fine.

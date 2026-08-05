@@ -666,7 +666,15 @@ async def chat_completions(request: Request) -> Response:
             continue
         line = f"[{role}]: {content}\n"
         if total_chars + len(line) > MAX_CONTEXT_CHARS:
-            break
+            if not context_messages:
+                # The newest message alone exceeds the budget.  Keep its
+                # head instead of returning an EMPTY dump: classification
+                # and the keyword heuristics must still see the real input
+                # (an empty dump was classified CHAT, skipping the coding
+                # gate and sending coding tasks to the chat model).
+                line = line[:MAX_CONTEXT_CHARS]
+            else:
+                break
         context_messages.insert(0, line)  # Prepend for chronological order
         total_chars += len(line)
 

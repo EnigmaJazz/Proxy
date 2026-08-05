@@ -47,6 +47,7 @@ from constants import (
     OPENROUTER_SITE_URL,
     OPENROUTER_SITE_NAME,
     PROMPTS_DIR,
+    PROJECT_ROOT,
     STOP_SEQS,
     MAX_RETRIES,
     RETRY_DELAY,
@@ -84,18 +85,25 @@ def load_role_prompt(role_name: str) -> str:
     """
     Load a role prompt from disk for proxy-internal use.
 
-    Reads ``~/kinver-hub/prompts/{role_name}.txt``.
-    Returns a generic fallback string if the file is not found.
+    Prefers the repo-local copy (``<repo>/prompts/{role_name}.txt`` —
+    versioned with the proxy), then falls back to the external
+    ``PROMPTS_DIR`` copy.  Returns a generic fallback string if neither
+    exists.
 
     IMPORTANT: This function is restricted to proxy-internal call sites.
     Do NOT use it to modify frontend-supplied messages.
     """
-    try:
-        prompt_path = os.path.join(PROMPTS_DIR, f"{role_name}.txt")
-        with open(prompt_path, "r") as f:
-            return f.read()
-    except FileNotFoundError:
-        return f"You are the {role_name} AI."
+    candidates = [
+        os.path.join(str(PROJECT_ROOT), "prompts", f"{role_name}.txt"),
+        os.path.join(PROMPTS_DIR, f"{role_name}.txt"),
+    ]
+    for prompt_path in candidates:
+        try:
+            with open(prompt_path, "r") as f:
+                return f.read()
+        except FileNotFoundError:
+            continue
+    return f"You are the {role_name} AI."
 
 
 # ---------------------------------------------------------------------------

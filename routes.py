@@ -2065,7 +2065,12 @@ async def _handle_opencode_request(
     Returns a streamed SSE response (or a JSON ChatCompletion for
     non-streaming clients, mirroring the proxy's stream-omitted default).
     """
-    return await _opencode_task_response(_last_user_text(messages), client_stream)
+    task_text = _last_user_text(messages)
+    logger.info(
+        "opencode bridge request: task=%r msgs=%d",
+        task_text[:160], len(messages),
+    )
+    return await _opencode_task_response(task_text, client_stream)
 
 
 # ---------------------------------------------------------------------------

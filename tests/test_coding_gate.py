@@ -541,6 +541,43 @@ class TestInvalidInputInterception:
         # Not intercepted — the model was called.
         assert capture.payload is not None
 
+    @pytest.mark.asyncio
+    async def test_mid_tool_flow_result_never_intercepted(self, gate_client) -> None:
+        """A tool-result continuation (short numeric/JSON result) must NOT
+        be intercepted as nonsense — the context dump legitimately looks
+        like noise but the professional is mid tool-chain.
+        """
+        capture = _StreamCapture()
+        with patch("routes.stream_llm", new=capture), \
+             patch(
+                 "routes.classify_with_frontdesk",
+                 new=AsyncMock(return_value=_classification("TOOL")),
+             ):
+            response = await gate_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "auto",
+                    "messages": [
+                        {"role": "user", "content": "what's 6 times 7"},
+                        {"role": "assistant", "content": "", "tool_calls": [
+                            {"id": "call_1", "type": "function", "function": {
+                                "name": "calculate",
+                                "arguments": '{"expr": "6*7"}',
+                            }},
+                        ]},
+                        {"role": "tool", "tool_call_id": "call_1", "content": "42"},
+                    ],
+                    "stream": True,
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            text = (await response.aread()).decode()
+
+        # The tool-result continuation went to the model — no nonsense
+        # interception mid-tool-chain.
+        assert capture.payload is not None
+        assert "couldn't understand" not in text
+
 
 # ---------------------------------------------------------------------------
 # Factual keyword heuristic (semantic cache feeding)

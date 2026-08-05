@@ -915,10 +915,15 @@ async def chat_completions(request: Request) -> Response:
     # is_valid is inconsistent); the ``is_valid`` signal additionally
     # catches pure-alpha mash like ``asdfghjkl``, guarded by the word-count
     # check so short-but-meaningful queries ("help") are never blocked.
-    if _is_deterministic_noise(user_text) or (
+    #
+    # Mid-tool-flow requests (last message is a tool call or tool result)
+    # are NEVER intercepted: their context dump includes tool results that
+    # can legitimately look like noise (short numbers, JSON, "True"), and
+    # intercepting would break an in-flight tool chain mid-stream.
+    if not has_tool_calls and (_is_deterministic_noise(user_text) or (
         classification.get("is_valid") is False
         and _looks_like_gibberish(user_text)
-    ):
+    )):
         logger.info(
             "Intercepting nonsense input (%r)",
             user_text[:60],

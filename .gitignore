@@ -247,3 +247,4 @@ sdd/
 # Local brainstorms and design scratch (kept in the working tree for
 # in-progress capture; tracked copies live in openspec/ as needed)
 docs/
+.atl/.skill-registry.cache.json

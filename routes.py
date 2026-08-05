@@ -673,24 +673,31 @@ async def chat_completions(request: Request) -> Response:
     user_text = "".join(context_messages).strip()
 
     # ---- Handle embedded commands -------------------------------------------
-    # /pause [minutes]
-    pause_match = _PAUSE_RE.search(user_text) if user_text else None
+    # Embedded commands (/pause, /resume, /cloud, /opencode) are only
+    # meaningful when the USER typed them in their LATEST message.  The
+    # context dump carries full conversation history, so matching against
+    # it would mis-route whenever history merely MENTIONS a command — e.g.
+    # a tool result containing file paths like ``.../.git/opencode`` or
+    # ``~/.opencode/bin/opencode`` matched the unanchored
+    # /opencode regex and routed every follow-up to the opencode bridge.
+    last_user = _last_user_text(processed_messages)
+    pause_match = _PAUSE_RE.search(last_user) if last_user else None
     if pause_match:
         duration_mins = int(pause_match.group(1)) if pause_match.group(1) else 60
         return await _handle_pause_command(duration_mins, state)
 
     # /resume
-    if user_text and _RESUME_RE.search(user_text):
+    if last_user and _RESUME_RE.search(last_user):
         return await _handle_resume_command(state)
 
     # /cloud
-    if user_text and _CLOUD_RE.search(user_text.lower()):
-        return await _handle_cloud_command(user_text)
+    if last_user and _CLOUD_RE.search(last_user.lower()):
+        return await _handle_cloud_command(last_user)
 
     # /opencode — direct the request to the opencode agent instead of a
     # local model (the programmatic escape hatch for coding tasks).
-    if user_text and _OPENCODE_RE.search(user_text.lower()):
-        return await _handle_opencode_command(user_text)
+    if last_user and _OPENCODE_RE.search(last_user.lower()):
+        return await _handle_opencode_command(last_user)
 
     # model: "opencode" — client picked the opencode bridge model.  This
     # bypasses llama routing entirely: the task goes to the headless

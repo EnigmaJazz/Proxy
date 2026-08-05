@@ -769,3 +769,44 @@ class TestClientDisconnectCancellation:
         assert db.cancelled == [("job-2", "client_cancelled")]
         assert db.completed == []
         assert cooler.baseline == 1
+
+
+# ---------------------------------------------------------------------------
+# Embedded-command false positive: /opencode in HISTORY must not route
+# ---------------------------------------------------------------------------
+class TestEmbeddedCommandFalsePositive:
+    """A tool result or file path containing ``/opencode`` anywhere in the
+    conversation must never trigger the opencode bridge — only the latest
+    user message can carry a real /opencode command."""
+
+    @pytest.mark.asyncio
+    async def test_tool_result_with_opencode_path_does_not_route(self, gate_client) -> None:
+        capture = _StreamCapture()
+        with patch("routes.stream_llm", new=capture), \
+             patch(
+                 "routes.classify_with_frontdesk",
+                 new=AsyncMock(return_value=_classification("CHAT")),
+             ):
+            response = await gate_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "auto",
+                    "messages": [
+                        {"role": "user", "content": "find opencode"},
+                        {"role": "assistant", "content": "", "tool_calls": [{
+                            "id": "call_1", "type": "function",
+                            "function": {"name": "run_shell", "arguments": "{}"},
+                        }]},
+                        {"role": "tool", "tool_call_id": "call_1",
+                         "content": "~/.opencode/bin/opencode\n~/weight_loss/.git/opencode"},
+                        {"role": "user", "content": "thanks"},
+                    ],
+                    "stream": True,
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            await response.aread()
+
+        # The model was called — NOT the opencode bridge.
+        assert capture.payload is not None
+        assert "Directing to OpenCode" not in capture.payload

@@ -236,16 +236,20 @@ _KEYBOARD_MASH: tuple[str, ...] = ("qwerty", "asdf", "zxcv")
 def _is_deterministic_noise(text: str) -> bool:
     """Strong, frontdesk-independent nonsense detection.
 
-    Empty input; fewer than two alphabetic words WITH digits or
-    punctuation (``asdfghjkl12345!!!@@@``); or a single long vowel-poor
-    token / keyboard-row mash (``asdfghjkl``, ``qwertyuiop``).  Pure short
-    alpha tokens (``help``, ``hi``) are NOT noise; those fall back to the
-    frontdesk's ``is_valid`` judgment.  This makes the nonsense intercept
-    reliable even though the 2B's is_valid is inconsistent.
+    Fewer than two alphabetic words WITH digits or punctuation
+    (``asdfghjkl12345!!!@@@``); or a single long vowel-poor token /
+    keyboard-row mash (``asdfghjkl``, ``qwertyuiop``).  Empty input is
+    NOT noise — empty ``user_text`` occurs in legitimate background
+    requests (e.g. nanobot status/heartbeat polls whose frontdesk call
+    failed), and intercepting them with a "couldn't understand"
+    clarification pollutes the client's stored history and later feeds
+    garbage to the dream/memory-consolidation cycle.  Pure short alpha
+    tokens (``help``, ``hi``) are NOT noise either; those fall back to
+    the frontdesk's ``is_valid`` judgment.
     """
     stripped = re.sub(r"\[[^\]]+\]:\s*", "", text or "").strip()
     if not stripped:
-        return True
+        return False  # empty → skip interception (see docstring)
     words = re.findall(r"[a-zA-Z]+", stripped)
     if len(words) >= 2:
         return False

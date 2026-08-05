@@ -118,7 +118,10 @@ class TestParsers:
     def test_deterministic_noise(self) -> None:
         assert _is_deterministic_noise("[user]: asdfghjkl12345!!!@@@") is True
         assert _is_deterministic_noise("[user]: 12345!!") is True
-        assert _is_deterministic_noise("") is True
+        # Empty input is NOT noise — background/status requests have empty
+        # user_text (frontdesk failure path) and must not be intercepted.
+        assert _is_deterministic_noise("") is False
+        assert _is_deterministic_noise("[user]:") is False
         # Pure-alpha keyboard mash is now deterministic noise too.
         assert _is_deterministic_noise("[user]: asdfghjkl") is True
         assert _is_deterministic_noise("[user]: qwertyuiop") is True

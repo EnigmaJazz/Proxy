@@ -442,6 +442,8 @@ CODE_KEYWORDS: frozenset[str] = frozenset({
     "create a script", "create a python", "create a program",
     "create a function", "create a class", "create a script that",
     "generate a script", "generate code", "generate a function",
+    "write a wrapper", "wrapper script", "script to", "monitor and time",
+    "time requests",
     "implement a", "implement the", "refactor", "refactoring",
     "debug", "debugging", "compile", "lint", "code review",
     "review this code", "review the code",

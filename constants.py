@@ -429,6 +429,40 @@ TOOL_KEYWORDS: frozenset[str] = frozenset({
     "run command", "execute",
 })
 
+# Safety-net keywords that force a CHAT classification to CODE.  The 2B
+# frontdesk sometimes misses explicit coding requests (e.g. "write a
+# python script") even though the prompt defines CODE; this deterministic
+# layer catches the common code-writing phrasings.  Over-detection is safe:
+# CODE and CHAT both route to Professional — the difference is the
+# coding-decision gate, the code profile, and the triage message.
+CODE_KEYWORDS: frozenset[str] = frozenset({
+    # Code-writing verbs
+    "write a script", "write a python", "write python", "write a program",
+    "write code", "write a function", "write a class", "write a script that",
+    "create a script", "create a python", "create a program",
+    "create a function", "create a class", "create a script that",
+    "generate a script", "generate code", "generate a function",
+    "implement a", "implement the", "refactor", "refactoring",
+    "debug", "debugging", "compile", "lint", "code review",
+    "review this code", "review the code",
+    "fix the bug", "fix this code", "fix the code", "fix the error",
+    "syntax error", "stack trace", "traceback", "unit test", "pytest",
+    "test case", "test suite", "write tests", "write a test",
+    "parse json", "json parsing",
+    # Language / artifact mentions
+    "python script", "python file", "python code", "python function",
+    "script in python", "code in python", "in python",
+    "bash script", "shell script", "shell command", "bash script that",
+    "javascript", "typescript", "node.js", "nodejs",
+    "flask app", "django", "fastapi", "sqlalchemy", "react component",
+    "html file", "css file", "json file", "yaml file",
+    "api endpoint", "api client", "api route", "rest api", "graphql",
+    "sql query", "database schema", "regex", "regex pattern", "regexp",
+    "function that", "function called", "class called", "class that",
+    "method that", "function returns", "function takes",
+    "python code that", "code that",
+})
+
 # ---------------------------------------------------------------------------
 # ROUTE_MAP: classified intent → local model endpoint key
 #

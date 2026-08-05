@@ -267,3 +267,91 @@ class TestCodingDecisionGate:
 
         assert capture.payload is not None
         assert "Coding decision" not in text
+
+
+# ---------------------------------------------------------------------------
+# Code-keyword heuristic (frontdesk says CHAT, keyword forces CODE)
+# ---------------------------------------------------------------------------
+
+class TestCodeKeywordHeuristic:
+    @pytest.mark.asyncio
+    async def test_python_script_request_prompts_as_code(self, gate_client) -> None:
+        """A coding request the 2B frontdesk labels CHAT must still reach
+        the coding-decision gate (the reported OpenWebUI bug).
+        """
+        with patch(
+            "routes.classify_with_frontdesk",
+            new=AsyncMock(return_value=_classification("CHAT")),
+        ):
+            response = await gate_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "auto",
+                    "messages": [{
+                        "role": "user",
+                        "content": "write a python script that downloads a file",
+                    }],
+                    "stream": False,
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            body = response.json()
+
+        assert response.status_code == 200
+        # The heuristic forced CHAT → CODE, so the gate asked the question.
+        assert "Coding decision" in body["choices"][0]["message"]["content"]
+
+    @pytest.mark.asyncio
+    async def test_plain_chat_query_not_forced(self, gate_client) -> None:
+        capture = _StreamCapture()
+        with patch("routes.stream_llm", new=capture), \
+             patch(
+                 "routes.classify_with_frontdesk",
+                 new=AsyncMock(return_value=_classification("CHAT")),
+             ):
+            response = await gate_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "auto",
+                    "messages": [{
+                        "role": "user",
+                        "content": "what is the capital of france",
+                    }],
+                    "stream": True,
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            text = (await response.aread()).decode()
+
+        assert capture.payload is not None
+        assert "Coding decision" not in text
+
+    @pytest.mark.asyncio
+    async def test_tool_keywords_win_over_code(self, gate_client) -> None:
+        """A request with both tool and code signals stays TOOL (the tool
+        heuristic runs first and the code heuristic only upgrades CHAT).
+        """
+        capture = _StreamCapture()
+        with patch("routes.stream_llm", new=capture), \
+             patch(
+                 "routes.classify_with_frontdesk",
+                 new=AsyncMock(return_value=_classification("CHAT")),
+             ):
+            response = await gate_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "auto",
+                    "messages": [{
+                        "role": "user",
+                        "content": "search the web for python tutorials then write a script",
+                    }],
+                    "stream": True,
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            text = (await response.aread()).decode()
+
+        # TOOL intent: the model was called directly — no coding-decision
+        # question, no gate prompt.
+        assert capture.payload is not None
+        assert "Coding decision" not in text

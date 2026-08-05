@@ -36,6 +36,7 @@ from constants import (
     R11_AUTHORITY_FIELDS,
     ALL_MODEL_KEYS,
     BRIDGE_MODEL_KEYS,
+    CODE_KEYWORDS,
     CPU_MODELS,
     TOOL_KEYWORDS,
     _HEAVY_MODEL_KEYS,
@@ -760,6 +761,22 @@ async def chat_completions(request: Request) -> Response:
                 )
                 classification["intent"] = "TOOL"
                 classification["tools_required"] = True
+                break
+
+    # ---- Code keyword heuristic: safety net for 2B frontdesk limitations ---
+    # The 2B frontdesk sometimes misses explicit coding requests ("write a
+    # python script") and classifies them as CHAT, which would skip the
+    # coding-decision gate and the code profile.  Force CHAT → CODE when
+    # the query carries a strong coding signal.  Over-detection is safe:
+    # CODE and CHAT both route to Professional.
+    if classification.get("intent") == "CHAT":
+        user_lower = user_text.lower()
+        for kw in CODE_KEYWORDS:
+            if kw in user_lower:
+                logger.info(
+                    "Code keyword '%s' matched — overriding CHAT → CODE", kw,
+                )
+                classification["intent"] = "CODE"
                 break
 
     # ---- Semantic cache check for factual queries ---------------------------

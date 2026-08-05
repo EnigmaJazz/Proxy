@@ -9,6 +9,7 @@ Covers:
 """
 from __future__ import annotations
 
+import json
 from typing import Any, Optional
 from unittest.mock import AsyncMock, patch
 
@@ -160,6 +161,14 @@ class TestCodingDecisionGate:
         assert "opencode" in text
         # The model was NOT called — the gate took over.
         assert capture.payload is None
+        # Regression: every SSE data line must parse as a JSON object (a
+        # double-encoded line — "data: \"data: {...}\"" — broke nanobot
+        # with "'str' object has no attribute 'choices'" and blanked
+        # OpenWebUI).
+        for line in text.splitlines():
+            if line.startswith("data: ") and line[6:] != "[DONE]":
+                payload = json.loads(line[6:])
+                assert isinstance(payload, dict)
 
     @pytest.mark.asyncio
     async def test_decision_answer_opencode_routes_to_bridge(self, gate_client) -> None:

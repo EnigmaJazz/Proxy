@@ -1988,11 +1988,27 @@ async def _coding_decision_response(question: str, client_stream: bool) -> Respo
     """Return the coding-decision question as a chat completion.
 
     The question is sentinel-prefixed so it renders inline in the frontend
-    AND is stripped from the OUTBOUND model-copy on the next turn.
+    AND is stripped from the OUTBOUND model-copy on the next turn.  The
+    stream chunk is built as a raw dict (NOT via ``_make_status_chunk``,
+    which returns a full SSE line and would double-encode here).
     """
     if client_stream:
         async def _stream() -> AsyncIterator[str]:
-            yield f"data: {json.dumps(_make_status_chunk(question, kind="status"))}\n\n"
+            chunk = {
+                "id": f"chatcmpl-{int(time.time())}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": "proxy-system",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "content": question,  # already sentinel-prefixed
+                    },
+                    "finish_reason": None,
+                }],
+            }
+            yield f"data: {json.dumps(chunk)}\n\n"
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(_stream(), media_type="text/event-stream")

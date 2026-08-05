@@ -63,6 +63,7 @@ class _FakeClient:
         self.get_status = 200
         self.raise_on = ""
         self.stream_lines: list[str] = []
+        self.message_get_parts: list[dict[str, Any]] = []
 
     async def __aenter__(self) -> "_FakeClient":
         return self
@@ -74,6 +75,9 @@ class _FakeClient:
         self.calls.append(("get", url))
         if self.raise_on == "get":
             raise httpx.ConnectError("conn refused")
+        if "/message/" in url:
+            # Persisted-message GET used by the question retry-race fetch.
+            return _FakeResp(200, {"info": {}, "parts": self.message_get_parts})
         return _FakeResp(self.get_status, {})
 
     async def post(self, url: str, **kwargs: Any) -> _FakeResp:
@@ -360,3 +364,101 @@ class TestChatStream:
         deltas = [d async for d in opencode_chat_stream("task")]
         joined = "".join(t for _, t in deltas)
         assert any("session HTTP 500" in t for _, t in deltas)
+
+
+# ---------------------------------------------------------------------------
+# Pinned sessions + clarifying questions (a701e8d)
+# ---------------------------------------------------------------------------
+class TestPinnedSessionAndQuestions:
+    @pytest.mark.asyncio
+    async def test_pinned_session_reuse(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Follow-ups reuse the pinned opencode session (no second create)."""
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        client = _FakeClient()
+        client.stream_lines = _stream_events()
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        smap: dict[str, str] = {}
+        # First call: creates + pins the session.
+        [d async for d in opencode_chat_stream("task", session_map=smap, session_key="conv-1")]
+        assert smap.get("conv-1") == "ses_0001"
+        creates = [u for m, u in client.calls if m == "post" and u.endswith("/session")]
+        assert len(creates) == 1
+
+        client.calls.clear()
+        client.stream_lines = _stream_events()
+        # Second call: reuses the pinned session — no new /session POST.
+        [d async for d in opencode_chat_stream("answer", session_map=smap, session_key="conv-1")]
+        creates = [u for m, u in client.calls if m == "post" and u.endswith("/session")]
+        assert creates == []
+        assert smap["conv-1"] == "ses_0001"
+
+    @pytest.mark.asyncio
+    async def test_question_yields_text_and_stops(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A question tool part yields ('question', text) with the options
+        and the stream stops — even when the event omits the input (the
+        retry-race fetch pulls it from the persisted part)."""
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        client = _FakeClient()
+        # Persisted part (returned by the retry fetch) carries the question.
+        client.message_get_parts = [{
+            "id": "prt_q", "messageID": "msg_a", "type": "tool", "tool": "question",
+            "state": {"status": "running", "input": {"questions": [{
+                "question": "Which source?",
+                "options": [{"label": "Logs"}, {"label": "Git"}],
+            }]}},
+        }]
+        client.stream_lines = [
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_user", "role": "user"}),
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_a", "role": "assistant"}),
+            # Event omits the input (the race the retry handles).
+            _evt("message.part.updated", sessionID="ses_0001",
+                 part={"id": "prt_q", "messageID": "msg_a", "type": "tool",
+                       "tool": "question", "state": {"status": "running"}}),
+        ]
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        deltas = [d async for d in opencode_chat_stream("task")]
+        assert deltas == [("question", "Which source? (Options: Logs | Git)")]
+
+    @pytest.mark.asyncio
+    async def test_tool_feedback_tuples(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Running/completed tool parts yield sentinel status tuples."""
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        client = _FakeClient()
+        client.stream_lines = [
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_user", "role": "user"}),
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_a", "role": "assistant"}),
+            _evt("message.part.updated", sessionID="ses_0001",
+                 part={"id": "prt_t1", "messageID": "msg_a", "type": "tool",
+                       "tool": "write", "state": {"status": "running"}}),
+            _evt("message.part.updated", sessionID="ses_0001",
+                 part={"id": "prt_t1", "messageID": "msg_a", "type": "tool",
+                       "tool": "write", "state": {"status": "completed"}}),
+        ]
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        deltas = [d async for d in opencode_chat_stream("task")]
+        assert ("status", "🔧 write…") in deltas
+        assert ("status", "✅ write done") in deltas

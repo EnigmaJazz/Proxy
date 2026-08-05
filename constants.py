@@ -463,6 +463,11 @@ CODE_KEYWORDS: frozenset[str] = frozenset({
     "generate a script", "generate code", "generate a function",
     "write a wrapper", "wrapper script", "script to", "monitor and time",
     "time requests",
+    # Conversational references to an existing script + automation intent
+    # (the 2B misses these without explicit "write a" verbs):
+    "the script", "my script", "this script", "that script",
+    "script run", "make the script", "check for update script",
+    "run automatically", "automatically on login", "on login", "cron",
     "implement a", "implement the", "refactor", "refactoring",
     "debug", "debugging", "compile", "lint", "code review",
     "review this code", "review the code",

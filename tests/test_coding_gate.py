@@ -832,12 +832,17 @@ class TestCachedDecisionFollowUp:
                  "routes.classify_with_frontdesk",
                  new=AsyncMock(return_value=_classification("CHAT")),
              ):
+            # Same conversation: the ORIGINAL first user message is in the
+            # history (same session id), the follow-up is the new turn.
             response = await gate_client.post(
                 "/v1/chat/completions",
                 json={
                     "model": "auto",
-                    "messages": [{"role": "user",
-                                  "content": "make the script run on login"}],
+                    "messages": [
+                        {"role": "user", "content": "write a script to check for updates"},
+                        {"role": "assistant", "content": "Done."},
+                        {"role": "user", "content": "make the script run on login"},
+                    ],
                     "stream": True,
                 },
                 headers={"Authorization": "Bearer agent-key"},

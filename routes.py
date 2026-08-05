@@ -591,9 +591,15 @@ async def chat_completions(request: Request) -> Response:
     # ---- Prepare messages (Glass Pipe Rule: NO text alteration) ------------
     processed_messages: list[dict[str, Any]] = list(messages)  # Shallow copy
 
-    # ---- Lane B (IDE passthrough): strip tools, bypass frontdesk -----------
+    # ---- Lane B (IDE passthrough): bypass frontdesk ----------------------
     if caller_type == "IDE" or lane_b:
-        tools = None  # IDE gets no tool injection
+        # Classic IDE clients (aider/cline/vscode) get no tools — they
+        # handle text-only model responses.  opencode is different: it is
+        # an agent framework that sends its OWN tool definitions and
+        # executes the model's tool calls itself, so its tools must be
+        # forwarded or its agent loop degrades to text-only answers.
+        if "opencode" not in request.headers.get("user-agent", "").lower():
+            tools = None
         # Messages pass through unchanged
         logger.info("Lane B (IDE passthrough) — bypassing frontdesk")
     elif caller_type == "AGENTIC":

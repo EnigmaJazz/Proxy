@@ -248,3 +248,4 @@ sdd/
 # in-progress capture; tracked copies live in openspec/ as needed)
 docs/
 .atl/.skill-registry.cache.json
+.atl/

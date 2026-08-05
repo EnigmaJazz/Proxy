@@ -501,6 +501,52 @@ class TestToolCallThinkingDefault:
         )
 
     @pytest.mark.asyncio
+    async def test_complex_intent_with_tools_attached_enables_thinking(
+        self, r1_client,
+    ) -> None:
+        """CODE intent WITH tools attached (the real nanobot/opencode
+        shape — every request carries a tool set): the proxy MUST enable
+        thinking.  Tool presence alone must not disable it; the intent +
+        tools_required classification is the driver.  The tool-call
+        corruption is contained by the fixed chat template and the
+        ToolCallTextToStructured state machine.
+        """
+        capture = _StreamCapture()
+        with patch("routes.stream_llm", new=capture), \
+             patch(
+                 "routes.classify_with_frontdesk",
+                 new=AsyncMock(return_value=_classification(
+                     "CODE", tools_required=False,
+                 )),
+             ):
+            response = await r1_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "auto",
+                    "messages": [{"role": "user", "content": "write a parser"}],
+                    "tools": [{
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "description": "Run a shell command",
+                            "parameters": {"type": "object"},
+                        },
+                    }],
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            await response.aread()
+
+        assert response.status_code == 200, response.text
+        assert capture.payload is not None
+        assert capture.payload.get("chat_template_kwargs") == {
+            "enable_thinking": True,
+            "preserve_thinking": True,
+        }, (
+            f"CODE intent + tools must enable thinking; got {capture.payload!r}"
+        )
+
+    @pytest.mark.asyncio
     async def test_tools_request_with_opt_in_header_enables_thinking(
         self, r1_client,
     ) -> None:

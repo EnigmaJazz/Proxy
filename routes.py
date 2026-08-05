@@ -1124,19 +1124,27 @@ async def chat_completions(request: Request) -> Response:
     #
     #   - X-Proxy-Thinking: true  → enable_thinking: True (force on)
     #   - X-Proxy-Thinking: false → enable_thinking: False (force off)
-    #   - no header, tools in request        → enable_thinking: False
-    #   - no header, no tools, complex intent
-    #     (CODE/SCHOLAR/CREATIVE/ARCHITECT)
+    #   - complex intent (CODE/SCHOLAR/CREATIVE/ARCHITECT)
     #     AND classifier says tools NOT required → enable_thinking: True
-    #   - no header, no tools, simple intent  → enable_thinking: False
-    #   - no header, no tools, complex intent
-    #     BUT classifier says tools required   → enable_thinking: False
+    #   - simple intent, TOOL intent, or tools_required=True
+    #                                          → enable_thinking: False
+    #
+    # NOTE: tool presence alone does NOT disable thinking anymore.  Every
+    # real client (nanobot, opencode, OpenWebUI) attaches its tool set to
+    # EVERY request, so a tools-presence gate made the thinking-ON path
+    # unreachable in practice.  The intent + tools_required classification
+    # is the driver; the tool-call corruption (text-based ``<tool_call>``
+    # on later turns) is contained by the fixed chat template
+    # (preserve_thinking: false) and the ToolCallTextToStructured state
+    # machine, verified live (thinking ON + tools: 48 reasoning chunks,
+    # 7 clean structured tool calls, 0 text-tool-call leak).  Mid-tool-flow
+    # continuations classify as TOOL, so they stay thinking-off.
     thinking_header = headers.get("x-proxy-thinking", "").lower()
     if thinking_header == "true":
         payload["chat_template_kwargs"] = {"enable_thinking": True, "preserve_thinking": True}
     elif thinking_header == "false":
         payload["chat_template_kwargs"] = {"enable_thinking": False, "preserve_thinking": False}
-    elif not tools:
+    else:
         intent = (classification or {}).get("intent", "").upper()
         tools_required = (classification or {}).get("tools_required", False)
         if (
@@ -1147,22 +1155,6 @@ async def chat_completions(request: Request) -> Response:
         else:
             # CHAT, TOOL, or tools_required=True: no thinking
             payload["chat_template_kwargs"] = {"enable_thinking": False, "preserve_thinking": False}
-    else:
-        # Tools in request, no header: explicit opt-out.  Defense in
-        # depth — even if the service's ``--chat-template-kwargs`` is
-        # ignored after the first turn (which it is, per Qwen 3.5's
-        # chat template behavior), the proxy's per-request setting is
-        # always honored.
-        #
-        # ``preserve_thinking: false`` is critical here: the fixed
-        # chat template (froggeric v21) emits an empty ``<think>\n\n
-        # ``</think>\n\n`` placeholder when ``enable_thinking: false``
-        # is set.  The model fills that placeholder on turn 4+ of
-        # tool-calling flows, re-introducing the bug.  Setting
-        # ``preserve_thinking: false`` strips past ``<think>`` blocks
-        # from the history so the model doesn't see its own previous
-        # thinking pattern and decide to continue it.
-        payload["chat_template_kwargs"] = {"enable_thinking": False, "preserve_thinking": False}
 
     # Forward additional OpenAI fields from the client body (R11 hardening).
     for field in OPENAI_FORWARD_FIELDS:

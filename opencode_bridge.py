@@ -265,6 +265,7 @@ async def opencode_chat_stream(
             text_lens: dict[str, int] = {}
             tool_state: dict[str, str] = {}
             pending_done = False
+            session_busy = True  # assume working until a status event says idle
             # Open the event bus BEFORE sending the message: the bus is
             # fire-and-forget (no replay), so connecting after prompt_async
             # misses the early events (user message, assistant start, first
@@ -281,10 +282,13 @@ async def opencode_chat_stream(
 
                 # An agentic session can produce several assistant messages
                 # (reasoning/tool step, then a final summary).  Completion =
-                # a finished step followed by quiet: a step-finish sets
-                # pending_done, and a timeout on the (blocking) event read
-                # confirms the session went idle.  The first step-finish is
-                # NOT the end (the summary message follows).
+                # a finished step AND the session idle: a step-finish sets
+                # pending_done, a ``session.status`` event tells us whether
+                # the session is still busy.  Quiet alone is NOT enough — a
+                # multi-step agent can pause >3s between steps while still
+                # busy (long tool runs, model generation), and returning on
+                # quiet mid-work cut the stream with the session still
+                # running.  Only complete when the session went idle.
                 ev_iter = ev.aiter_lines()
                 while True:
                     try:
@@ -296,7 +300,7 @@ async def opencode_chat_stream(
                     except StopAsyncIteration:
                         return
                     except asyncio.TimeoutError:
-                        if pending_done:
+                        if pending_done and not session_busy:
                             return
                         # Keep the client connection alive during long tool
                         # phases (and show the agent is still working).
@@ -312,6 +316,15 @@ async def opencode_chat_stream(
                     if props.get("sessionID") != session_id:
                         continue
                     etype = evt.get("type")
+                    if etype == "session.status":
+                        # Track whether the agent is still working:
+                        # properties.status.type is "busy" | "idle".
+                        st = (props.get("status") or {}).get("type")
+                        if st == "busy":
+                            session_busy = True
+                        elif st == "idle":
+                            session_busy = False
+                        continue
                     if etype == "message.updated":
                         info = props.get("info") or {}
                         mid = info.get("id")

@@ -82,6 +82,11 @@ _RESUME_RE = re.compile(r"(?i)\s*/resume\s*$")
 _CLOUD_RE = re.compile(r"/cloud")
 _OPENCODE_RE = re.compile(r"/opencode")
 
+# Sentinel-prefixed coding-decision question.  Visible inline (like the
+# triage) and stripped from the OUTBOUND model-copy by strip_proxy_status,
+# so the question never reaches the model — only the user's answer does.
+_CODING_QUESTION_PREFIX = STATUS_SENTINEL + "⚡ Coding decision:"
+
 # ---------------------------------------------------------------------------
 # Tool-loop detection (defense in depth against model reasoning loops)
 # ---------------------------------------------------------------------------
@@ -131,6 +136,53 @@ def _session_state(app: FastAPI) -> dict[str, dict[str, Any]]:
     if not hasattr(state, "session_state"):
         state.session_state = {}
     return state.session_state
+
+
+def _coding_decision_state(app: FastAPI) -> dict[str, str]:
+    """Lazy accessor for the per-session coding decision on ``app.state``.
+
+    Keyed by ``session_id`` → ``"opencode"`` | ``"professional"``.  The
+    decision is cached so a coding session only prompts once.
+    """
+    state = app.state
+    if not hasattr(state, "coding_decisions"):
+        state.coding_decisions = {}
+    return state.coding_decisions
+
+
+def _find_coding_question_index(messages: list[dict[str, Any]]) -> Optional[int]:
+    """Index of the LAST proxy-emitted coding-decision question message."""
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if (
+            msg.get("role") == "assistant"
+            and isinstance(msg.get("content"), str)
+            and msg["content"].startswith(_CODING_QUESTION_PREFIX)
+            and not msg.get("tool_calls")
+        ):
+            return i
+    return None
+
+
+def _parse_coding_answer(text: str) -> str:
+    """Map the user's reply to a routing decision.
+
+    ``"opencode"`` when the reply mentions opencode; otherwise the safe
+    default ``"professional"`` (the local code pathway).
+    """
+    lowered = (text or "").strip().lower()
+    if any(k in lowered for k in ("opencode", "/opencode")):
+        return "opencode"
+    return "professional"
+
+
+def _last_user_text(messages: list[dict[str, Any]]) -> str:
+    """Content of the last non-empty user message."""
+    for msg in reversed(messages):
+        content = msg.get("content")
+        if msg.get("role") == "user" and isinstance(content, str) and content.strip():
+            return content.strip()
+    return ""
 
 
 def _tool_call_signature(tc: dict[str, Any]) -> str:
@@ -770,6 +822,26 @@ async def chat_completions(request: Request) -> Response:
             "Client-named model override: %s → %s",
             route.model_key, requested_model,
         )
+
+    # ---- Coding-task decision gate -------------------------------------------
+    # Coding requests from non-opencode clients get a one-turn choice:
+    # route to OpenCode (the bridge) or the local code pathway (Professional).
+    # Requests from opencode itself (Lane B / IDE) skip the gate and go
+    # straight to the local model (loop-prevention requirement).
+    # ``session_id`` is only resolved inside the AGENTIC branch above; the
+    # accessor is idempotent (cached by first-user-message hash) so resolving
+    # it here is safe for every caller.
+    gate_session_id = _resolve_session_id(processed_messages, request.app)
+    gate_response = await _apply_coding_decision_gate(
+        app=request.app,
+        messages=processed_messages,
+        session_id=gate_session_id,
+        client_stream=client_stream,
+        route=route,
+        has_tool_calls=has_tool_calls,
+    )
+    if gate_response is not None:
+        return gate_response
 
     # ---- Extract project context for database ---------------------------------
     ctx = extract_project_context(user_text)
@@ -1709,23 +1781,14 @@ async def _handle_cloud_command(user_text: str) -> StreamingResponse:
 # OpenCode bridge handlers
 # ---------------------------------------------------------------------------
 
-async def _handle_opencode_request(
-    messages: list[dict[str, Any]],
-    client_stream: bool,
-) -> Response:
-    """Handle ``model: "opencode"`` — direct the task to the opencode agent.
+async def _opencode_task_response(task_text: str, client_stream: bool) -> Response:
+    """Run a task through the opencode bridge and return the response.
 
-    Extracts the latest user message as the task text and runs it through
-    the headless opencode serve backend (``opencode_bridge.opencode_chat``).
-    Returns a streamed SSE response (or a JSON ChatCompletion for
-    non-streaming clients, mirroring the proxy's stream-omitted default).
+    Streams an SSE response (or a JSON ChatCompletion for non-streaming
+    clients, mirroring the proxy's stream-omitted default).  Shared by the
+    ``model: "opencode"`` route, the ``/opencode`` command, and the
+    coding-decision gate.
     """
-    task_text = ""
-    for msg in reversed(messages):
-        content = msg.get("content")
-        if msg.get("role") == "user" and isinstance(content, str) and content.strip():
-            task_text = content.strip()
-            break
     if not task_text:
         return JSONResponse(
             {"error": "opencode model requires a user message"},
@@ -1768,6 +1831,108 @@ async def _handle_opencode_request(
         }],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     })
+
+
+async def _handle_opencode_request(
+    messages: list[dict[str, Any]],
+    client_stream: bool,
+) -> Response:
+    """Handle ``model: "opencode"`` — direct the task to the opencode agent.
+
+    Extracts the latest user message as the task text and runs it through
+    the headless opencode serve backend (``opencode_bridge.opencode_chat``).
+    Returns a streamed SSE response (or a JSON ChatCompletion for
+    non-streaming clients, mirroring the proxy's stream-omitted default).
+    """
+    return await _opencode_task_response(_last_user_text(messages), client_stream)
+
+
+# ---------------------------------------------------------------------------
+# Coding-task decision gate
+# ---------------------------------------------------------------------------
+
+async def _coding_decision_response(question: str, client_stream: bool) -> Response:
+    """Return the coding-decision question as a chat completion.
+
+    The question is sentinel-prefixed so it renders inline in the frontend
+    AND is stripped from the OUTBOUND model-copy on the next turn.
+    """
+    if client_stream:
+        async def _stream() -> AsyncIterator[str]:
+            yield f"data: {json.dumps(_make_status_chunk(question, kind="status"))}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(_stream(), media_type="text/event-stream")
+
+    return JSONResponse({
+        "id": f"chatcmpl-{int(time.time())}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": "proxy-system",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": question},
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    })
+
+
+async def _apply_coding_decision_gate(
+    app: FastAPI,
+    messages: list[dict[str, Any]],
+    session_id: str,
+    client_stream: bool,
+    route: RouteDecision,
+    has_tool_calls: bool,
+) -> Optional[Response]:
+    """Prompt the user for the coding route, or apply a cached decision.
+
+    Coding requests from non-opencode clients get a one-turn choice:
+    route to OpenCode (the bridge) or the local code pathway (Professional).
+    Requests from opencode itself (Lane B / IDE) skip the gate entirely and
+    go straight to the local model — the loop-prevention requirement.
+
+    Returns a ``Response`` when the gate must take over (question emission,
+    opencode routing, or the professional decision turn), or ``None`` to
+    continue the normal flow.
+    """
+    if route.is_lane_b:
+        return None  # opencode caller → local model directly, never prompt
+
+    decisions = _coding_decision_state(app)
+
+    # ---- Decision turn: the user answered the coding question ----------
+    question_idx = _find_coding_question_index(messages)
+    if question_idx is not None:
+        answer_text = _last_user_text(messages)
+        decision = _parse_coding_answer(answer_text)
+        decisions[session_id] = decision
+        logger.info("Coding decision for session %s: %s", session_id, decision)
+        task_messages = messages[:question_idx]  # task = convo up to the question
+        if decision == "opencode":
+            return await _opencode_task_response(
+                _last_user_text(task_messages), client_stream,
+            )
+        # professional: drop the question + answer; the flow continues to
+        # the local code pathway with the original task as the last turn.
+        messages[:] = task_messages
+        route.intent = "CODE"
+        return None
+
+    # ---- Fresh coding request: prompt once, then cache the choice ------
+    if route.intent == "CODE" and not has_tool_calls:
+        decision = decisions.get(session_id)
+        if decision == "opencode":
+            return await _opencode_task_response(_last_user_text(messages), client_stream)
+        if decision is None:
+            question = (
+                f"{_CODING_QUESTION_PREFIX} Coding task detected — route to OpenCode "
+                f"or the local code pathway (Professional)? Reply `opencode` or `local`."
+            )
+            logger.info("Prompting coding decision for session %s", session_id)
+            return await _coding_decision_response(question, client_stream)
+    return None
 
 
 async def _handle_opencode_command(user_text: str) -> StreamingResponse:

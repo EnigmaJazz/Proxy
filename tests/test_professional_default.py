@@ -271,12 +271,19 @@ class _StreamCapture:
 
 
 @pytest_asyncio.fixture
-async def pd_client() -> Any:
+async def pd_client(monkeypatch: pytest.MonkeyPatch) -> Any:
     """Yield an httpx async client against the real app with state stubbed."""
     from tests.conftest import (
         _NoOpCooling,
         _NoOpDatabase,
         _NoOpSystemd,
+    )
+
+    # The coding-decision gate is orthogonal to this suite (payload + route
+    # pinning); pass through without prompting.
+    monkeypatch.setattr(
+        "routes._apply_coding_decision_gate",
+        AsyncMock(return_value=None),
     )
 
     proxy.app.state.database = _NoOpDatabase()

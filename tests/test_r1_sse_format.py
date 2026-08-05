@@ -159,12 +159,19 @@ class _ToolCallCapture:
 
 
 @pytest_asyncio.fixture
-async def r1_client() -> Any:
+async def r1_client(monkeypatch: pytest.MonkeyPatch) -> Any:
     """Yield an httpx async client against the real app with state stubbed."""
     from tests.conftest import (
         _NoOpCooling,
         _NoOpDatabase,
         _NoOpSystemd,
+    )
+
+    # The coding-decision gate is orthogonal to this suite (SSE format +
+    # thinking defaults); pass through without prompting.
+    monkeypatch.setattr(
+        "routes._apply_coding_decision_gate",
+        AsyncMock(return_value=None),
     )
 
     proxy.app.state.database = _NoOpDatabase()

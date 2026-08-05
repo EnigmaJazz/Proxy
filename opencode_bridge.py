@@ -42,6 +42,21 @@ from constants import (
 
 logger = get_logger("kinver.opencode_bridge")
 
+# System prompt sent to every bridge session.  The gentle-orchestrator's
+# persona (AGENTS.md) defaults direct replies to Rioplatense Spanish, which
+# is wrong for an API-facing bridge consumed by OpenWebUI/nanobot — pin
+# English unless the user's own message is in another language.
+_BRIDGE_SYSTEM_PROMPT = (
+    "You are an API-backed coding assistant reached through a proxy bridge. "
+    "Respond in English unless the user's message is written in another "
+    "language. Keep the final answer concise and in English."
+)
+
+# Quiet period after a finished step before the bridge considers the
+# agentic session complete (the final summary message follows the last
+# tool step within milliseconds; a step-finish alone is not the end).
+_EVENT_QUIET_TIMEOUT: float = 8.0
+
 # Sentinel-prefixed proxy status the opencode client accumulates into the
 # assistant text (the proxy emits triage as the first SSE chunk).  The
 # triage formats are stable (routes._build_triage_message).  Stripping the
@@ -139,6 +154,7 @@ async def opencode_chat(
             # ---- 2. Post the message (blocks until the agent finishes) ----
             payload: dict[str, Any] = {
                 "agent": agent,
+                "system": _BRIDGE_SYSTEM_PROMPT,
                 "parts": [{"type": "text", "text": user_text}],
             }
             if model_id:
@@ -195,8 +211,12 @@ async def opencode_chat_stream(
                 yield f"[OpenCode Bridge Error: session HTTP {resp.status_code}]"
                 return
             session_id = resp.json().get("id")
+            if not session_id:
+                yield "[OpenCode Bridge Error: session created without id]"
+                return
             payload: dict[str, Any] = {
                 "agent": agent,
+                "system": _BRIDGE_SYSTEM_PROMPT,
                 "parts": [{"type": "text", "text": user_text}],
             }
             if model_id:
@@ -205,20 +225,44 @@ async def opencode_chat_stream(
                     "providerID": provider_id,
                     "variant": "default",
                 }
-            async_resp = await client.post(
-                f"{OPENCODE_SERVE_URL}/session/{session_id}/prompt_async",
-                json=payload,
-                timeout=30.0,
-            )
-            if async_resp.status_code != 204:
-                yield f"[OpenCode Bridge Error: prompt HTTP {async_resp.status_code}]"
-                return
 
-            user_mid: Optional[str] = None
+            user_mids: set[str] = set()
             asst_mid: Optional[str] = None
             text_lens: dict[str, int] = {}
+            tool_state: dict[str, str] = {}
+            pending_done = False
+            # Open the event bus BEFORE sending the message: the bus is
+            # fire-and-forget (no replay), so connecting after prompt_async
+            # misses the early events (user message, assistant start, first
+            # reasoning/tool parts) and the stream would look empty.
             async with client.stream("GET", f"{OPENCODE_SERVE_URL}/event") as ev:
-                async for line in ev.aiter_lines():
+                async_resp = await client.post(
+                    f"{OPENCODE_SERVE_URL}/session/{session_id}/prompt_async",
+                    json=payload,
+                    timeout=30.0,
+                )
+                if async_resp.status_code != 204:
+                    yield f"[OpenCode Bridge Error: prompt HTTP {async_resp.status_code}]"
+                    return
+
+                # An agentic session can produce several assistant messages
+                # (reasoning/tool step, then a final summary).  Completion =
+                # a finished step followed by quiet: a step-finish sets
+                # pending_done, and a timeout on the (blocking) event read
+                # confirms the session went idle.  The first step-finish is
+                # NOT the end (the summary message follows).
+                ev_iter = ev.aiter_lines()
+                while True:
+                    try:
+                        line = await asyncio.wait_for(
+                            anext(ev_iter), timeout=_EVENT_QUIET_TIMEOUT,
+                        )
+                    except StopAsyncIteration:
+                        return
+                    except asyncio.TimeoutError:
+                        if pending_done:
+                            return
+                        continue
                     if not line.startswith("data: "):
                         continue
                     try:
@@ -230,27 +274,53 @@ async def opencode_chat_stream(
                         continue
                     etype = evt.get("type")
                     if etype == "message.updated":
-                        mid = (props.get("info") or {}).get("id")
-                        role = (props.get("info") or {}).get("role")
-                        if role == "user" and user_mid is None:
-                            user_mid = mid
+                        info = props.get("info") or {}
+                        mid = info.get("id")
+                        role = info.get("role")
+                        if role == "user" and mid:
+                            user_mids.add(mid)
                         elif role == "assistant" and asst_mid is None:
                             asst_mid = mid
+                            if info.get("error"):
+                                yield f"[OpenCode Bridge Error: {info['error']}]"
+                                return
                     elif etype == "message.part.updated":
                         part = props.get("part") or {}
                         pid = part.get("id")
-                        if part.get("messageID") == asst_mid:
-                            if part.get("type") == "step-finish":
-                                return
-                            if part.get("type") == "text":
-                                text = str(part.get("text") or "")
-                                prev = text_lens.get(pid, 0)
-                                if len(text) > prev:
-                                    text_lens[pid] = len(text)
-                                    yield text[prev:]
-                    elif etype == "session.status":
-                        if props.get("type") in ("idle", "completed") and asst_mid:
-                            return
+                        # Accept parts from ANY assistant message (an agentic
+                        # session emits several: reasoning/tool step, then a
+                        # final summary message); only user-message parts are
+                        # excluded so the echoed prompt never streams back.
+                        if part.get("messageID") in user_mids:
+                            continue
+                        ptype = part.get("type")
+                        if ptype == "step-finish":
+                            pending_done = True
+                        elif ptype == "text":
+                            text = str(part.get("text") or "")
+                            prev = text_lens.get(pid, 0)
+                            if len(text) > prev:
+                                text_lens[pid] = len(text)
+                                yield text[prev:]
+                        elif ptype == "reasoning":
+                            # Live thinking feedback (sentinel-prefixed so it
+                            # is visible inline but stripped from future
+                            # model copies).
+                            text = str(part.get("text") or "")
+                            prev = text_lens.get(pid, 0)
+                            if len(text) > prev:
+                                text_lens[pid] = len(text)
+                                yield f"\u200b{text[prev:]}"
+                        elif ptype == "tool":
+                            # Tool execution feedback: show each tool the
+                            # agent runs (sentinel-prefixed status).
+                            call = part.get("call") or {}
+                            name = str(call.get("name") or part.get("state") or "")
+                            state = str(part.get("state") or "")
+                            if name and state != tool_state.get(name):
+                                tool_state[name] = state
+                                if state == "running":
+                                    yield f"\u200b🔧 {name}…"
         except (httpx.HTTPError, OSError, ValueError) as exc:
             yield f"[OpenCode Bridge Network Error: {str(exc)}]"
 

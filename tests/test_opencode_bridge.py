@@ -8,6 +8,8 @@ Covers:
 """
 from __future__ import annotations
 
+import asyncio
+import json
 from typing import Any, AsyncIterator, Optional
 
 import httpx
@@ -31,6 +33,24 @@ class _FakeResp:
         return self._data
 
 
+class _FakeStream:
+    """Async context manager that yields scripted SSE data lines."""
+
+    def __init__(self, lines: list[str]) -> None:
+        self._lines = lines
+
+    async def __aenter__(self) -> "_FakeStream":
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        return None
+
+    async def aiter_lines(self) -> AsyncIterator[str]:
+        for line in self._lines:
+            yield line
+            await asyncio.sleep(0)
+
+
 class _FakeClient:
     """Scripted httpx client: get→config, post→session then message."""
 
@@ -42,6 +62,7 @@ class _FakeClient:
         self.message_parts: list[dict[str, Any]] = []
         self.get_status = 200
         self.raise_on = ""
+        self.stream_lines: list[str] = []
 
     async def __aenter__(self) -> "_FakeClient":
         return self
@@ -61,7 +82,12 @@ class _FakeClient:
             raise httpx.ConnectError("conn refused")
         if url.endswith("/session"):
             return _FakeResp(self.session_status, {"id": self.session_id})
+        if "prompt_async" in url:
+            return _FakeResp(204, {})
         return _FakeResp(self.message_status, {"parts": self.message_parts})
+
+    def stream(self, *args: Any, **kwargs: Any) -> _FakeStream:
+        return _FakeStream(self.stream_lines)
 
 
 @pytest.fixture
@@ -240,3 +266,91 @@ class TestRoutesOpenCode:
         assert captured == ["implement the parser"]
         assert "CMD_DONE" in text
         assert "OpenCode (gentle-orchestrator agent)" in text
+
+
+# ---------------------------------------------------------------------------
+# opencode_chat_stream
+# ---------------------------------------------------------------------------
+
+def _sse(data: dict[str, Any]) -> str:
+    return f"data: {json.dumps(data)}"
+
+
+def _evt(etype: str, **props: Any) -> str:
+    return _sse({"id": "evt_x", "type": etype, "properties": props})
+
+
+def _stream_events() -> list[str]:
+    """Scripted event sequence for one agentic turn: user msg, assistant
+    reasoning + text + step-finish, then a quiet completion."""
+    return [
+        _evt("server.connected", **{}),
+        _evt("message.updated", sessionID="ses_0001",
+             info={"id": "msg_user", "role": "user"}),
+        _evt("message.part.updated", sessionID="ses_0001",
+             part={"id": "prt_u", "messageID": "msg_user", "type": "text",
+                   "text": "the echoed prompt"}),
+        _evt("message.updated", sessionID="ses_0001",
+             info={"id": "msg_a", "role": "assistant"}),
+        _evt("message.part.updated", sessionID="ses_0001",
+             part={"id": "prt_r", "messageID": "msg_a", "type": "reasoning",
+                   "text": "think about it"}),
+        _evt("message.part.updated", sessionID="ses_0001",
+             part={"id": "prt_t", "messageID": "msg_a", "type": "text",
+                   "text": "Created file."}),
+        _evt("message.part.updated", sessionID="ses_0001",
+             part={"id": "prt_f", "messageID": "msg_a", "type": "step-finish"}),
+        # A second assistant message (the final summary) must also stream.
+        _evt("message.updated", sessionID="ses_0001",
+             info={"id": "msg_b", "role": "assistant"}),
+        _evt("message.part.updated", sessionID="ses_0001",
+             part={"id": "prt_s", "messageID": "msg_b", "type": "text",
+                   "text": "Done."}),
+        _evt("message.part.updated", sessionID="ses_0001",
+             part={"id": "prt_f2", "messageID": "msg_b", "type": "step-finish"}),
+    ]
+
+
+class TestChatStream:
+    @pytest.mark.asyncio
+    async def test_streams_reasoning_text_and_summary(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        client = _FakeClient()
+        client.stream_lines = _stream_events()
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        deltas = [d async for d in opencode_chat_stream("task")]
+        joined = "".join(deltas)
+        # Reasoning streamed as sentinel-prefixed feedback; user echo excluded.
+        assert "think about it" in joined
+        assert "the echoed prompt" not in joined
+        # Both assistant messages' text streamed.
+        assert "Created file." in joined
+        assert "Done." in joined
+        # Exactly one prompt_async POST (the reviewer-duplicate regression).
+        async_posts = [u for m, u in client.calls if m == "post" and "prompt_async" in u]
+        assert len(async_posts) == 1
+
+    @pytest.mark.asyncio
+    async def test_session_error_surfaces_cleanly(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        client = _FakeClient()
+        client.session_status = 500
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        deltas = [d async for d in opencode_chat_stream("task")]
+        assert any("session HTTP 500" in d for d in deltas)

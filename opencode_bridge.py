@@ -27,6 +27,7 @@ import asyncio
 import json
 import os
 import re
+import time
 from typing import Any, AsyncIterator, Optional
 
 import httpx
@@ -290,7 +291,27 @@ async def opencode_chat_stream(
                 # quiet mid-work cut the stream with the session still
                 # running.  Only complete when the session went idle.
                 ev_iter = ev.aiter_lines()
+                started = time.monotonic()
                 while True:
+                    # Bounded total duration: a hung agent tool (e.g. a
+                    # package-manager command stuck on a lock) leaves the
+                    # session "busy" forever; cap the wait, abort the
+                    # session, and surface a clear error instead of
+                    # streaming keepalives indefinitely.
+                    if time.monotonic() - started > OPENCODE_SERVE_TIMEOUT:
+                        logger.error(
+                            "opencode bridge timeout after %.0fs — aborting session %s",
+                            OPENCODE_SERVE_TIMEOUT, session_id[:16],
+                        )
+                        try:
+                            await client.post(
+                                f"{OPENCODE_SERVE_URL}/session/{session_id}/abort",
+                                timeout=10.0,
+                            )
+                        except (httpx.HTTPError, OSError):
+                            pass
+                        yield ("status", "[OpenCode Bridge Error: timed out waiting for the agent]",)
+                        return
                     try:
                         line = await asyncio.wait_for(
                             anext(ev_iter),

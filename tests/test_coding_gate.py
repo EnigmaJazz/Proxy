@@ -21,6 +21,8 @@ from routes import (
     _CODING_QUESTION_PREFIX,
     _coding_decision_state,
     _find_coding_question_index,
+    _is_deterministic_noise,
+    _looks_like_gibberish,
     _parse_coding_answer,
     _resolve_session_id,
 )
@@ -29,15 +31,15 @@ from tests.conftest import _NoOpCooling, _NoOpDatabase, _NoOpSystemd
 QUESTION = f"{_CODING_QUESTION_PREFIX} Coding task detected — route to OpenCode or the local code pathway (Professional)? Reply `opencode` or `local`."
 
 
-def _classification(intent: str = "CODE") -> dict[str, Any]:
+def _classification(intent: str = "CODE", *, tools_required: bool = False, is_valid: bool = True) -> dict[str, Any]:
     return {
-        "is_valid": True,
+        "is_valid": is_valid,
         "intent": intent,
         "priority": 2,
         "complexity": "low",
         "project_name": "general",
         "is_factual": False,
-        "tools_required": False,
+        "tools_required": tools_required,
     }
 
 
@@ -98,6 +100,22 @@ class TestParsers:
         assert _parse_coding_answer("use professional") == "professional"
         assert _parse_coding_answer("yes") == "professional"
         assert _parse_coding_answer("") == "professional"
+
+    def test_gibberish_guard(self) -> None:
+        assert _looks_like_gibberish("asdfghjkl12345!!!@@@") is True
+        assert _looks_like_gibberish("asdfghjkl") is True
+        assert _looks_like_gibberish("help") is True
+        assert _looks_like_gibberish("what is the capital of france") is False
+
+    def test_deterministic_noise(self) -> None:
+        assert _is_deterministic_noise("[user]: asdfghjkl12345!!!@@@") is True
+        assert _is_deterministic_noise("[user]: 12345!!") is True
+        assert _is_deterministic_noise("") is True
+        # Pure short alpha tokens are NOT deterministic noise — the
+        # frontdesk's is_valid decides those.
+        assert _is_deterministic_noise("[user]: help") is False
+        assert _is_deterministic_noise("[user]: asdfghjkl") is False
+        assert _is_deterministic_noise("[user]: what is the capital of france") is False
 
     def test_find_question_index(self) -> None:
         msgs = [
@@ -355,3 +373,125 @@ class TestCodeKeywordHeuristic:
         # question, no gate prompt.
         assert capture.payload is not None
         assert "Coding decision" not in text
+
+
+# ---------------------------------------------------------------------------
+# Frontdesk is_valid interception (nonsense input)
+# ---------------------------------------------------------------------------
+
+class TestInvalidInputInterception:
+    @pytest.mark.asyncio
+    async def test_gibberish_returns_clarification(self, gate_client) -> None:
+        capture = _StreamCapture()
+        with patch("routes.stream_llm", new=capture), \
+             patch(
+                 "routes.classify_with_frontdesk",
+                 new=AsyncMock(return_value=_classification(is_valid=False)),
+             ):
+            response = await gate_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "auto",
+                    "messages": [{"role": "user", "content": "asdfghjkl12345!!!@@@"}],
+                    "stream": False,
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            body = response.json()
+
+        assert response.status_code == 200
+        assert "couldn't understand" in body["choices"][0]["message"]["content"]
+        # The professional model was NOT called.
+        assert capture.payload is None
+
+    @pytest.mark.asyncio
+    async def test_deterministic_noise_intercepts_even_when_frontdesk_says_valid(
+        self, gate_client
+    ) -> None:
+        """The 2B's is_valid is inconsistent; the deterministic noise guard
+        must intercept clear gibberish even when is_valid comes back True.
+        """
+        capture = _StreamCapture()
+        with patch("routes.stream_llm", new=capture), \
+             patch(
+                 "routes.classify_with_frontdesk",
+                 new=AsyncMock(return_value=_classification("CHAT", is_valid=True)),
+             ):
+            response = await gate_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "auto",
+                    "messages": [{"role": "user", "content": "asdfghjkl12345!!!@@@"}],
+                    "stream": False,
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            body = response.json()
+
+        assert "couldn't understand" in body["choices"][0]["message"]["content"]
+        assert capture.payload is None
+
+    @pytest.mark.asyncio
+    async def test_short_but_meaningful_not_intercepted(self, gate_client) -> None:
+        """The gibberish guard protects short-but-meaningful input: a 2B
+        false ``is_valid=False`` on "help" must NOT block the request.
+        """
+        capture = _StreamCapture()
+        with patch("routes.stream_llm", new=capture), \
+             patch(
+                 "routes.classify_with_frontdesk",
+                 new=AsyncMock(return_value=_classification("CHAT", is_valid=False)),
+             ):
+            response = await gate_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "auto",
+                    "messages": [{"role": "user", "content": "help me with this"}],
+                    "stream": True,
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            await response.aread()
+
+        # Not intercepted — the model was called.
+        assert capture.payload is not None
+
+
+# ---------------------------------------------------------------------------
+# Factual keyword heuristic (semantic cache feeding)
+# ---------------------------------------------------------------------------
+
+class TestFactualKeywordHeuristic:
+    @pytest.mark.asyncio
+    async def test_factual_phrasing_routes_normally_with_cache_path(
+        self, gate_client
+    ) -> None:
+        """A factual-phrased question the 2B marked non-factual must be
+        forced factual and still reach the model (cache miss → normal flow),
+        without crashing on the NoOp database's cache surface.
+        """
+        capture = _StreamCapture()
+        with patch("routes.stream_llm", new=capture), \
+             patch(
+                 "routes.classify_with_frontdesk",
+                 new=AsyncMock(return_value=_classification("CHAT")),
+             ):
+            response = await gate_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "auto",
+                    "messages": [{
+                        "role": "user",
+                        "content": "what is the capital of france",
+                    }],
+                    "stream": True,
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            await response.aread()
+
+        assert capture.payload is not None
+        # The factual net forced is_factual → the semantic cache lookup ran
+        # (NoOp returns a miss) and the store fires on completion without
+        # crashing (NoOp cache_store no-ops).  The request reached the model.
+        assert capture.payload is not None

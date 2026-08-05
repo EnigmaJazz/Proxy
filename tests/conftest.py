@@ -78,6 +78,12 @@ class _NoOpDatabase:
     async def escalate_job(self, *args, **kwargs) -> None:
         pass
 
+    async def cache_lookup(self, *args, **kwargs) -> None:
+        return None
+
+    async def cache_store(self, *args, **kwargs) -> None:
+        pass
+
 
 class _NoOpSystemd:
     """Fake systemd service manager that reports every model as ready."""

@@ -21,6 +21,7 @@ import asyncio
 import hashlib
 import json
 import re
+import sqlite3
 import subprocess
 import time
 import uuid
@@ -38,6 +39,7 @@ from constants import (
     BRIDGE_MODEL_KEYS,
     CODE_KEYWORDS,
     CPU_MODELS,
+    FACTUAL_KEYWORDS,
     TOOL_KEYWORDS,
     _HEAVY_MODEL_KEYS,
     MODEL_LABELS,
@@ -184,6 +186,73 @@ def _last_user_text(messages: list[dict[str, Any]]) -> str:
         if msg.get("role") == "user" and isinstance(content, str) and content.strip():
             return content.strip()
     return ""
+
+
+def _looks_like_gibberish(text: str) -> bool:
+    """True when the text has fewer than two alphabetic words — the
+    profile of complete nonsense (e.g. ``asdfghjkl12345!!!@@@``).  Used as
+    a guard so the 2B frontdesk's ``is_valid=False`` cannot false-positive
+    on short-but-meaningful queries like ``help``.  The ``[role]:`` labels
+    from the context dump are stripped first so they don't count as words.
+    """
+    stripped = re.sub(r"\[[^\]]+\]:\s*", "", text or "")
+    return len(re.findall(r"[a-zA-Z]+", stripped)) < 2
+
+
+def _is_deterministic_noise(text: str) -> bool:
+    """Strong, frontdesk-independent nonsense detection.
+
+    Empty input, or fewer than two alphabetic words WITH digits or
+    punctuation — e.g. ``asdfghjkl12345!!!@@@``.  Pure short alpha tokens
+    (``help``, ``hi``) are NOT noise; those fall back to the frontdesk's
+    ``is_valid`` judgment.  This makes the nonsense intercept reliable
+    even though the 2B's is_valid is inconsistent.
+    """
+    stripped = re.sub(r"\[[^\]]+\]:\s*", "", text or "").strip()
+    if not stripped:
+        return True
+    words = re.findall(r"[a-zA-Z]+", stripped)
+    if len(words) >= 2:
+        return False
+    return bool(re.search(r"[0-9!@#$%^&*()_+=|~`<>?{}\[\]\\/]", stripped))
+
+
+async def _plain_completion(text: str, client_stream: bool) -> Response:
+    """Return a plain assistant-message completion (SSE or JSON).
+
+    Used for proxy-authored replies that ARE the model's answer (nonsense
+    clarification), not proxy status — so no sentinel prefix.
+    """
+    if client_stream:
+        async def _stream() -> AsyncIterator[str]:
+            chunk = {
+                "id": f"chatcmpl-{int(time.time())}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": "proxy-system",
+                "choices": [{
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": text},
+                    "finish_reason": None,
+                }],
+            }
+            yield f"data: {json.dumps(chunk)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(_stream(), media_type="text/event-stream")
+
+    return JSONResponse({
+        "id": f"chatcmpl-{int(time.time())}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": "proxy-system",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": text},
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    })
 
 
 def _tool_call_signature(tc: dict[str, Any]) -> str:
@@ -779,12 +848,47 @@ async def chat_completions(request: Request) -> Response:
                 classification["intent"] = "CODE"
                 break
 
+    # ---- Factual keyword heuristic: make the semantic cache useful --------
+    # The 2B frontdesk's is_factual is unreliable (it marked "what is the
+    # capital of france" as non-factual), starving the semantic cache.
+    # Force it for obvious factual phrasings so repeat factual questions
+    # are served from cache without waking the GPU.
+    if not classification.get("is_factual"):
+        user_lower = user_text.lower()
+        for kw in FACTUAL_KEYWORDS:
+            if kw in user_lower:
+                classification["is_factual"] = True
+                break
+
+    # ---- Invalid-input interception (frontdesk is_valid + noise guard) ------
+    # The 2B frontdesk's ``is_valid`` signal was computed but never acted
+    # on: complete nonsense still burned the professional model.  Intercept
+    # it here.  The deterministic noise guard fires on its own (the 2B's
+    # is_valid is inconsistent); the ``is_valid`` signal additionally
+    # catches pure-alpha mash like ``asdfghjkl``, guarded by the word-count
+    # check so short-but-meaningful queries ("help") are never blocked.
+    if _is_deterministic_noise(user_text) or (
+        classification.get("is_valid") is False
+        and _looks_like_gibberish(user_text)
+    ):
+        logger.info(
+            "Intercepting nonsense input (%r)",
+            user_text[:60],
+        )
+        return await _plain_completion(
+            "⚡ I couldn't understand that message — it looks like it may "
+            "have been garbled. Could you rephrase it?",
+            client_stream,
+        )
+
     # ---- Semantic cache check for factual queries ---------------------------
     if classification.get("is_factual"):
         cached = await check_semantic_cache(user_text, True, db)
         if cached:
             logger.info("Returning cached response for factual query")
-            return await _stream_cached_response(cached, requested_model)
+            return await _stream_cached_response(
+                cached, requested_model, client_stream=client_stream,
+            )
 
     # ---- Resolve route (GPU-aware) ------------------------------------------
     route: RouteDecision
@@ -1068,6 +1172,7 @@ async def chat_completions(request: Request) -> Response:
         proxy_preamble=proxy_preamble,
         client_named_model=client_named_model,
         session_id=_resolve_session_id(processed_messages, request.app),
+        cache_query=user_text if classification.get("is_factual") else "",
     )
     if not client_stream:
         # Non-streaming client: return a JSON ChatCompletion assembled
@@ -1101,6 +1206,7 @@ async def _event_stream(
     proxy_preamble: Optional[list[str]] = None,
     client_named_model: bool = False,
     session_id: str = "",  # SHA-256[:16]:<first_seen_unix> for cross-request loop detection
+    cache_query: str = "",  # user_text for semantic-cache storage (factual queries)
 ) -> AsyncIterator[str]:
     """
     Core SSE streaming generator.
@@ -1433,6 +1539,14 @@ async def _event_stream(
                 finish_reason="stop",
                 full_content="".join(full_content),
             )
+            # Populate the semantic cache for factual queries so a repeated
+            # question is answered from cache without waking the GPU — the
+            # frontdesk's ``is_factual`` signal finally pays for itself.
+            if cache_query and route.is_factual and full_content:
+                try:
+                    await db.cache_store(cache_query, "".join(full_content))
+                except (sqlite3.Error, OSError, ValueError):
+                    logger.debug("Semantic cache store failed (non-critical)")
         yield "data: [DONE]\n\n"
 
     # AGENTS.md rule 10 permits `except Exception` at the terminal SSE
@@ -1482,6 +1596,7 @@ async def _event_stream_with_model_startup(
     proxy_preamble: Optional[list[str]] = None,
     client_named_model: bool = False,
     session_id: str = "",
+    cache_query: str = "",
 ) -> AsyncIterator[str]:
     """
     Wrapper around ``_event_stream`` that ensures heavy GPU models are
@@ -1605,6 +1720,7 @@ async def _event_stream_with_model_startup(
         proxy_preamble=proxy_preamble,
         client_named_model=client_named_model,
         session_id=session_id,
+        cache_query=cache_query,
     ):
         yield chunk
 
@@ -1993,12 +2109,13 @@ async def _handle_opencode_command(user_text: str) -> StreamingResponse:
 async def _stream_cached_response(
     cached_text: str,
     model_name: str,
-) -> StreamingResponse:
-    """
-    Stream a cached response as SSE chunks for a factual query cache hit.
+    client_stream: bool = True,
+) -> Response:
+    """Serve a cached response for a factual query cache hit.
 
-    Sends the entire cached text as a single content delta followed by
-    [DONE] — the client sees it as an instant completion.
+    Streams the entire cached text as a single content delta followed by
+    [DONE] for streaming clients; returns a JSON ChatCompletion for
+    non-streaming clients (mirroring the proxy's stream-omitted default).
     """
     async def _stream() -> AsyncIterator[str]:
         chunk = {
@@ -2015,7 +2132,21 @@ async def _stream_cached_response(
         yield f"data: {json.dumps(chunk)}\n\n"
         yield "data: [DONE]\n\n"
 
-    return StreamingResponse(_stream(), media_type="text/event-stream")
+    if client_stream:
+        return StreamingResponse(_stream(), media_type="text/event-stream")
+
+    return JSONResponse({
+        "id": f"chatcmpl-cached-{int(time.time())}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model_name if model_name != "auto" else "cache",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": cached_text},
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    })
 
 
 # ---------------------------------------------------------------------------

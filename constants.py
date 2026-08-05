@@ -463,6 +463,20 @@ CODE_KEYWORDS: frozenset[str] = frozenset({
     "python code that", "code that",
 })
 
+# Keywords that force ``is_factual`` for obvious factual phrasings.  The 2B
+# frontdesk's is_factual is unreliable (it marked "what is the capital of
+# france" as non-factual), which starves the semantic cache.  This net makes
+# the cache actually populate and serve repeat factual questions without
+# waking the GPU.
+FACTUAL_KEYWORDS: frozenset[str] = frozenset({
+    "what is", "what's", "what are", "who is", "who's",
+    "when was", "when is", "where is", "where are",
+    "capital of", "population of", "distance between", "how many",
+    "how old", "define", "definition of", "meaning of", "convert",
+    "what year", "history of", "founded", "invented", "discovered",
+    "explain", "what does", "how does", "why is", "why are",
+})
+
 # ---------------------------------------------------------------------------
 # ROUTE_MAP: classified intent → local model endpoint key
 #

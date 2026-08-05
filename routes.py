@@ -59,7 +59,7 @@ from llm import (
     stream_llm,
     openrouter_cloud_escalation,
 )
-from opencode_bridge import opencode_chat
+from opencode_bridge import opencode_chat, opencode_chat_stream
 from routing import (
     RouteDecision,
     discriminate_caller,
@@ -2028,19 +2028,21 @@ async def _opencode_task_response(task_text: str, client_stream: bool) -> Respon
             f"_⏳ [Proxy: Directing to OpenCode ({OPENCODE_AGENT} agent)...]_\n\n"
         )
         yield f"data: {json.dumps(_make_system_chunk(status_msg))}\n\n"
-        resp_text = await opencode_chat(task_text, agent=OPENCODE_AGENT)
-        chunk = {
-            "id": f"chatcmpl-{int(time.time())}",
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": "opencode",
-            "choices": [{
-                "index": 0,
-                "delta": {"content": resp_text},
-                "finish_reason": None,
-            }],
-        }
-        yield f"data: {json.dumps(chunk)}\n\n"
+        async for text_delta in opencode_chat_stream(task_text, agent=OPENCODE_AGENT):
+            if not text_delta:
+                continue
+            chunk = {
+                "id": f"chatcmpl-{int(time.time())}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": "opencode",
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": text_delta},
+                    "finish_reason": None,
+                }],
+            }
+            yield f"data: {json.dumps(chunk)}\n\n"
         yield "data: [DONE]\n\n"
 
     if client_stream:

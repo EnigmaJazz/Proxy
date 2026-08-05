@@ -24,9 +24,10 @@ assistant text.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
-from typing import Any, Optional
+from typing import Any, AsyncIterator, Optional
 
 import httpx
 
@@ -165,6 +166,93 @@ async def opencode_chat(
             )
         except (httpx.HTTPError, OSError, ValueError) as exc:
             return f"[OpenCode Bridge Network Error: {str(exc)}]"
+
+
+async def opencode_chat_stream(
+    user_text: str,
+    *,
+    agent: str = OPENCODE_AGENT,
+    model_id: Optional[str] = None,
+    provider_id: str = "kinver",
+) -> AsyncIterator[str]:
+    """Stream a task through headless opencode, yielding assistant text live.
+
+    Uses ``prompt_async`` (no-wait send) + the ``/event`` SSE bus instead of
+    the blocking message POST, so the caller sees the agent's output as it is
+    generated rather than one blob after minutes.  Yields incremental text
+    part content for the assistant message; returns when the session goes
+    idle.  On failure yields an error string (never raises).
+    """
+    if not await ensure_opencode_serve():
+        yield "[OpenCode Bridge Failed: opencode serve not reachable.]"
+        return
+    async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
+        try:
+            resp = await client.post(
+                f"{OPENCODE_SERVE_URL}/session", json={}, timeout=30.0,
+            )
+            if resp.status_code != 200:
+                yield f"[OpenCode Bridge Error: session HTTP {resp.status_code}]"
+                return
+            session_id = resp.json().get("id")
+            payload: dict[str, Any] = {
+                "agent": agent,
+                "parts": [{"type": "text", "text": user_text}],
+            }
+            if model_id:
+                payload["model"] = {
+                    "modelID": model_id,
+                    "providerID": provider_id,
+                    "variant": "default",
+                }
+            async_resp = await client.post(
+                f"{OPENCODE_SERVE_URL}/session/{session_id}/prompt_async",
+                json=payload,
+                timeout=30.0,
+            )
+            if async_resp.status_code != 204:
+                yield f"[OpenCode Bridge Error: prompt HTTP {async_resp.status_code}]"
+                return
+
+            user_mid: Optional[str] = None
+            asst_mid: Optional[str] = None
+            text_lens: dict[str, int] = {}
+            async with client.stream("GET", f"{OPENCODE_SERVE_URL}/event") as ev:
+                async for line in ev.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    try:
+                        evt = json.loads(line[6:])
+                    except json.JSONDecodeError:
+                        continue
+                    props = evt.get("properties") or {}
+                    if props.get("sessionID") != session_id:
+                        continue
+                    etype = evt.get("type")
+                    if etype == "message.updated":
+                        mid = (props.get("info") or {}).get("id")
+                        role = (props.get("info") or {}).get("role")
+                        if role == "user" and user_mid is None:
+                            user_mid = mid
+                        elif role == "assistant" and asst_mid is None:
+                            asst_mid = mid
+                    elif etype == "message.part.updated":
+                        part = props.get("part") or {}
+                        pid = part.get("id")
+                        if part.get("messageID") == asst_mid:
+                            if part.get("type") == "step-finish":
+                                return
+                            if part.get("type") == "text":
+                                text = str(part.get("text") or "")
+                                prev = text_lens.get(pid, 0)
+                                if len(text) > prev:
+                                    text_lens[pid] = len(text)
+                                    yield text[prev:]
+                    elif etype == "session.status":
+                        if props.get("type") in ("idle", "completed") and asst_mid:
+                            return
+        except (httpx.HTTPError, OSError, ValueError) as exc:
+            yield f"[OpenCode Bridge Network Error: {str(exc)}]"
 
 
 # ---------------------------------------------------------------------------

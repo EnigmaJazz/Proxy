@@ -8,7 +8,7 @@ Covers:
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, AsyncIterator, Optional
 
 import httpx
 import pytest
@@ -197,17 +197,22 @@ class TestRoutesOpenCode:
     ) -> None:
         from routes import _handle_opencode_request
 
-        async def _fake_chat(text: str, *, agent: str = "gentle-orchestrator") -> str:
-            return "STREAMED_DONE"
+        async def _fake_stream(
+            text: str, *, agent: str = "gentle-orchestrator",
+            model_id: Optional[str] = None, provider_id: str = "kinver",
+        ) -> AsyncIterator[str]:
+            yield "STREAMED_"
+            yield "DONE"
 
-        monkeypatch.setattr("routes.opencode_chat", _fake_chat)
+        monkeypatch.setattr("routes.opencode_chat_stream", _fake_stream)
         resp = await _handle_opencode_request(
             [{"role": "user", "content": "task"}],
             client_stream=True,
         )
         text = await _drain_stream(resp)
         assert "Directing to OpenCode" in text
-        assert "STREAMED_DONE" in text
+        assert "STREAMED_" in text
+        assert '"content": "DONE"' in text
         assert "[DONE]" in text
 
     @pytest.mark.asyncio

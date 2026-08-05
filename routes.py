@@ -155,16 +155,28 @@ def _coding_decision_state(app: FastAPI) -> dict[str, str]:
 
 
 def _find_coding_question_index(messages: list[dict[str, Any]]) -> Optional[int]:
-    """Index of the LAST proxy-emitted coding-decision question message."""
-    for i in range(len(messages) - 1, -1, -1):
-        msg = messages[i]
-        if (
-            msg.get("role") == "assistant"
-            and isinstance(msg.get("content"), str)
-            and msg["content"].startswith(_CODING_QUESTION_PREFIX)
-            and not msg.get("tool_calls")
-        ):
-            return i
+    """Index of the PENDING coding-decision question.
+
+    The question is pending only when it is the last assistant message and
+    the final message is the user's answer (the OpenAI turn shape:
+    ``... question(assistant), answer(user)``).  Once the decision is made
+    and the model responds, the question is no longer pending — later
+    requests must NOT re-trigger the decision turn (which would re-route
+    the old task and reprompt the model).
+    """
+    if not messages or messages[-1].get("role") != "user":
+        return None
+    question_idx = len(messages) - 2
+    if question_idx < 0:
+        return None
+    msg = messages[question_idx]
+    if (
+        msg.get("role") == "assistant"
+        and isinstance(msg.get("content"), str)
+        and msg["content"].startswith(_CODING_QUESTION_PREFIX)
+        and not msg.get("tool_calls")
+    ):
+        return question_idx
     return None
 
 
@@ -216,14 +228,20 @@ def _looks_like_gibberish(text: str) -> bool:
     return len(re.findall(r"[a-zA-Z]+", stripped)) < 2
 
 
+# Keyboard-row substrings that almost never appear in real words — a
+# reliable pure-alpha keyboard-mash signature (e.g. "asdfghjkl").
+_KEYBOARD_MASH: tuple[str, ...] = ("qwerty", "asdf", "zxcv")
+
+
 def _is_deterministic_noise(text: str) -> bool:
     """Strong, frontdesk-independent nonsense detection.
 
-    Empty input, or fewer than two alphabetic words WITH digits or
-    punctuation — e.g. ``asdfghjkl12345!!!@@@``.  Pure short alpha tokens
-    (``help``, ``hi``) are NOT noise; those fall back to the frontdesk's
-    ``is_valid`` judgment.  This makes the nonsense intercept reliable
-    even though the 2B's is_valid is inconsistent.
+    Empty input; fewer than two alphabetic words WITH digits or
+    punctuation (``asdfghjkl12345!!!@@@``); or a single long vowel-poor
+    token / keyboard-row mash (``asdfghjkl``, ``qwertyuiop``).  Pure short
+    alpha tokens (``help``, ``hi``) are NOT noise; those fall back to the
+    frontdesk's ``is_valid`` judgment.  This makes the nonsense intercept
+    reliable even though the 2B's is_valid is inconsistent.
     """
     stripped = re.sub(r"\[[^\]]+\]:\s*", "", text or "").strip()
     if not stripped:
@@ -231,7 +249,20 @@ def _is_deterministic_noise(text: str) -> bool:
     words = re.findall(r"[a-zA-Z]+", stripped)
     if len(words) >= 2:
         return False
-    return bool(re.search(r"[0-9!@#$%^&*()_+=|~`<>?{}\[\]\\/]", stripped))
+    if re.search(r"[0-9!@#$%^&*()_+=|~`<>?{}\[\]\\/]", stripped):
+        return True
+    if words:
+        word = words[0].lower()
+        # Keyboard-row mash ("asdfghjkl", "qwertyuiop", "zxcvbnm")
+        if any(seq in word for seq in _KEYBOARD_MASH):
+            return True
+        # Long vowel-poor token (≤1 vowel in ≥6 letters) — keyboard mash
+        # like "asdfghjkl" has no natural vowel ratio.
+        if len(word) >= 6:
+            vowels = sum(1 for ch in word if ch in "aeiou")
+            if vowels <= 1:
+                return True
+    return False
 
 
 async def _plain_completion(text: str, client_stream: bool) -> Response:

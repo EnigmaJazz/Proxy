@@ -119,10 +119,12 @@ class TestParsers:
         assert _is_deterministic_noise("[user]: asdfghjkl12345!!!@@@") is True
         assert _is_deterministic_noise("[user]: 12345!!") is True
         assert _is_deterministic_noise("") is True
+        # Pure-alpha keyboard mash is now deterministic noise too.
+        assert _is_deterministic_noise("[user]: asdfghjkl") is True
+        assert _is_deterministic_noise("[user]: qwertyuiop") is True
         # Pure short alpha tokens are NOT deterministic noise — the
         # frontdesk's is_valid decides those.
         assert _is_deterministic_noise("[user]: help") is False
-        assert _is_deterministic_noise("[user]: asdfghjkl") is False
         assert _is_deterministic_noise("[user]: what is the capital of france") is False
 
     def test_find_question_index(self) -> None:
@@ -132,6 +134,34 @@ class TestParsers:
             {"role": "user", "content": "opencode"},
         ]
         assert _find_coding_question_index(msgs) == 1
+
+    def test_question_not_pending_after_response(self) -> None:
+        """Once the decision is made and the model responds, the question
+        is no longer pending — a later request must NOT re-trigger the
+        decision turn (which re-routed the old task and reprompted the
+        model with the same task).
+        """
+        msgs = [
+            {"role": "user", "content": "write a parser"},
+            {"role": "assistant", "content": QUESTION},
+            {"role": "user", "content": "local"},
+            {"role": "assistant", "content": "Here is the parser code..."},
+            {"role": "user", "content": "now add error handling"},
+        ]
+        assert _find_coding_question_index(msgs) is None
+
+    def test_question_not_pending_with_old_answer(self) -> None:
+        """After a cancel, re-sending the same request must prompt again,
+        not silently default to the old task (the question is not the last
+        assistant message before the final user turn).
+        """
+        msgs = [
+            {"role": "user", "content": "write a parser"},
+            {"role": "assistant", "content": QUESTION},
+            {"role": "user", "content": "cancel"},
+            {"role": "user", "content": "write a parser"},
+        ]
+        assert _find_coding_question_index(msgs) is None
 
     def test_no_question_returns_none(self) -> None:
         assert _find_coding_question_index(

@@ -810,3 +810,41 @@ class TestEmbeddedCommandFalsePositive:
         # The model was called — NOT the opencode bridge.
         assert capture.payload is not None
         assert "Directing to OpenCode" not in capture.payload
+
+
+# ---------------------------------------------------------------------------
+# Cached-decision follow-ups stay CODE (no re-ask, no drop to chat)
+# ---------------------------------------------------------------------------
+class TestCachedDecisionFollowUp:
+    @pytest.mark.asyncio
+    async def test_followup_routes_per_cached_decision(
+        self, gate_client, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from routes import _coding_decision_state, _resolve_session_id
+
+        msgs = [{"role": "user", "content": "write a script to check for updates"}]
+        sid = _resolve_session_id(msgs, proxy.app)
+        _coding_decision_state(proxy.app)[sid] = "professional"
+
+        capture = _StreamCapture()
+        with patch("routes.stream_llm", new=capture), \
+             patch(
+                 "routes.classify_with_frontdesk",
+                 new=AsyncMock(return_value=_classification("CHAT")),
+             ):
+            response = await gate_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "auto",
+                    "messages": [{"role": "user",
+                                  "content": "make the script run on login"}],
+                    "stream": True,
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            await response.aread()
+
+        # No re-ask (cached decision) and the model was called (not the
+        # plain chat path bypassing the coding pipeline).
+        assert "Coding decision" not in capture.payload
+        assert capture.payload is not None

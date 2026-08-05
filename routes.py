@@ -920,6 +920,22 @@ async def chat_completions(request: Request) -> Response:
                 )
                 classification["intent"] = "CODE"
                 break
+        else:
+            # A conversation that already made a coding decision is a
+            # coding conversation — follow-ups reference "the script" /
+            # "make it run on login" and rarely repeat explicit code
+            # keywords.  Treat them as CODE so they continue on the
+            # cached pathway (opencode or local) instead of dropping to
+            # the plain chat model.
+            try:
+                session_id = _resolve_session_id(processed_messages, request.app)
+            except Exception:
+                session_id = None
+            if session_id and session_id in _coding_decision_state(request.app):
+                logger.info(
+                    "Cached coding decision — treating follow-up as CODE",
+                )
+                classification["intent"] = "CODE"
 
     # ---- Factual keyword heuristic: make the semantic cache useful --------
     # The 2B frontdesk's is_factual is unreliable (it marked "what is the

@@ -108,15 +108,28 @@ async def ensure_opencode_serve() -> bool:
     try:
         os.makedirs(OPENCODE_WORKSPACE_DIR, exist_ok=True)
         port = OPENCODE_SERVE_URL.rsplit(":", 1)[-1]
+        serve_log = open(
+            os.path.join(OPENCODE_WORKSPACE_DIR, "opencode-serve.log"), "ab", buffering=0,
+        )
+        # The serve inherits a minimal systemd PATH; give it the usual
+        # user paths so plugins (e.g. skill-registry → gentle-ai) resolve.
+        serve_env = dict(os.environ)
+        serve_env["PATH"] = (
+            "/home/linuxbrew/.linuxbrew/bin:"
+            "~/.local/bin:"
+            "~/.opencode/bin:"
+            "/usr/local/bin:/usr/bin:/bin"
+        )
         proc = await asyncio.create_subprocess_exec(
             OPENCODE_BIN,
             "serve",
             "--port", port,
             "--hostname", "127.0.0.1",
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+            stdout=serve_log,
+            stderr=serve_log,
             start_new_session=True,
             cwd=OPENCODE_WORKSPACE_DIR,
+            env=serve_env,
         )
         logger.info("Opened opencode serve (pid=%s) on %s", proc.pid, OPENCODE_SERVE_URL)
         # Wait briefly for the listener to come up.
@@ -232,11 +245,34 @@ async def opencode_chat_stream(
             )
             if session_id:
                 # Follow-up in the same conversation: reuse the pinned agent
-                # session so it retains its tool state and context.
-                logger.info(
-                    "opencode bridge resuming pinned session %s", session_id[:16],
-                )
-            else:
+                # session so it retains its tool state and context.  But a
+                # session that is STILL BUSY (a previously hung agent tool)
+                # can never accept new work — abort it, drop the pin, and
+                # start fresh instead of queueing behind a zombie.
+                try:
+                    st_resp = await client.get(
+                        f"{OPENCODE_SERVE_URL}/session/status", timeout=10.0,
+                    )
+                    st_map = st_resp.json()
+                    st = (st_map.get(session_id) or {}).get("type")
+                except (httpx.HTTPError, ValueError):
+                    st = None
+                if st == "busy":
+                    logger.warning(
+                        "pinned session %s is busy (likely stuck) — aborting and starting fresh",
+                        session_id[:16],
+                    )
+                    try:
+                        await client.post(
+                            f"{OPENCODE_SERVE_URL}/session/{session_id}/abort",
+                            timeout=10.0,
+                        )
+                    except (httpx.HTTPError, OSError):
+                        pass
+                    if session_map is not None and session_key:
+                        session_map.pop(session_key, None)
+                    session_id = None
+            if not session_id:
                 resp = await client.post(
                     f"{OPENCODE_SERVE_URL}/session", json={}, timeout=30.0,
                 )

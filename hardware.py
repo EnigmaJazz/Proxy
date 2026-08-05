@@ -364,7 +364,12 @@ async def calculate_dynamic_ngl(
         is_headless = await asyncio.to_thread(is_system_headless)
 
     # fit-target is the MB buffer to leave free when --fit calculates offloading
-    fit_target: int = 256 if is_headless else 1024
+    #
+    # 2026-08-05 (user decision): the workstation no longer keeps the
+    # 1024MB graphical headroom — the model should use the VRAM instead of
+    # leaving it idle.  Uniform 256MB buffer regardless of desktop state.
+    # The llama-professional service also pins -fitt 256 explicitly.
+    fit_target: int = 256
 
     try:
         await asyncio.to_thread(_write_fit_target, fit_target, ENV_NGL_FILE)

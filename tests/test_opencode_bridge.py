@@ -465,3 +465,89 @@ class TestPinnedSessionAndQuestions:
         deltas = [d async for d in opencode_chat_stream("task")]
         assert ("status", "🔧 write…") in deltas
         assert ("status", "✅ write done") in deltas
+
+
+# ---------------------------------------------------------------------------
+# Serve health / age-based recycling
+# ---------------------------------------------------------------------------
+class TestServeHealth:
+    @pytest.mark.asyncio
+    async def test_recycles_old_serve(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An old serve (no memory pressure) is killed for recycling."""
+        from opencode_bridge import _recycle_serve_if_low_memory
+
+        killed: list[int] = []
+
+        def _health(port: str) -> tuple[bool, float]:
+            return False, 3600.0  # healthy memory, but up an hour
+
+        def _find(port: str) -> int:
+            return 12345
+
+        monkeypatch.setattr(opencode_bridge, "_serve_health", _health)
+        monkeypatch.setattr(opencode_bridge, "_find_serve_pid", _find)
+        monkeypatch.setattr(opencode_bridge.os, "kill", lambda pid, sig: killed.append(pid))
+
+        await _recycle_serve_if_low_memory()
+        assert killed == [12345]
+
+    @pytest.mark.asyncio
+    async def test_young_serve_not_recycled(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from opencode_bridge import _recycle_serve_if_low_memory
+
+        killed: list[int] = []
+
+        def _health(port: str) -> tuple[bool, float]:
+            return False, 60.0  # healthy memory, fresh serve
+
+        def _find(port: str) -> int:
+            return 12345
+
+        monkeypatch.setattr(opencode_bridge, "_serve_health", _health)
+        monkeypatch.setattr(opencode_bridge, "_find_serve_pid", _find)
+        monkeypatch.setattr(opencode_bridge.os, "kill", lambda pid, sig: killed.append(pid))
+
+        await _recycle_serve_if_low_memory()
+        assert killed == []
+
+    def test_serve_health_parses_proc(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """_serve_health reads /proc/<pid>/stat start ticks + uptime."""
+        import tempfile
+        from opencode_bridge import _serve_health
+
+        fake_pid = 4242
+        # pid found in /proc listing
+        monkeypatch.setattr(opencode_bridge, "_find_serve_pid", lambda port: fake_pid)
+        monkeypatch.setattr(opencode_bridge, "_memory_pressure", lambda: False)
+
+        stat = "0 (serve) S " + " 0 " * 18 + " 1000"  # start_ticks=1000 at index 21
+        real_open = open
+
+        def _fake_open(path: str, *a: Any, **kw: Any):
+            if f"/proc/{fake_pid}/stat" in str(path):
+                return _FakeProc(stat.encode())
+            if path == "/proc/uptime":
+                return _FakeProc(b"6000.0 123.0\n")
+            return real_open(path, *a, **kw)
+
+        class _FakeProc:
+            def __init__(self, data: bytes) -> None:
+                self._data = data
+
+            def __enter__(self) -> "_FakeProc":
+                return self
+
+            def __exit__(self, *a: Any) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return self._data
+
+        monkeypatch.setattr(opencode_bridge.os, "sysconf", lambda name: 100)
+        monkeypatch.setattr("builtins.open", _fake_open)
+
+        pressure, elapsed = _serve_health("18900")
+        assert pressure is False
+        assert elapsed is not None
+        # start_ticks 1000 @ 100Hz = 10s after boot; uptime 6000 → ~5990s up
+        assert 5900 < elapsed < 6000

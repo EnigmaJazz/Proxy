@@ -58,6 +58,12 @@ _BRIDGE_SYSTEM_PROMPT = (
     "make reasonable assumptions, state them briefly, and complete the task."
 )
 
+# Recycle the opencode serve after this uptime: the serve's agent-loop
+# tool runner progressively wedges (bash hangs on trivial commands even
+# with healthy memory); a fresh serve runs bash reliably.
+_SERVE_RECYCLE_AFTER_S: float = 1800.0
+
+
 # Quiet period after a finished step before the bridge considers the
 # agentic session complete (the final summary message follows the last
 # tool step within milliseconds; a step-finish alone is not the end).
@@ -106,11 +112,8 @@ async def ensure_opencode_serve() -> bool:
     if await is_opencode_serve_running():
         return True
     try:
-        os.makedirs(OPENCODE_WORKSPACE_DIR, exist_ok=True)
         port = OPENCODE_SERVE_URL.rsplit(":", 1)[-1]
-        serve_log = open(
-            os.path.join(OPENCODE_WORKSPACE_DIR, "opencode-serve.log"), "ab", buffering=0,
-        )
+        serve_log = await asyncio.to_thread(_open_serve_log)
         # The serve inherits a minimal systemd PATH; give it the usual
         # user paths so plugins (e.g. skill-registry → gentle-ai) resolve.
         serve_env = dict(os.environ)
@@ -615,10 +618,16 @@ async def _recycle_serve_if_low_memory() -> None:
     fresh one.  Never raises.
     """
     try:
-        pressure = await asyncio.to_thread(_memory_pressure)
-        if not pressure:
-            return
         port = OPENCODE_SERVE_URL.rsplit(":", 1)[-1]
+        pressure, elapsed = await asyncio.to_thread(_serve_health, port)
+        reason = None
+        if pressure:
+            reason = "low memory"
+        elif elapsed is not None and elapsed > _SERVE_RECYCLE_AFTER_S:
+            reason = f"up {elapsed / 60:.0f} min (progressive tool-runner wedging)"
+        if not reason:
+            return
+        logger.warning("Recycling opencode serve: %s", reason)
         pid = await asyncio.to_thread(_find_serve_pid, port)
         if pid:
             try:
@@ -627,6 +636,37 @@ async def _recycle_serve_if_low_memory() -> None:
                 pass
     except (OSError, ValueError):
         return
+
+
+def _serve_health(port: str) -> tuple[bool, Optional[float]]:
+    """Sync health probe (offloaded by the caller): (memory_pressure,
+    serve_elapsed_seconds).  Returns (False, None) when the serve is
+    healthy and recent — callers recycle only on low memory or age."""
+    pressure = _memory_pressure()
+    pid = _find_serve_pid(port)
+    elapsed: Optional[float] = None
+    if pid:
+        try:
+            with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+                parts = fh.read().split()
+            start_ticks = int(parts[21])
+            with open("/proc/uptime", encoding="utf-8") as fh:
+                uptime_s = float(fh.read().split()[0])
+            # Process uptime = system uptime - (start ticks / clock rate).
+            elapsed = uptime_s - (start_ticks / os.sysconf("SC_CLK_TCK"))
+        except (OSError, ValueError, IndexError):
+            elapsed = None
+    return pressure, elapsed
+
+
+
+
+def _open_serve_log() -> Any:
+    """Open (create) the serve log file with sync I/O off the event loop."""
+    os.makedirs(OPENCODE_WORKSPACE_DIR, exist_ok=True)
+    return open(
+        os.path.join(OPENCODE_WORKSPACE_DIR, "opencode-serve.log"), "ab", buffering=0,
+    )
 
 
 def _memory_pressure() -> bool:

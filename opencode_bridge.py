@@ -239,6 +239,7 @@ async def opencode_chat_stream(
         return
     async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
         try:
+            await _abort_zombie_sessions(client)
             session_id = (
                 session_map.get(session_key)
                 if session_map and session_key else None
@@ -357,7 +358,47 @@ async def opencode_chat_stream(
                             else _EVENT_QUIET_TIMEOUT,
                         )
                     except StopAsyncIteration:
-                        return
+                        # The /event SSE bus closed (the serve closes idle
+                        # connections) but the session may still be working.
+                        # Fall back to polling the session's message list
+                        # until it completes or the total timeout fires.
+                        while True:
+                            if time.monotonic() - started > OPENCODE_SERVE_TIMEOUT:
+                                logger.error(
+                                    "opencode bridge timeout during polling — aborting session %s",
+                                    session_id[:16],
+                                )
+                                try:
+                                    await client.post(
+                                        f"{OPENCODE_SERVE_URL}/session/{session_id}/abort",
+                                        timeout=10.0,
+                                    )
+                                except (httpx.HTTPError, OSError):
+                                    pass
+                                if session_map is not None and session_key:
+                                    session_map.pop(session_key, None)
+                                yield ("status", "[OpenCode Bridge Error: timed out waiting for the agent]")
+                                return
+                            async for delta in _poll_session_deltas(
+                                client, session_id, user_mids, text_lens, tool_state,
+                            ):
+                                if delta[0] == "question":
+                                    yield delta
+                                    return
+                                if delta[0] == "_step_finish":
+                                    pending_done = True
+                                    continue
+                                yield delta
+                            try:
+                                st_resp = await client.get(
+                                    f"{OPENCODE_SERVE_URL}/session/status", timeout=10.0,
+                                )
+                                st = (st_resp.json().get(session_id) or {}).get("type")
+                            except (httpx.HTTPError, ValueError):
+                                st = None
+                            if st == "idle":
+                                return
+                            await asyncio.sleep(1.0)
                     except asyncio.TimeoutError:
                         if pending_done and not session_busy:
                             return
@@ -397,111 +438,21 @@ async def opencode_chat_stream(
                                 return
                     elif etype == "message.part.updated":
                         part = props.get("part") or {}
-                        pid = part.get("id")
-                        # Accept parts from ANY assistant message (an agentic
-                        # session emits several: reasoning/tool step, then a
-                        # final summary message); only user-message parts are
-                        # excluded so the echoed prompt never streams back.
+                        # Accept parts from ANY assistant message; only
+                        # user-message parts are excluded so the echoed
+                        # prompt never streams back.
                         if part.get("messageID") in user_mids:
                             continue
-                        ptype = part.get("type")
-                        if ptype == "step-finish":
-                            pending_done = True
-                        elif ptype == "text":
-                            text = str(part.get("text") or "")
-                            prev = text_lens.get(pid, 0)
-                            if len(text) > prev:
-                                text_lens[pid] = len(text)
-                                yield ("text", text[prev:])
-                        elif ptype == "reasoning":
-                            # Live thinking feedback (sentinel-prefixed so it
-                            # is visible inline but stripped from future
-                            # model copies).
-                            text = str(part.get("text") or "")
-                            prev = text_lens.get(pid, 0)
-                            if len(text) > prev:
-                                text_lens[pid] = len(text)
-                                delta = text[prev:]
-                                if delta.strip():
-                                    yield ("reasoning", delta)
-                        elif ptype == "tool":
-                            # Tool execution feedback: show each tool the
-                            # agent runs (sentinel-prefixed status).  The
-                            # event schema: part["tool"] is the name and
-                            # part["state"] is a dict with a "status" key.
-                            name = str(part.get("tool") or "")
-                            if name == "question":
-                                # The agent is asking the user a clarifying
-                                # question.  Stream the question text (with
-                                # its options) and stop: the session stays
-                                # pinned so the next request can post the
-                                # user's answer.  The event's part often
-                                # omits the input, so fetch the persisted
-                                # part to read state.input.questions[].
-                                qtext = ""
-                                opts: list[str] = []
-                                state = part.get("state") or {}
-                                inp = state.get("input") if isinstance(state, dict) else None
-                                if isinstance(inp, dict):
-                                    questions = inp.get("questions")
-                                    if isinstance(questions, list) and questions:
-                                        q0 = questions[0]
-                                        if isinstance(q0, dict):
-                                            qtext = str(q0.get("question") or "")
-                                            opts = [
-                                                str(o.get("label") or "")
-                                                for o in (q0.get("options") or [])
-                                                if isinstance(o, dict) and o.get("label")
-                                            ]
-                                    else:
-                                        qtext = str(inp.get("question") or "")
-                                else:
-                                    qtext = str(inp or "")
-                                if not qtext:
-                                    logger.info(
-                                        "question event missing input; part=%s mid=%s",
-                                        (part.get("id") or "")[:16],
-                                        (part.get("messageID") or "")[:16],
-                                    )
-                                    # The question part's input is persisted
-                                    # a moment AFTER the event fires (race);
-                                    # retry the fetch briefly.
-                                    for _attempt in range(6):
-                                        try:
-                                            msg_resp = await client.get(
-                                                f"{OPENCODE_SERVE_URL}/session/{session_id}/message/{part.get('messageID')}",
-                                                timeout=10.0,
-                                            )
-                                            for p2 in (msg_resp.json().get("parts") or []):
-                                                if p2.get("id") == part.get("id") and isinstance(p2.get("state"), dict):
-                                                    i2 = (p2.get("state") or {}).get("input")
-                                                    if isinstance(i2, dict):
-                                                        qs = i2.get("questions")
-                                                        if isinstance(qs, list) and qs and isinstance(qs[0], dict):
-                                                            qtext = str(qs[0].get("question") or "")
-                                                            opts = [
-                                                                str(o.get("label") or "")
-                                                                for o in (qs[0].get("options") or [])
-                                                                if isinstance(o, dict) and o.get("label")
-                                                            ]
-                                                        else:
-                                                            qtext = str(i2.get("question") or "")
-                                        except (httpx.HTTPError, ValueError):
-                                            pass
-                                        if qtext:
-                                            break
-                                        await asyncio.sleep(0.3)
-                                if opts:
-                                    qtext = f"{qtext} (Options: {' | '.join(opts)})"
-                                yield ("question", qtext or "Could you clarify?")
+                        async for delta in _yield_part_deltas(
+                            part, text_lens, tool_state, session_id, client,
+                        ):
+                            if delta[0] == "_step_finish":
+                                pending_done = True
+                            elif delta[0] == "question":
+                                yield delta
                                 return
-                            state = str((part.get("state") or {}).get("status") or "")
-                            if name and state != tool_state.get(name):
-                                tool_state[name] = state
-                                if state == "running":
-                                    yield ("status", f"🔧 {name}…")
-                                elif state == "completed":
-                                    yield ("status", f"✅ {name} done")
+                            else:
+                                yield delta
         except (httpx.HTTPError, OSError, ValueError) as exc:
             yield ("status", f"[OpenCode Bridge Network Error: {str(exc)}]")
 
@@ -518,3 +469,170 @@ async def opencode_escalation(stage: int, prompt: str) -> str:
     """
     logger.info("OpenCode escalation (stage=%d): %r", stage, prompt[:200])
     return await opencode_chat(prompt, agent=OPENCODE_AGENT)
+
+
+
+async def _yield_part_deltas(
+    part: dict[str, Any],
+    text_lens: dict[str, int],
+    tool_state: dict[str, str],
+    session_id: str,
+    client: httpx.AsyncClient,
+) -> AsyncIterator[tuple[str, str]]:
+    """Yield stream deltas for one opencode part (shared by the event bus
+    and the polling fallback).
+
+    Yields (kind, text): "text" → assistant content, "reasoning" → thinking,
+    "status" → tool progress feedback, "question" → the agent is asking the
+    user (caller must stop), "_step_finish" → a step completed (caller tracks
+    pending_done).  Never raises.
+    """
+    pid = str(part.get("id") or "")
+    ptype = part.get("type")
+    if ptype == "step-finish":
+        yield ("_step_finish", "")
+        return
+    if ptype == "text":
+        text = str(part.get("text") or "")
+        prev = text_lens.get(pid, 0)
+        if len(text) > prev:
+            text_lens[pid] = len(text)
+            if text[prev:].strip():
+                yield ("text", text[prev:])
+        return
+    if ptype == "reasoning":
+        text = str(part.get("text") or "")
+        prev = text_lens.get(pid, 0)
+        if len(text) > prev:
+            text_lens[pid] = len(text)
+            delta = text[prev:]
+            if delta.strip():
+                yield ("reasoning", delta)
+        return
+    if ptype == "tool":
+        name = str(part.get("tool") or "")
+        if name == "question":
+            # The agent is asking the user.  The event part often omits the
+            # input; fetch the persisted part to read state.input.questions[].
+            qtext = ""
+            opts: list[str] = []
+            state = part.get("state") or {}
+            inp = state.get("input") if isinstance(state, dict) else None
+            if isinstance(inp, dict):
+                questions = inp.get("questions")
+                if isinstance(questions, list) and questions:
+                    q0 = questions[0]
+                    if isinstance(q0, dict):
+                        qtext = str(q0.get("question") or "")
+                        opts = [str(o.get("label") or "") for o in (q0.get("options") or [])
+                                if isinstance(o, dict) and o.get("label")]
+                else:
+                    qtext = str(inp.get("question") or "")
+            else:
+                qtext = str(inp or "")
+            if not qtext:
+                for _attempt in range(6):
+                    try:
+                        msg_resp = await client.get(
+                            f"{OPENCODE_SERVE_URL}/session/{session_id}/message/{part.get('messageID')}",
+                            timeout=10.0,
+                        )
+                        for p2 in (msg_resp.json().get("parts") or []):
+                            if p2.get("id") == pid and isinstance(p2.get("state"), dict):
+                                i2 = (p2.get("state") or {}).get("input")
+                                if isinstance(i2, dict):
+                                    qs = i2.get("questions")
+                                    if isinstance(qs, list) and qs and isinstance(qs[0], dict):
+                                        qtext = str(qs[0].get("question") or "")
+                                        opts = [str(o.get("label") or "") for o in (qs[0].get("options") or [])
+                                                if isinstance(o, dict) and o.get("label")]
+                                    else:
+                                        qtext = str(i2.get("question") or "")
+                    except (httpx.HTTPError, ValueError):
+                        pass
+                    if qtext:
+                        break
+                    await asyncio.sleep(0.3)
+            if opts:
+                qtext = f"{qtext} (Options: {' | '.join(opts)})"
+            yield ("question", qtext or "Could you clarify?")
+            return
+        state = str((part.get("state") or {}).get("status") or "")
+        if name and state != tool_state.get(name):
+            tool_state[name] = state
+            if state == "running":
+                yield ("status", f"🔧 {name}…")
+            elif state == "completed":
+                yield ("status", f"✅ {name} done")
+        return
+
+
+async def _poll_session_deltas(
+    client: httpx.AsyncClient,
+    session_id: str,
+    user_mids: set[str],
+    text_lens: dict[str, int],
+    tool_state: dict[str, str],
+) -> AsyncIterator[tuple[str, str]]:
+    """Poll a session's message list for new parts (used when the /event SSE
+    bus closes but the session is still busy).  Yields deltas; the CALLER
+    checks the session status and decides when to stop polling."""
+    try:
+        resp = await client.get(
+            f"{OPENCODE_SERVE_URL}/session/{session_id}/message", timeout=10.0,
+        )
+        if resp.status_code != 200:
+            return
+        for m in resp.json():
+            if (m.get("info") or {}).get("role") != "assistant":
+                continue
+            for p in m.get("parts") or []:
+                if p.get("messageID") in user_mids:
+                    continue
+                async for delta in _yield_part_deltas(
+                    p, text_lens, tool_state, session_id, client,
+                ):
+                    if delta[0] == "question":
+                        yield delta
+                        return
+                    yield delta
+    except (httpx.HTTPError, OSError, ValueError):
+        return
+
+
+
+async def _abort_zombie_sessions(client: httpx.AsyncClient) -> None:
+    """Abort sessions that are stuck (busy with no recent activity).
+
+    The opencode serve processes agent sessions through a sequential tool
+    runner: a hung tool (e.g. an agent bash call that never completes)
+    leaves the session busy FOREVER and blocks every later task behind it —
+    which made the bridge look like it "consistently fails" after one
+    zombie session accumulated.  A busy session whose last update is older
+    than a few minutes is stuck, not working; abort it so new tasks get a
+    free slot.  Never raises (best-effort hygiene).
+    """
+    try:
+        resp = await client.get(f"{OPENCODE_SERVE_URL}/session", timeout=10.0)
+        if resp.status_code != 200:
+            return
+        now_ms = int(time.time() * 1000)
+        threshold_ms = 240_000
+        for s in resp.json():
+            sid = s.get("id")
+            if not sid:
+                continue
+            updated = ((s.get("time") or {}).get("updated") or 0)
+            if updated and now_ms - updated > threshold_ms:
+                logger.warning(
+                    "opencode zombie session %s idle for %.0fs — aborting",
+                    str(sid)[:16], (now_ms - updated) / 1000,
+                )
+                try:
+                    await client.post(
+                        f"{OPENCODE_SERVE_URL}/session/{sid}/abort", timeout=10.0,
+                    )
+                except (httpx.HTTPError, OSError):
+                    pass
+    except (httpx.HTTPError, OSError, ValueError):
+        return

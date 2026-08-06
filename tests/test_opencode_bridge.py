@@ -78,6 +78,9 @@ class _FakeClient:
         if "/message/" in url:
             # Persisted-message GET used by the question retry-race fetch.
             return _FakeResp(200, {"info": {}, "parts": self.message_get_parts})
+        if "/session/status" in url:
+            # Event-stream end → polling fallback → session is idle (done).
+            return _FakeResp(200, {self.session_id: {"type": "idle"}})
         return _FakeResp(self.get_status, {})
 
     async def post(self, url: str, **kwargs: Any) -> _FakeResp:

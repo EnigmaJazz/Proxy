@@ -1212,9 +1212,17 @@ async def chat_completions(request: Request) -> Response:
     # 7 clean structured tool calls, 0 text-tool-call leak).  Mid-tool-flow
     # continuations classify as TOOL, so they stay thinking-off.
     thinking_header = headers.get("x-proxy-thinking", "").lower()
+    user_agent = headers.get("user-agent", "").lower()
     if thinking_header == "true":
         payload["chat_template_kwargs"] = {"enable_thinking": True, "preserve_thinking": True}
     elif thinking_header == "false":
+        payload["chat_template_kwargs"] = {"enable_thinking": False, "preserve_thinking": False}
+    elif "opencode" in user_agent:
+        # opencode's agent expects content/tool_calls, not reasoning-only:
+        # the local Qwen professional with thinking ON emits reasoning but
+        # NO content, so the opencode agent sees an empty response and
+        # stalls ("local model doesn't work in opencode").  Force thinking
+        # off for opencode clients.
         payload["chat_template_kwargs"] = {"enable_thinking": False, "preserve_thinking": False}
     else:
         intent = (classification or {}).get("intent", "").upper()

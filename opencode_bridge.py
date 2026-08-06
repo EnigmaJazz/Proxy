@@ -239,6 +239,7 @@ async def opencode_chat_stream(
         return
     async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
         try:
+            await _recycle_serve_if_low_memory()
             await _abort_zombie_sessions(client)
             session_id = (
                 session_map.get(session_key)
@@ -599,6 +600,63 @@ async def _poll_session_deltas(
     except (httpx.HTTPError, OSError, ValueError):
         return
 
+
+
+
+
+async def _recycle_serve_if_low_memory() -> None:
+    """Restart the opencode serve when the system is critically short of
+    memory.
+
+    The serve's ~1GB RSS is a significant reclaim when the box is swap
+    thrashing, and a memory-starved serve hangs its bash tool on trivial
+    commands (the agent-loop tool runner cannot spawn/complete shells).
+    Killing the serve lets the next ``ensure_opencode_serve`` respawn a
+    fresh one.  Never raises.
+    """
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    avail_kb = int(line.split()[1])
+                    break
+            else:
+                return
+        if avail_kb >= 1_500_000:
+            return
+        logger.warning(
+            "Low memory (%.1fGB available) — recycling opencode serve",
+            avail_kb / 1048576,
+        )
+        # Discover the serve pid by scanning /proc (no module global —
+        # Rule 6: no mutable module-level state).
+        port = OPENCODE_SERVE_URL.rsplit(":", 1)[-1]
+        pid = _find_serve_pid(port)
+        if pid:
+            try:
+                os.kill(pid, 15)
+            except (OSError, ProcessLookupError):
+                pass
+    except (OSError, ValueError):
+        return
+
+
+def _find_serve_pid(port: str) -> Optional[int]:
+    """Locate the opencode serve process pid by scanning /proc cmdlines."""
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/cmdline", "rb") as fh:
+                    cmd = fh.read().decode("utf-8", "ignore")
+                if "opencode" in cmd and "serve" in cmd and f"--port {port}" in cmd:
+                    return int(entry)
+            except (OSError, ValueError):
+                continue
+    except OSError:
+        pass
+    return None
 
 
 async def _abort_zombie_sessions(client: httpx.AsyncClient) -> None:

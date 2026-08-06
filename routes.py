@@ -735,9 +735,12 @@ async def chat_completions(request: Request) -> Response:
     # Pinned opencode session continuation: a previous opencode task in
     # THIS conversation ended with a clarifying question (or is still
     # active).  Route the follow-up to the SAME agent session so it can
-    # answer the question / continue with the new instruction.
+    # answer the question / continue with the new instruction.  Skip when
+    # the last assistant message is the pending coding-decision question
+    # — that turn is owned by the gate (the user's "opencode"/"local"
+    # answer must resolve the routing, never become the agent's task).
     pinned = _opencode_session_state(request.app).get(session_key)
-    if pinned:
+    if pinned and _find_coding_question_index(processed_messages) is None:
         answer = _last_user_text(processed_messages)
         logger.info(
             "Resuming pinned opencode session for %s (answer=%r)",

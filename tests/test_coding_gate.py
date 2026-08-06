@@ -853,3 +853,58 @@ class TestCachedDecisionFollowUp:
         # plain chat path bypassing the coding pipeline).
         assert "Coding decision" not in capture.payload
         assert capture.payload is not None
+
+
+# ---------------------------------------------------------------------------
+# Pinned-session continuation must not steal the gate's decision turn
+# ---------------------------------------------------------------------------
+class TestPinnedContinuationVsGate:
+    @pytest.mark.asyncio
+    async def test_gate_answer_does_not_become_the_task(
+        self, gate_client, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from routes import (
+            _CODING_QUESTION_PREFIX,
+            _opencode_session_state,
+            _resolve_session_id,
+        )
+
+        task = "write a script to check for updates"
+        msgs = [{"role": "user", "content": task}]
+        sid = _resolve_session_id(msgs, proxy.app)
+        # Pin an opencode session for this conversation (as if a previous
+        # opencode task had pinned it).
+        _opencode_session_state(proxy.app)[sid] = "ses_0001"
+
+        seen_task: list[str] = []
+
+        async def _fake_stream(
+            text: str, *args: Any, **kwargs: Any,
+        ) -> AsyncIterator[tuple[str, str]]:
+            seen_task.append(text)
+            yield ("text", "ok")
+            return
+
+        monkeypatch.setattr("routes.opencode_chat_stream", _fake_stream)
+        with patch("routes.classify_with_frontdesk",
+                   new=AsyncMock(return_value=_classification("CODE"))):
+            response = await gate_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "auto",
+                    "messages": [
+                        {"role": "user", "content": task},
+                        {"role": "assistant",
+                         "content": f"{_CODING_QUESTION_PREFIX} Coding task detected"},
+                        {"role": "user", "content": "Opencode"},
+                    ],
+                    "stream": True,
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            await response.aread()
+
+        # The agent must receive the ORIGINAL TASK, not the answer "Opencode".
+        assert seen_task, "bridge was not called"
+        assert seen_task[0] == task
+        assert "Opencode" not in seen_task[0]

@@ -615,23 +615,11 @@ async def _recycle_serve_if_low_memory() -> None:
     fresh one.  Never raises.
     """
     try:
-        with open("/proc/meminfo", encoding="utf-8") as fh:
-            for line in fh:
-                if line.startswith("MemAvailable:"):
-                    avail_kb = int(line.split()[1])
-                    break
-            else:
-                return
-        if avail_kb >= 1_500_000:
+        pressure = await asyncio.to_thread(_memory_pressure)
+        if not pressure:
             return
-        logger.warning(
-            "Low memory (%.1fGB available) — recycling opencode serve",
-            avail_kb / 1048576,
-        )
-        # Discover the serve pid by scanning /proc (no module global —
-        # Rule 6: no mutable module-level state).
         port = OPENCODE_SERVE_URL.rsplit(":", 1)[-1]
-        pid = _find_serve_pid(port)
+        pid = await asyncio.to_thread(_find_serve_pid, port)
         if pid:
             try:
                 os.kill(pid, 15)
@@ -639,6 +627,28 @@ async def _recycle_serve_if_low_memory() -> None:
                 pass
     except (OSError, ValueError):
         return
+
+
+def _memory_pressure() -> bool:
+    """True when the system is critically short of memory (sync /proc read,
+    offloaded to a worker thread by the caller — Rule 3)."""
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    avail_kb = int(line.split()[1])
+                    break
+            else:
+                return False
+        if avail_kb < 2_000_000:
+            logger.warning(
+                "Low memory (%.1fGB available) — recycling opencode serve",
+                avail_kb / 1048576,
+            )
+            return True
+    except (OSError, ValueError):
+        pass
+    return False
 
 
 def _find_serve_pid(port: str) -> Optional[int]:

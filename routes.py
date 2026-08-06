@@ -26,6 +26,7 @@ import sqlite3
 import subprocess
 import time
 import uuid
+from pathlib import Path
 import httpx
 from typing import TYPE_CHECKING, Any, AsyncIterator, Optional
 
@@ -45,7 +46,6 @@ from constants import (
     _HEAVY_MODEL_KEYS,
     MODEL_LABELS,
     OPENCODE_AGENT,
-    OPENCODE_SERVE_TIMEOUT,
     RUNTIME_CONTEXT_WINDOWS,
     get_logger,
 )
@@ -160,11 +160,44 @@ def _opencode_session_state(app: FastAPI) -> dict[str, str]:
     Keyed by proxy ``session_id`` → opencode session id.  Pinning lets a
     follow-up request RESUME the same agent session (it keeps its tool state
     and can answer clarifying questions), instead of starting fresh each time.
+    The map is disk-backed (survives proxy restarts) — without that, a proxy
+    restart orphaned every pin and each request created a NEW opencode
+    session, so the orchestrator lost the task context.
     """
     state = app.state
     if not hasattr(state, "opencode_sessions"):
-        state.opencode_sessions = {}
+        # Deliberate one-time lazy init (a single cold read on first
+        # access; the map is then cached on app.state and all later
+        # mutations are disk-persisted off the event loop).
+        state.opencode_sessions = _load_opencode_sessions()
     return state.opencode_sessions
+
+
+async def _persist_opencode_sessions(app: FastAPI) -> None:
+    """Persist the pinned-session map to disk (survives proxy restarts).
+
+    Disk I/O runs on a worker thread (Rule 3 — the request path is async).
+    """
+    try:
+        path = Path.home() / ".kinver-proxy" / "opencode-sessions.json"
+        data = json.dumps(_opencode_session_state(app))
+        await asyncio.to_thread(_write_opencode_sessions, path, data)
+    except OSError as exc:
+        logger.warning("Failed to persist opencode sessions: %s", exc)
+
+
+def _write_opencode_sessions(path: Path, data: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(data)
+
+
+def _load_opencode_sessions() -> dict[str, str]:
+    try:
+        path = Path.home() / ".kinver-proxy" / "opencode-sessions.json"
+        data = json.loads(path.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
 def _find_coding_question_index(messages: list[dict[str, Any]]) -> Optional[int]:
@@ -725,12 +758,14 @@ async def chat_completions(request: Request) -> Response:
     # opencode serve backend (gentle-orchestrator SDD agent).
     session_key = _resolve_session_id(processed_messages, request.app)
     if requested_model in BRIDGE_MODEL_KEYS:
-        return await _handle_opencode_request(
+        resp = await _handle_opencode_request(
             processed_messages,
             client_stream,
             session_map=_opencode_session_state(request.app),
             session_key=session_key,
         )
+        await _persist_opencode_sessions(request.app)
+        return resp
 
     # Pinned opencode session continuation: a previous opencode task in
     # THIS conversation ended with a clarifying question (or is still
@@ -746,12 +781,14 @@ async def chat_completions(request: Request) -> Response:
             "Resuming pinned opencode session for %s (answer=%r)",
             session_key[:16], answer[:60],
         )
-        return await _opencode_task_response(
+        resp = await _opencode_task_response(
             answer or "continue",
             client_stream,
             session_map=_opencode_session_state(request.app),
             session_key=session_key,
         )
+        await _persist_opencode_sessions(request.app)
+        return resp
 
     # ---- Dream/soul fast-path: bypass frontdesk, route to professional ----
     if is_dream:
@@ -2186,12 +2223,13 @@ async def _handle_opencode_request(
         "opencode bridge request: task=%r msgs=%d",
         task_text[:160], len(messages),
     )
-    return await _opencode_task_response(
+    resp = await _opencode_task_response(
         task_text,
         client_stream,
         session_map=session_map,
         session_key=session_key,
     )
+    return resp
 
 
 # ---------------------------------------------------------------------------
@@ -2281,12 +2319,14 @@ async def _apply_coding_decision_gate(
         logger.info("Coding decision for session %s: %s", session_id, decision)
         task_messages = messages[:question_idx]  # task = convo up to the question
         if decision == "opencode":
-            return await _opencode_task_response(
+            resp = await _opencode_task_response(
                 _last_user_text(task_messages),
                 client_stream,
                 session_map=_opencode_session_state(app),
                 session_key=session_id,
             )
+            await _persist_opencode_sessions(app)
+            return resp
         # professional: drop the question + answer; the flow continues to
         # the local code pathway with the original task as the last turn.
         messages[:] = task_messages
@@ -2297,12 +2337,14 @@ async def _apply_coding_decision_gate(
     if route.intent == "CODE" and not has_tool_calls:
         decision = decisions.get(session_id)
         if decision == "opencode":
-            return await _opencode_task_response(
+            resp = await _opencode_task_response(
                 _last_user_text(messages),
                 client_stream,
                 session_map=_opencode_session_state(app),
                 session_key=session_id,
             )
+            await _persist_opencode_sessions(app)
+            return resp
         if decision is None:
             question = (
                 f"{_CODING_QUESTION_PREFIX} Coding task detected — route to OpenCode "

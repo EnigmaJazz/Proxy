@@ -47,6 +47,8 @@ from constants import (
     _HEAVY_MODEL_KEYS,
     MODEL_LABELS,
     OPENCODE_AGENT,
+    OPENCODE_SDD_TIMEOUT,
+    OPENCODE_SERVE_TIMEOUT,
     RUNTIME_CONTEXT_WINDOWS,
     get_logger,
 )
@@ -61,6 +63,8 @@ from llm import (
     openrouter_cloud_escalation,
 )
 from opencode_bridge import (
+    _BRIDGE_SYSTEM_PROMPT,
+    _SDD_AUTONOMOUS_SYSTEM_PROMPT,
     _parse_permission_answer,
     _post_permission_response,
     opencode_chat,
@@ -777,9 +781,10 @@ async def chat_completions(request: Request) -> Response:
     if last_user and _OPENCODE_RE.search(last_user.lower()):
         return await _handle_opencode_command(last_user)
 
-    # model: "opencode" — client picked the opencode bridge model.  This
-    # bypasses llama routing entirely: the task goes to the headless
-    # opencode serve backend (gentle-orchestrator SDD agent).
+    # model: "opencode" / "opencode-sdd" — client picked the opencode
+    # bridge model.  This bypasses llama routing entirely: the task goes to
+    # the headless opencode serve backend (gentle-orchestrator SDD agent).
+    # "opencode-sdd" runs the FULL SDD cycle autonomously in one turn.
     session_key = _resolve_session_id(processed_messages, request.app)
     if requested_model in BRIDGE_MODEL_KEYS:
         resp = await _handle_opencode_request(
@@ -788,6 +793,7 @@ async def chat_completions(request: Request) -> Response:
             session_map=_opencode_session_state(request.app),
             session_key=session_key,
             pending_permissions=_pending_permissions_state(request.app),
+            sdd=(requested_model == "opencode-sdd"),
         )
         await _persist_opencode_sessions(request.app)
         return resp
@@ -2196,6 +2202,8 @@ async def _opencode_task_response(
     session_key: Optional[str] = None,
     pending_permissions: Optional[dict[str, str]] = None,
     just_approved_permission: bool = False,
+    system_prompt: str = _BRIDGE_SYSTEM_PROMPT,
+    timeout: float = OPENCODE_SERVE_TIMEOUT,
 ) -> Response:
     """Run a task through the opencode bridge and return the response.
 
@@ -2226,6 +2234,8 @@ async def _opencode_task_response(
             session_key=session_key,
             pending_permissions=pending_permissions,
             just_approved_permission=just_approved_permission,
+            system_prompt=system_prompt,
+            timeout=timeout,
         ):
             stop_after = False
             if not text_delta:
@@ -2304,6 +2314,7 @@ async def _handle_opencode_request(
     session_map: Optional[dict[str, str]] = None,
     session_key: Optional[str] = None,
     pending_permissions: Optional[dict[str, str]] = None,
+    sdd: bool = False,
 ) -> Response:
     """Handle ``model: "opencode"`` — direct the task to the opencode agent.
 
@@ -2323,6 +2334,10 @@ async def _handle_opencode_request(
         session_map=session_map,
         session_key=session_key,
         pending_permissions=pending_permissions,
+        system_prompt=(
+            _SDD_AUTONOMOUS_SYSTEM_PROMPT if sdd else _BRIDGE_SYSTEM_PROMPT
+        ),
+        timeout=OPENCODE_SDD_TIMEOUT if sdd else OPENCODE_SERVE_TIMEOUT,
     )
     return resp
 

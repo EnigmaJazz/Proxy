@@ -36,6 +36,7 @@ from constants import (
     OPENCODE_AGENT,
     OPENCODE_BIN,
     OPENCODE_SERVE_TIMEOUT,
+    OPENCODE_SDD_TIMEOUT,
     OPENCODE_SERVE_URL,
     OPENCODE_BRIDGE_DIRECTORY,
     OPENCODE_WORKSPACE_DIR,
@@ -57,6 +58,35 @@ _BRIDGE_SYSTEM_PROMPT = (
     "the result, ask a clarifying question and stop — the user's answer will "
     "resume this same session and you may ask again if needed.  Otherwise "
     "make reasonable assumptions, state them briefly, and complete the task."
+)
+
+# SDD-AUTONOMOUS system prompt: used when the client picks model
+# "opencode-sdd".  The orchestrator must run the COMPLETE SDD cycle in ONE
+# long-lived turn — no clarifying questions, no per-phase chat — because
+# the bridge is a single request/response and the user will not answer
+# follow-ups mid-cycle.  The preflight choices are supplied in the task
+# text; the orchestrator caches them and proceeds.
+_SDD_AUTONOMOUS_SYSTEM_PROMPT = (
+    "You are the SDD orchestrator in AUTONOMOUS mode through a proxy "
+    "bridge. Run the COMPLETE Spec-Driven Development cycle for the "
+    "requested change in ONE continuous turn: session preflight (use the "
+    "choices already given in the task text - do NOT ask), init guard, "
+    "then proposal, spec, design, tasks, apply, verify, archive "
+    "back-to-back, delegating each phase to the appropriate sub-agent.\n\n"
+    "CRITICAL RULES:\n"
+    "- Never stop to ask a clarifying question or present the interactive "
+    "proceed/adjust/stop menu. The user cannot answer mid-cycle on this "
+    "channel; the whole cycle must complete autonomously in this turn.\n"
+    "- If the preflight choices are embedded in the task text, treat them "
+    "as the user-supplied session preflight and do not re-ask.\n"
+    "- Stream concise status lines between phases so the caller sees "
+    "progress (e.g. 'SDD: exploring', 'SDD: proposing', ...).\n"
+    "- Apply the Gatekeeper between phases; on failure fix once or abort "
+    "with a clear error - never loop.\n"
+    "- Keep the final summary short: change name, artifacts produced, "
+    "tests run, and any remaining risk.\n"
+    "You still have full sub-agent access; use it for every phase. Do NOT "
+    "ask the user anything."
 )
 
 # Recycle the opencode serve after this uptime: the serve's agent-loop
@@ -420,6 +450,7 @@ async def opencode_chat(
     model_id: Optional[str] = None,
     provider_id: str = "kinver",
     timeout: float = OPENCODE_SERVE_TIMEOUT,
+    system_prompt: str = _BRIDGE_SYSTEM_PROMPT,
 ) -> str:
     """Send a task to headless opencode and return the assistant text.
 
@@ -447,7 +478,7 @@ async def opencode_chat(
             # ---- 2. Post the message (blocks until the agent finishes) ----
             payload: dict[str, Any] = {
                 "agent": agent,
-                "system": _BRIDGE_SYSTEM_PROMPT,
+                "system": system_prompt,
                 "parts": [{"type": "text", "text": user_text}],
             }
             if model_id:
@@ -487,6 +518,8 @@ async def opencode_chat_stream(
     session_key: Optional[str] = None,
     pending_permissions: Optional[dict[str, tuple[str, bool]]] = None,
     just_approved_permission: bool = False,
+    system_prompt: str = _BRIDGE_SYSTEM_PROMPT,
+    timeout: float = OPENCODE_SERVE_TIMEOUT,
 ) -> AsyncIterator[tuple[str, str]]:
     """Stream a task through headless opencode, yielding assistant content live.
 
@@ -573,7 +606,7 @@ async def opencode_chat_stream(
                     session_map[session_key] = session_id
             payload: dict[str, Any] = {
                 "agent": agent,
-                "system": _BRIDGE_SYSTEM_PROMPT,
+                "system": system_prompt,
                 "parts": [{"type": "text", "text": user_text}],
             }
             if model_id:
@@ -621,7 +654,7 @@ async def opencode_chat_stream(
                     # session "busy" forever; cap the wait, abort the
                     # session, and surface a clear error instead of
                     # streaming keepalives indefinitely.
-                    if time.monotonic() - started > OPENCODE_SERVE_TIMEOUT:
+                    if time.monotonic() - started > timeout:
                         logger.error(
                             "opencode bridge timeout after %.0fs — aborting session %s",
                             OPENCODE_SERVE_TIMEOUT, session_id[:16],
@@ -670,7 +703,7 @@ async def opencode_chat_stream(
                         # consecutive poll cycles means the agent is done.
                         finish_quiet_cycles = 0
                         while True:
-                            if time.monotonic() - started > OPENCODE_SERVE_TIMEOUT:
+                            if time.monotonic() - started > timeout:
                                 logger.error(
                                     "opencode bridge timeout during polling — aborting session %s",
                                     session_id[:16],

@@ -256,6 +256,8 @@ class TestRoutesOpenCode:
             session_key: Optional[str] = None,
             pending_permissions: Optional[dict[str, tuple[str, bool]]] = None,
             just_approved_permission: bool = False,
+            system_prompt: str = "",
+            timeout: float = 600.0,
         ) -> AsyncIterator[tuple[str, str]]:
             captured.append(text)
             yield ("text", "BRIDGE_DONE")
@@ -284,6 +286,8 @@ class TestRoutesOpenCode:
             session_key: Optional[str] = None,
             pending_permissions: Optional[dict[str, tuple[str, bool]]] = None,
             just_approved_permission: bool = False,
+            system_prompt: str = "",
+            timeout: float = 600.0,
         ) -> AsyncIterator[tuple[str, str]]:
             yield ("text", "STREAMED_")
             yield ("text", "DONE")
@@ -305,6 +309,45 @@ class TestRoutesOpenCode:
 
         resp = await _handle_opencode_request([], client_stream=True)
         assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_model_opencode_sdd_uses_autonomous_prompt_and_long_timeout(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """SDD-autonomous mode: model "opencode-sdd" must dispatch through
+        the bridge with the _SDD_AUTONOMOUS_SYSTEM_PROMPT and the long
+        OPENCODE_SDD_TIMEOUT — the whole cycle runs in ONE long-lived turn
+        with no per-phase chat."""
+        from routes import _handle_opencode_request
+        from opencode_bridge import _SDD_AUTONOMOUS_SYSTEM_PROMPT
+        from constants import OPENCODE_SDD_TIMEOUT
+
+        seen: dict[str, object] = {}
+
+        async def _fake_stream(
+            text: str, *, agent: str = "gentle-orchestrator",
+            model_id: Optional[str] = None, provider_id: str = "kinver",
+            session_map: Optional[dict[str, str]] = None,
+            session_key: Optional[str] = None,
+            pending_permissions: Optional[dict[str, str]] = None,
+            just_approved_permission: bool = False,
+            system_prompt: str = "",
+            timeout: float = 600.0,
+        ) -> AsyncIterator[tuple[str, str]]:
+            seen["system_prompt"] = system_prompt
+            seen["timeout"] = timeout
+            yield ("text", "SDD_CYCLE_DONE")
+
+        monkeypatch.setattr("routes.opencode_chat_stream", _fake_stream)
+        resp = await _handle_opencode_request(
+            [{"role": "user", "content": "Use SDD to add a docs file"}],
+            client_stream=True,
+            sdd=True,
+        )
+        text = await _drain_stream(resp)
+        assert "SDD_CYCLE_DONE" in text
+        assert seen.get("system_prompt") == _SDD_AUTONOMOUS_SYSTEM_PROMPT
+        assert seen.get("timeout") == OPENCODE_SDD_TIMEOUT
 
     @pytest.mark.asyncio
     async def test_opencode_command_strips_prefix(

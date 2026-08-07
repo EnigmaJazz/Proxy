@@ -182,7 +182,13 @@ OPENCODE_SERVE_TIMEOUT: float = 600.0
 
 # Bridge model keys exposed to clients, validated alongside ALL_MODEL_KEYS.
 # "opencode" routes to the opencode serve bridge instead of llama.cpp.
-BRIDGE_MODEL_KEYS: frozenset[str] = frozenset({"opencode"})
+BRIDGE_MODEL_KEYS: frozenset[str] = frozenset({"opencode", "opencode-sdd"})
+
+# Time budget for a single bridge turn.  The regular bridge streams one
+# agentic task; the SDD-autonomous mode runs the FULL cycle (proposal →
+# spec → design → tasks → apply → verify → archive) in one long-lived
+# turn, so it gets a much larger budget.
+OPENCODE_SDD_TIMEOUT: float = 3600.0
 
 # Queue-worker escalation backend after local tiers are exhausted:
 # "opencode" → headless opencode serve (build agent);

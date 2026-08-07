@@ -128,7 +128,7 @@ def fake_client(monkeypatch: pytest.MonkeyPatch) -> _FakeClient:
 # Shared pending-permission map for tests that exercise the permission
 # relay: the bridge no longer holds module-level mutable state (Rule 6), so
 # tests pass this dict in and assert against it.
-PP: dict[str, str] = {}
+PP: dict[str, tuple[str, bool]] = {}
 
 
 @pytest.fixture(autouse=True)
@@ -247,15 +247,25 @@ class TestRoutesOpenCode:
     ) -> None:
         from routes import _handle_opencode_request
 
-        async def _fake_chat(text: str, *, agent: str = "gentle-orchestrator") -> str:
-            assert text == "write a test"
-            return "BRIDGE_DONE"
+        captured: list[str] = []
 
-        monkeypatch.setattr("routes.opencode_chat", _fake_chat)
+        async def _fake_stream(
+            text: str, *, agent: str = "gentle-orchestrator",
+            model_id: Optional[str] = None, provider_id: str = "kinver",
+            session_map: Optional[dict[str, str]] = None,
+            session_key: Optional[str] = None,
+            pending_permissions: Optional[dict[str, tuple[str, bool]]] = None,
+            just_approved_permission: bool = False,
+        ) -> AsyncIterator[tuple[str, str]]:
+            captured.append(text)
+            yield ("text", "BRIDGE_DONE")
+
+        monkeypatch.setattr("routes.opencode_chat_stream", _fake_stream)
         resp = await _handle_opencode_request(
             [{"role": "user", "content": "write a test"}],
             client_stream=False,
         )
+        assert captured == ["write a test"]
         assert resp.status_code == 200
         body = resp.body.decode()
         assert "BRIDGE_DONE" in body
@@ -272,7 +282,8 @@ class TestRoutesOpenCode:
             model_id: Optional[str] = None, provider_id: str = "kinver",
             session_map: Optional[dict[str, str]] = None,
             session_key: Optional[str] = None,
-            pending_permissions: Optional[dict[str, str]] = None,
+            pending_permissions: Optional[dict[str, tuple[str, bool]]] = None,
+            just_approved_permission: bool = False,
         ) -> AsyncIterator[tuple[str, str]]:
             yield ("text", "STREAMED_")
             yield ("text", "DONE")
@@ -620,6 +631,23 @@ class TestParsePermissionAnswer:
         from opencode_bridge import _parse_permission_answer
         assert _parse_permission_answer(answer) == "once"
 
+    @pytest.mark.parametrize("reply,expected", [
+        ("allow", "once"),
+        ("always", "always"),
+        ("yes go ahead", "once"),
+        ("reject", "reject"),
+        ("no", "reject"),
+        ("continue", "reject"),      # unrelated follow-up must NOT grant
+        ("", "reject"),              # empty reply must NOT grant
+        ("write the docs", "reject"),  # a new task must NOT grant a write
+    ])
+    def test_parse_permission_answer_strict_write(self, reply: str, expected: str) -> None:
+        """WRITE-class permissions default to reject: only an explicit
+        allow/always grants.  An unrelated follow-up or bare 'continue'
+        must never authorize an external write (review finding 3)."""
+        from opencode_bridge import _parse_permission_answer
+        assert _parse_permission_answer(reply, write=True) == expected
+
 
 class TestPermissionRelay:
     """The event-bus permission.updated handler relays external_directory
@@ -697,7 +725,7 @@ class TestPermissionRelay:
         # No permission POST fired; the pending entry awaits the user's
         # answer on the next (pinned-continuation) request.
         assert [u for u, _ in client.post_calls if "/permissions/" in u] == []
-        assert PP.get("ses_0001") == "perm_1"
+        assert PP.get("ses_0001") == ("perm_1", True)
 
     @pytest.mark.asyncio
     async def test_other_permission_types_ignored(
@@ -769,7 +797,7 @@ class TestPermissionRelay:
         assert "Command: git commit -m bump" in text
         assert "Reply" in text
         assert [u for u, _ in client.post_calls if "/permissions/" in u] == []
-        assert PP.get("ses_0001") == "perm_g"
+        assert PP.get("ses_0001") == ("perm_g", True)
 
     @pytest.mark.asyncio
     async def test_post_permission_response_posts_body(
@@ -830,6 +858,49 @@ class TestPinnedSessionAndQuestions:
         creates = [u for m, u in client.calls if m == "post" and u.endswith("/session")]
         assert creates == []
         assert smap["conv-1"] == "ses_0001"
+
+    @pytest.mark.asyncio
+    async def test_busy_pinned_after_permission_approval_not_aborted(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Regression (review finding 2): a pinned session that just resumed
+        after a permission approval is legitimately BUSY (executing the
+        approved tool / generating its summary).  With
+        ``just_approved_permission=True`` the busy-abort must be skipped and
+        the pin reused — NOT aborted and started fresh (which would kill the
+        just-approved tool mid-execution)."""
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        client = _BusyThenIdleClient()  # reports busy for 3 polls then idle
+        client.stream_lines = _stream_events()
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        smap: dict[str, str] = {}
+        # First call pins the session.
+        [d async for d in opencode_chat_stream(
+            "task", session_map=smap, session_key="conv-perm",
+        )]
+        assert smap.get("conv-perm") == "ses_0001"
+
+        client.calls.clear()
+        client.stream_lines = _stream_events()
+        # Second call resumes AFTER a permission approval: busy must NOT abort.
+        [d async for d in opencode_chat_stream(
+            "allow",
+            session_map=smap,
+            session_key="conv-perm",
+            just_approved_permission=True,
+        )]
+        # No /session POST (create) and no abort fired; pin survived.
+        creates = [u for m, u in client.calls if m == "post" and u.endswith("/session")]
+        aborts = [u for m, u in client.calls if m == "post" and u.endswith("/abort")]
+        assert creates == []
+        assert aborts == []
+        assert smap["conv-perm"] == "ses_0001"
 
     @pytest.mark.asyncio
     async def test_question_yields_text_and_stops(
@@ -1318,9 +1389,22 @@ class _RunningToolPermissionClient(_FakeClient):
         super().__init__()
         self.permission_records: list[dict[str, Any]] = []
         self.status_type = "busy"
+        self.write_tool: bool = False
 
     async def get(self, url: str, **kwargs: Any) -> _FakeResp:
         if url.endswith(f"/session/{self.session_id}/message"):
+            if self.write_tool:
+                return _FakeResp(200, [_assistant_msg([
+                    {
+                        "id": "prt_write", "type": "tool", "tool": "write",
+                        "state": {
+                            "status": "running",
+                            "input": {"filePath": "/etc/kinver-test.service",
+                                      "content": "x"},
+                            "time": {"start": 1786124255392},
+                        },
+                    },
+                ])])
             return _FakeResp(200, [_assistant_msg([
                 {
                     "id": "prt_running", "type": "tool", "tool": "bash",
@@ -1347,6 +1431,27 @@ class TestCompletionResolvesPermissions:
     session.  Two fixes: (1) completion must not fire while a running tool
     exists in the newest message; (2) when it does complete, it must
     RESOLVE the pending permission (auto-allow READ, question for WRITE)."""
+
+    @pytest.mark.parametrize("tool_name,cmd,expected", [
+        ("write", "/etc/*", "write"),
+        ("edit", "/etc/*", "write"),
+        ("patch", "/etc/*", "write"),
+        ("bash", "cat /etc/os-release", "read"),
+        ("bash", "mv /etc/foo /etc/bar", "write"),
+    ])
+    def test_permission_classification_tool_aware(
+        self, tool_name: str, cmd: str, expected: str,
+    ) -> None:
+        """Review finding 2: the permission classifier must be TOOL-AWARE so
+        a write/edit/patch tool to an external path is classified WRITE even
+        though it has no bash command to inspect (the bash-only heuristic
+        would read the path pattern and auto-allow the write).  All paths —
+        event bus, polling fallback, completion resolver — use this one
+        classifier."""
+        from opencode_bridge import _classify_permission_access
+        assert _classify_permission_access(
+            "external_directory", tool_name, cmd,
+        ) == expected
 
     @pytest.mark.asyncio
     async def test_completion_does_not_fire_with_running_tool(

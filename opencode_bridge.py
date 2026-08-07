@@ -196,17 +196,26 @@ def _classify_permission_access(perm_type: str, tool_name: str, cmd: str) -> str
     return _classify_external_access(cmd)
 
 
-def _parse_permission_answer(answer: str) -> str:
+def _parse_permission_answer(answer: str, *, write: bool = False) -> str:
     """Map the user's reply to a permission response: "once"|"always"|"reject".
 
     "always" wins (so "allow always" is not misread as a one-shot);
-    "reject"/"deny"/a standalone "no" rejects; anything else (allow, yes,
-    y, ok, go ahead) grants once.
+    "reject"/"deny"/a standalone "no" rejects; "allow"/"yes"/"y"/"ok"/
+    "go ahead" grants once.
+
+    For WRITE-class permissions (``write=True``) the default is STRICT:
+    only an explicit allow/always grants — an unrelated follow-up, a bare
+    "continue", or empty text REJECTS.  The relay exists so the human
+    decides external writes; anything short of an explicit yes is a no.
     """
     lowered = (answer or "").strip().lower()
     if "always" in lowered:
         return "always"
     if "reject" in lowered or "deny" in lowered or re.search(r"\bno\b", lowered):
+        return "reject"
+    if write:
+        if any(tok in lowered for tok in ("allow", "yes", "y", "ok", "go ahead", "approve")):
+            return "once"
         return "reject"
     return "once"
 
@@ -237,7 +246,7 @@ async def _post_permission_response(
 async def _resolve_pending_permission(
     client: httpx.AsyncClient,
     session_id: str,
-    pending_permissions: dict[str, str],
+    pending_permissions: dict[str, tuple[str, bool]],
 ) -> Optional[str]:
     """Answer any pending relayed permission for a session before the
     bridge returns.
@@ -305,7 +314,7 @@ async def _resolve_pending_permission(
     if (_classify_permission_access(perm_type, tool_name, cmd) == "read"):
         await _post_permission_response(session_id, pid, "always")
         return None
-    pending_permissions[session_id] = pid
+    pending_permissions[session_id] = (pid, True)
     template = (_GIT_PERMISSION_QUESTION_TEMPLATE
                 if perm_type == "bash" else _PERMISSION_QUESTION_TEMPLATE)
     return template.format(target=_permission_target(pending), cmd=cmd[:300])
@@ -476,7 +485,8 @@ async def opencode_chat_stream(
     provider_id: str = "kinver",
     session_map: Optional[dict[str, str]] = None,
     session_key: Optional[str] = None,
-    pending_permissions: Optional[dict[str, str]] = None,
+    pending_permissions: Optional[dict[str, tuple[str, bool]]] = None,
+    just_approved_permission: bool = False,
 ) -> AsyncIterator[tuple[str, str]]:
     """Stream a task through headless opencode, yielding assistant content live.
 
@@ -526,7 +536,11 @@ async def opencode_chat_stream(
                     st = (st_map.get(session_id) or {}).get("type")
                 except (httpx.HTTPError, ValueError):
                     st = None
-                if st == "busy":
+                if st == "busy" and not just_approved_permission:
+                    # A session that just resumed after a permission
+                    # approval is legitimately busy executing the approved
+                    # tool (or generating its summary) — do NOT abort it.
+                    # Only a busy session with NO such resume is stuck.
                     logger.warning(
                         "pinned session %s is busy (likely stuck) — aborting and starting fresh",
                         session_id[:16],
@@ -803,11 +817,32 @@ async def opencode_chat_stream(
                                     except (httpx.HTTPError, OSError, ValueError):
                                         pass
                                     cmd = cmd or str((pending_perm.get("patterns") or [""])[0])
-                                    if (perm_type == "external_directory"
-                                            and _classify_external_access(cmd) == "read"):
+                                    # Resolve the tool type so a write/edit/
+                                    # patch tool is classified as a WRITE even
+                                    # though it has no bash command to inspect
+                                    # (the bash-only heuristic would read a
+                                    # path pattern and auto-allow the write).
+                                    tool_name = ""
+                                    try:
+                                        tool_info2 = pending_perm.get("tool") or {}
+                                        mid2 = tool_info2.get("messageID")
+                                        call_id2 = tool_info2.get("callID")
+                                        if mid2:
+                                            m_resp2 = await client.get(
+                                                f"{OPENCODE_SERVE_URL}/session/{session_id}/message/{mid2}",
+                                                timeout=10.0,
+                                            )
+                                            if m_resp2.status_code == 200:
+                                                for part2 in (m_resp2.json().get("parts") or []):
+                                                    if part2.get("callID") == call_id2 or part2.get("id") == call_id2:
+                                                        tool_name = str(part2.get("tool") or "")
+                                                        break
+                                    except (httpx.HTTPError, OSError, ValueError):
+                                        pass
+                                    if (_classify_permission_access(perm_type, tool_name, cmd) == "read"):
                                         await _post_permission_response(session_id, pid, "always")
                                         continue
-                                    pending_permissions[session_id] = pid
+                                    pending_permissions[session_id] = (pid, True)
                                     template = (_GIT_PERMISSION_QUESTION_TEMPLATE
                                                 if perm_type == "bash"
                                                 else _PERMISSION_QUESTION_TEMPLATE)
@@ -890,7 +925,7 @@ async def opencode_chat_stream(
                                 if (_classify_permission_access(perm_type, tool_name, cmd) == "read"):
                                     await _post_permission_response(session_id, pid, "always")
                                     continue
-                                pending_permissions[session_id] = pid
+                                pending_permissions[session_id] = (pid, True)
                                 template = (_GIT_PERMISSION_QUESTION_TEMPLATE
                                             if perm_type == "bash"
                                             else _PERMISSION_QUESTION_TEMPLATE)
@@ -974,7 +1009,7 @@ async def opencode_chat_stream(
                                 except (httpx.HTTPError, OSError):
                                     pass
                                 continue
-                            pending_permissions[session_id] = pid
+                            pending_permissions[session_id] = (pid, True)
                             template = (_GIT_PERMISSION_QUESTION_TEMPLATE
                                         if props.get("type") == "bash"
                                         else _PERMISSION_QUESTION_TEMPLATE)

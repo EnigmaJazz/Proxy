@@ -224,13 +224,15 @@ class TestCodingDecisionGate:
 
     @pytest.mark.asyncio
     async def test_decision_answer_opencode_routes_to_bridge(self, gate_client) -> None:
+        async def _fake_stream(
+            text: str, *args: Any, **kwargs: Any,
+        ) -> AsyncIterator[tuple[str, str]]:
+            yield ("text", "BRIDGE_ANSWER")
+
         with patch(
             "routes.classify_with_frontdesk",
             new=AsyncMock(return_value=_classification()),
-        ), patch(
-            "routes.opencode_chat",
-            new=AsyncMock(return_value="BRIDGE_ANSWER"),
-        ):
+        ), patch("routes.opencode_chat_stream", new=_fake_stream):
             response = await gate_client.post(
                 "/v1/chat/completions",
                 json={
@@ -324,13 +326,15 @@ class TestCodingDecisionGate:
         session_id = _resolve_session_id(messages, proxy.app)
         _coding_decision_state(proxy.app)[session_id] = "opencode"
 
+        async def _fake_stream(
+            text: str, *args: Any, **kwargs: Any,
+        ) -> AsyncIterator[tuple[str, str]]:
+            yield ("text", "CACHED_ANSWER")
+
         with patch(
             "routes.classify_with_frontdesk",
             new=AsyncMock(return_value=_classification()),
-        ), patch(
-            "routes.opencode_chat",
-            new=AsyncMock(return_value="CACHED_ANSWER"),
-        ):
+        ), patch("routes.opencode_chat_stream", new=_fake_stream):
             response = await gate_client.post(
                 "/v1/chat/completions",
                 json={"model": "auto", "messages": messages, "stream": False},

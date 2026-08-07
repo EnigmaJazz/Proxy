@@ -100,6 +100,7 @@ from routes import (
     health_check,
     list_models,
     chat_completions,
+    _opencode_session_state,
 )
 
 # ---------------------------------------------------------------------------
@@ -253,6 +254,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Spawn it here when missing; never block startup on it.
     if CLOUD_ESCALATION_BACKEND == "opencode":
         await ensure_opencode_serve()
+
+    # ---- 5c. Warm the pinned-opencode-session map (Rule 3) -----------------
+    # _opencode_session_state loads the disk-backed session map lazily on
+    # first access.  Warm it HERE (startup, off the request path) so the
+    # one-time sync disk read never runs on a request — the request path
+    # then only ever touches the cached app.state dict.
+    _opencode_session_state(app)  # noqa: B018 — intentional warm-up
 
     # ---- 6. Background tasks -----------------------------------------------
     # Thermal monitor (reads sensors, enforces shutdown thresholds)

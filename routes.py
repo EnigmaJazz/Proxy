@@ -180,7 +180,7 @@ def _opencode_session_state(app: FastAPI) -> dict[str, str]:
     return state.opencode_sessions
 
 
-def _pending_permissions_state(app: FastAPI) -> dict[str, str]:
+def _pending_permissions_state(app: FastAPI) -> dict[str, tuple[str, bool]]:
     """Lazy accessor for the bridge's pending-permission map on app.state.
 
     Rule 6: mutable cross-request state must live on ``app.state``, not at
@@ -807,13 +807,18 @@ async def chat_completions(request: Request) -> Response:
         # reply into a permission response, POST it so the tool resumes,
         # then run the normal pinned continuation.
         pending_permission = _pending_permissions_state(request.app).get(pinned)
+        just_approved = False
         if pending_permission:
-            permission_response = _parse_permission_answer(answer or "continue")
-            await _post_permission_response(pinned, pending_permission, permission_response)
+            pid, is_write = pending_permission
+            permission_response = _parse_permission_answer(
+                answer or "continue", write=is_write,
+            )
+            await _post_permission_response(pinned, pid, permission_response)
             _pending_permissions_state(request.app).pop(pinned, None)
+            just_approved = True
             logger.info(
                 "Answered pending permission %s for session %s (%s)",
-                pending_permission[:16], pinned[:16], permission_response,
+                pid[:16], pinned[:16], permission_response,
             )
         logger.info(
             "Resuming pinned opencode session for %s (answer=%r)",
@@ -825,6 +830,7 @@ async def chat_completions(request: Request) -> Response:
             session_map=_opencode_session_state(request.app),
             session_key=session_key,
             pending_permissions=_pending_permissions_state(request.app),
+            just_approved_permission=just_approved,
         )
         await _persist_opencode_sessions(request.app)
         return resp
@@ -2189,6 +2195,7 @@ async def _opencode_task_response(
     session_map: Optional[dict[str, str]] = None,
     session_key: Optional[str] = None,
     pending_permissions: Optional[dict[str, str]] = None,
+    just_approved_permission: bool = False,
 ) -> Response:
     """Run a task through the opencode bridge and return the response.
 
@@ -2218,6 +2225,7 @@ async def _opencode_task_response(
             session_map=session_map,
             session_key=session_key,
             pending_permissions=pending_permissions,
+            just_approved_permission=just_approved_permission,
         ):
             stop_after = False
             if not text_delta:
@@ -2260,7 +2268,22 @@ async def _opencode_task_response(
     if client_stream:
         return StreamingResponse(_stream(), media_type="text/event-stream")
 
-    resp_text = await opencode_chat(task_text, agent=OPENCODE_AGENT)
+    # Non-streaming path MUST reuse the same pinned streaming generator so
+    # session continuity, permission relay, and multi-group question
+    # handling behave identically (a plain opencode_chat here would create a
+    # fresh session and orphan the pin / parked permission).
+    resp_parts: list[str] = []
+    async for kind, text_delta in opencode_chat_stream(
+        task_text,
+        agent=OPENCODE_AGENT,
+        session_map=session_map,
+        session_key=session_key,
+        pending_permissions=pending_permissions,
+        just_approved_permission=just_approved_permission,
+    ):
+        if kind == "text" and text_delta:
+            resp_parts.append(text_delta)
+    resp_text = "".join(resp_parts)
     return JSONResponse({
         "id": f"chatcmpl-{int(time.time())}",
         "object": "chat.completion",

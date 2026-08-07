@@ -549,6 +549,10 @@ async def opencode_chat_stream(
     async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
         try:
             await _recycle_serve_if_low_memory()
+            # SDD-autonomous mode passes a long timeout: force a fresh serve
+            # so the cycle never runs on a progressively-wedged tool runner.
+            if timeout > OPENCODE_SERVE_TIMEOUT:
+                await _force_recycle_serve()
             protected = set(session_map.values()) if session_map else None
             await _abort_zombie_sessions(client, protected)
             session_id = (
@@ -1406,6 +1410,27 @@ async def _recycle_serve_if_low_memory() -> None:
                 os.kill(pid, 15)
             except (OSError, ProcessLookupError):
                 pass
+    except (OSError, ValueError):
+        return
+
+
+async def _force_recycle_serve() -> None:
+    """Kill the opencode serve unconditionally so the next
+    ``ensure_opencode_serve`` respawns a fresh one.
+
+    Used by long-lived calls (SDD-autonomous mode): the serve's tool runner
+    progressively wedges (bash hangs on trivial commands), and an SDD cycle
+    can burn a full hour on a wedged runner.  A fresh serve at cycle start
+    removes that risk.  Never raises.
+    """
+    try:
+        port = OPENCODE_SERVE_URL.rsplit(":", 1)[-1]
+        pid = await asyncio.to_thread(_find_serve_pid, port)
+        if pid:
+            logger.warning("Forcing opencode serve recycle (long-lived call)")
+            os.kill(pid, 15)
+    except (OSError, ProcessLookupError):
+        pass
     except (OSError, ValueError):
         return
 

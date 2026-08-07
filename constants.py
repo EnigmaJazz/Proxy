@@ -161,6 +161,12 @@ OPENCODE_SERVE_URL: str = "http://127.0.0.1:18900"
 # (stray artifacts + corrupt index objects).
 OPENCODE_WORKSPACE_DIR: str = "~/opencode-workspace"
 
+# Directory the opencode bridge creates sessions in.  The serve defaults to
+# its own cwd (OPENCODE_WORKSPACE_DIR); passing an explicit directory lets
+# bridge sessions operate on a real project (e.g. the proxy repo, which
+# hosts the OpenSpec SDD store) instead of the scratch workspace.
+OPENCODE_BRIDGE_DIRECTORY: str = "<REPO_ROOT>"
+
 # Absolute path to the opencode binary.  systemd services run with a
 # minimal PATH that does not include ~/.opencode/bin, so the bridge spawn
 # must not rely on PATH resolution.
@@ -487,6 +493,11 @@ CODE_KEYWORDS: frozenset[str] = frozenset({
     "function that", "function called", "class called", "class that",
     "method that", "function returns", "function takes",
     "python code that", "code that",
+    # Add/edit verbs (the 2B and the original list both missed "add a
+    # function to utils.py that parses JSON" — "parses json" ≠ "parse json"):
+    "add a function", "add a class", "add a method", "add function",
+    "add a new function", "add a helper", "add a utility",
+    "parses json", "parsing json",
 })
 
 # Keywords that force ``is_factual`` for obvious factual phrasings.  The 2B
@@ -494,6 +505,33 @@ CODE_KEYWORDS: frozenset[str] = frozenset({
 # france" as non-factual), which starves the semantic cache.  This net makes
 # the cache actually populate and serve repeat factual questions without
 # waking the GPU.
+# Safety-net keywords that force a CHAT classification to SCHOLAR.  The 2B
+# frontdesk misses deep-research phrasings ("compare transformer
+# architectures BERT vs GPT vs T5" came back CHAT), and SCHOLAR routes to
+# a DIFFERENT model (scholar, port 8086) — unlike CHAT/TOOL/CODE which all
+# collapse onto professional.  This net is the only thing standing between
+# a research request and the wrong specialist, so it must be aggressive.
+# Over-detection risk is bounded: a plain chat query rarely contains both
+# a comparison verb AND a technical/abstract noun.
+# VERB/phrase-driven only.  Bare technical nouns ("model", "architecture",
+# "approach", "framework", "method") are deliberately excluded: they appear
+# in ordinary chat ("what model of laptop should I buy") and would misroute
+# plain conversation to the heavy scholar model.  The comparison/research
+# verbs are rare enough in casual chat that over-detection stays bounded.
+SCHOLAR_KEYWORDS: frozenset[str] = frozenset({
+    # Comparison / analysis verbs
+    "compare", "comparison", "versus", " vs ", "analyze", "analysis",
+    "evaluate", "evaluation", "assess", "assessment", "benchmark",
+    # Research vocabulary (phrases, not bare nouns)
+    "research", "literature", "academic", "study of", "survey of",
+    "state of the art", "theoretical", "methodology",
+    "implications", "impact of",
+    # Multi-word technical comparison phrases (still verb-anchored via
+    # "compare"/"vs" above; kept for direct phrasings like "paper on")
+    "paper on", "paper about", "papers on", "review of",
+})
+
+
 FACTUAL_KEYWORDS: frozenset[str] = frozenset({
     "what is", "what's", "what are", "who is", "who's",
     "when was", "when is", "where is", "where are",

@@ -42,6 +42,7 @@ from constants import (
     CODE_KEYWORDS,
     CPU_MODELS,
     FACTUAL_KEYWORDS,
+    SCHOLAR_KEYWORDS,
     TOOL_KEYWORDS,
     _HEAVY_MODEL_KEYS,
     MODEL_LABELS,
@@ -65,6 +66,7 @@ from routing import (
     discriminate_caller,
     is_lane_b,
     classify_with_frontdesk,
+    evaluate_coding_task,
     resolve_route_for_lane_a,
     detect_tool_loops,
     check_semantic_cache,
@@ -966,28 +968,19 @@ async def chat_completions(request: Request) -> Response:
         classification["priority"] = 1
         logger.info("Lane B — frontdesk bypassed, intent forced to CODE")
 
-    # ---- Tool keyword heuristic: safety net for 2B frontdesk limitations ---
-    # If the 2B frontdesk classified as CHAT but the query contains obvious
-    # tool-triggering keywords (weather, file I/O, web search, exec), force
-    # intent to TOOL.  Over-detection is safe because TOOL-routed requests
-    # reach a capable model (professional) that handles plain chat too.
-    if classification.get("intent") == "CHAT":
-        user_lower = user_text.lower()
-        for kw in TOOL_KEYWORDS:
-            if kw in user_lower:
-                logger.info(
-                    "Tool keyword '%s' matched — overriding CHAT → TOOL", kw,
-                )
-                classification["intent"] = "TOOL"
-                classification["tools_required"] = True
-                break
-
-    # ---- Code keyword heuristic: safety net for 2B frontdesk limitations ---
+    # ---- Code keyword heuristic FIRST (dominates tool keywords) ----------
     # The 2B frontdesk sometimes misses explicit coding requests ("write a
     # python script") and classifies them as CHAT, which would skip the
     # coding-decision gate and the code profile.  Force CHAT → CODE when
     # the query carries a strong coding signal.  Over-detection is safe:
     # CODE and CHAT both route to Professional.
+    #
+    # CRITICAL ORDERING: this runs BEFORE the tool-keyword heuristic.  A
+    # coding request whose description happens to mention live-data words
+    # ("write a script that checks tomorrow's forecast") matches BOTH
+    # keyword sets; the coding instruction is the user's intent and must
+    # win, or the request silently skips the coding gate and the task is
+    # never routed to OpenCode.
     if classification.get("intent") == "CHAT":
         user_lower = user_text.lower()
         for kw in CODE_KEYWORDS:
@@ -1010,6 +1003,44 @@ async def chat_completions(request: Request) -> Response:
                     "Cached coding decision — treating follow-up as CODE",
                 )
                 classification["intent"] = "CODE"
+
+    # ---- Tool keyword heuristic: safety net for 2B frontdesk limitations ---
+    # If the 2B frontdesk classified as CHAT but the query contains obvious
+    # tool-triggering keywords (weather, file I/O, web search, exec), force
+    # intent to TOOL.  Over-detection is safe because TOOL-routed requests
+    # reach a capable model (professional) that handles plain chat too.
+    # Runs AFTER the code heuristic so a coding instruction with incidental
+    # tool words ("write a script that checks tomorrow's forecast") is not
+    # hijacked into TOOL.
+    if classification.get("intent") == "CHAT":
+        user_lower = user_text.lower()
+        for kw in TOOL_KEYWORDS:
+            if kw in user_lower:
+                logger.info(
+                    "Tool keyword '%s' matched — overriding CHAT → TOOL", kw,
+                )
+                classification["intent"] = "TOOL"
+                classification["tools_required"] = True
+                break
+
+    # ---- Scholar keyword heuristic: safety net for 2B frontdesk limits ----
+    # The 2B frontdesk misses deep-research phrasings ("compare transformer
+    # architectures BERT vs GPT vs T5" came back CHAT), and SCHOLAR routes
+    # to a DIFFERENT model (scholar) — unlike CHAT/TOOL/CODE which all
+    # collapse onto professional.  This net is the only guard between a
+    # research request and the wrong specialist.  Runs after CODE (a coding
+    # instruction with research words is still code) but before factual, and
+    # is intentionally broad: over-detection to scholar is bounded by the
+    # comparison/research vocabulary being rare in plain chat.
+    if classification.get("intent") == "CHAT":
+        user_lower = user_text.lower()
+        for kw in SCHOLAR_KEYWORDS:
+            if kw in user_lower:
+                logger.info(
+                    "Scholar keyword '%s' matched — overriding CHAT → SCHOLAR", kw,
+                )
+                classification["intent"] = "SCHOLAR"
+                break
 
     # ---- Factual keyword heuristic: make the semantic cache useful --------
     # The 2B frontdesk's is_factual is unreliable (it marked "what is the
@@ -2350,6 +2381,37 @@ async def _apply_coding_decision_gate(
                 f"{_CODING_QUESTION_PREFIX} Coding task detected — route to OpenCode "
                 f"or the local code pathway (Professional)? Reply `opencode` or `local`."
             )
+            # Advisory local-model difficulty assessment shown in the question.
+            # Best-effort: any failure here must never block the gate, so the
+            # bare question stands as the fallback.
+            try:
+                systemd = getattr(app.state, "systemd", None)
+                assessment_port = 0
+                if systemd is not None:
+                    # Use the professional model (the capable local code
+                    # model) for the difficulty judgment — the 2B frontdesk
+                    # under-judges complex multi-file work.
+                    assessment_port = await systemd.get_port("professional")
+                assessment = await evaluate_coding_task(
+                    _last_user_text(messages),
+                    model_port=assessment_port,
+                )
+                difficulty = assessment.get("difficulty", "")
+                recommendation = assessment.get("recommendation", "")
+                reason = assessment.get("reason", "")
+                if difficulty and recommendation:
+                    reason_suffix = f" ({reason})" if reason else ""
+                    question = (
+                        f"{_CODING_QUESTION_PREFIX} Coding task detected — route to OpenCode "
+                        f"or the local code pathway (Professional)?\n\n"
+                        f"🔍 Local model assessment: {difficulty} difficulty — "
+                        f"recommends `{recommendation}`{reason_suffix}\n\n"
+                        f"Reply `opencode` or `local`."
+                    )
+            except (httpx.HTTPError, OSError, AttributeError, ValueError):
+                logger.exception(
+                    "Coding difficulty assessment failed — falling back to bare question"
+                )
             logger.info("Prompting coding decision for session %s", session_id)
             return await _coding_decision_response(question, client_stream)
     return None

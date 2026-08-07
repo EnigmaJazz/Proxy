@@ -398,7 +398,8 @@ async def call_model(
     prompt : str
         The raw prompt text (may include proxy-internal role prompts).
     profile : str
-        One of ``"analytical"``, ``"deterministic"``, ``"json_gbnf"``.
+        One of ``"analytical"``, ``"deterministic"``, ``"json_gbnf"``,
+        ``"json_gbnf_difficulty"``.
     max_tokens : int
         Maximum tokens to generate.
 
@@ -430,6 +431,18 @@ async def call_model(
                     "project_name": {"type": "string"},
                     "is_factual": {"type": "boolean"},
                     "tools_required": {"type": "boolean"},
+                },
+            },
+        })
+    elif profile == "json_gbnf_difficulty":
+        payload.update({
+            "temperature": 0.0,
+            "json_schema": {
+                "type": "object",
+                "properties": {
+                    "difficulty": {"type": "string"},
+                    "recommendation": {"type": "string"},
+                    "reason": {"type": "string"},
                 },
             },
         })

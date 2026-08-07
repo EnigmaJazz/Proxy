@@ -44,6 +44,18 @@ def _classification(intent: str = "CODE", *, tools_required: bool = False, is_va
     }
 
 
+def _sse_content(text: str) -> str:
+    """Concatenate the content deltas from an SSE response body."""
+    parts: list[str] = []
+    for line in text.splitlines():
+        if line.startswith("data: ") and line[6:] != "[DONE]":
+            payload = json.loads(line[6:])
+            delta = payload["choices"][0]["delta"]
+            if delta.get("content"):
+                parts.append(delta["content"])
+    return "".join(parts)
+
+
 class _StreamCapture:
     """Stand-in for stream_llm that records the outbound payload."""
 
@@ -374,6 +386,101 @@ class TestCodingDecisionGate:
         assert capture.payload is not None
         assert "Coding decision" not in text
 
+    @pytest.mark.asyncio
+    async def test_code_question_includes_difficulty_assessment(self, gate_client) -> None:
+        """A fresh coding request shows the local model's difficulty
+        assessment inside the question.  Advisory only — the answer domain
+        (Reply `opencode` or `local`.) is unchanged.
+        """
+        with patch(
+            "routes.classify_with_frontdesk",
+            new=AsyncMock(return_value=_classification()),
+        ), patch(
+            "routes.evaluate_coding_task",
+            new=AsyncMock(return_value={
+                "difficulty": "high",
+                "recommendation": "opencode",
+                "reason": "multi-file",
+            }),
+        ):
+            response = await gate_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "auto",
+                    "messages": [{"role": "user", "content": "write a parser"}],
+                    "stream": True,
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            text = (await response.aread()).decode()
+            content = _sse_content(text)
+
+        assert response.status_code == 200
+        assert "Local model assessment" in content
+        assert "high difficulty" in content
+        assert "recommends `opencode`" in content
+        assert "multi-file" in content
+        assert "Reply `opencode` or `local`." in content
+
+    @pytest.mark.asyncio
+    async def test_code_question_falls_back_when_assessment_fails(self, gate_client) -> None:
+        """When the evaluator returns defaults or throws, the question still
+        appears — the gate must never fail because of the assessment."""
+        for evaluator in (
+            AsyncMock(return_value={
+                "difficulty": "medium", "recommendation": "local", "reason": "",
+            }),
+            AsyncMock(side_effect=httpx.ConnectError("connection refused")),
+        ):
+            with patch(
+                "routes.classify_with_frontdesk",
+                new=AsyncMock(return_value=_classification()),
+            ), patch("routes.evaluate_coding_task", new=evaluator):
+                response = await gate_client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "auto",
+                        "messages": [{"role": "user", "content": "write a parser"}],
+                        "stream": True,
+                    },
+                    headers={"Authorization": "Bearer agent-key"},
+                )
+                text = (await response.aread()).decode()
+
+            assert response.status_code == 200
+            assert "Coding decision" in text
+            assert "Reply `opencode` or `local`." in text
+
+    @pytest.mark.asyncio
+    async def test_assessment_skipped_for_non_code_intent(self, gate_client) -> None:
+        """The evaluator only runs on fresh coding requests — a CHAT intent
+        must never invoke it."""
+        capture = _StreamCapture()
+        with patch("routes.stream_llm", new=capture), \
+             patch(
+                 "routes.classify_with_frontdesk",
+                 new=AsyncMock(return_value=_classification("CHAT")),
+             ), \
+             patch(
+                 "routes.evaluate_coding_task",
+                 new=AsyncMock(return_value={
+                     "difficulty": "low", "recommendation": "local", "reason": "chat",
+                 }),
+             ) as evaluator:
+            response = await gate_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "auto",
+                    "messages": [{"role": "user", "content": "hello there"}],
+                    "stream": True,
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            await response.aread()
+
+        assert response.status_code == 200
+        assert evaluator.await_count == 0
+
 
 # ---------------------------------------------------------------------------
 # Code-keyword heuristic (frontdesk says CHAT, keyword forces CODE)
@@ -433,9 +540,12 @@ class TestCodeKeywordHeuristic:
         assert "Coding decision" not in text
 
     @pytest.mark.asyncio
-    async def test_tool_keywords_win_over_code(self, gate_client) -> None:
-        """A request with both tool and code signals stays TOOL (the tool
-        heuristic runs first and the code heuristic only upgrades CHAT).
+    async def test_code_keywords_win_over_tool(self, gate_client) -> None:
+        """A request with BOTH tool and code signals routes CODE — the
+        coding instruction is the intent and must reach the coding gate
+        (regression 2026-08-07: "write a script ... when rain is forecast
+        tomorrow" was hijacked to TOOL because the tool heuristic ran
+        first).
         """
         capture = _StreamCapture()
         with patch("routes.stream_llm", new=capture), \
@@ -457,10 +567,8 @@ class TestCodeKeywordHeuristic:
             )
             text = (await response.aread()).decode()
 
-        # TOOL intent: the model was called directly — no coding-decision
-        # question, no gate prompt.
-        assert capture.payload is not None
-        assert "Coding decision" not in text
+        # CODE intent: the coding gate fired and asked the question.
+        assert "Coding decision" in text
 
 
 # ---------------------------------------------------------------------------
@@ -908,3 +1016,78 @@ class TestPinnedContinuationVsGate:
         assert seen_task, "bridge was not called"
         assert seen_task[0] == task
         assert "Opencode" not in seen_task[0]
+
+
+class TestKeywordHeuristicsTightened:
+    """Regression (2026-08-07): golden-set gaps closed by the keyword nets.
+
+    The 2B frontdesk misses several phrasings; the deterministic nets must
+    catch them so the request reaches the right specialist model / the
+    coding gate.
+    """
+
+    @pytest.mark.parametrize("request_text", [
+        "add a function to utils.py that parses JSON",
+        "add a class to models.py",
+        "add a method to the service class",
+    ])
+    @pytest.mark.asyncio
+    async def test_add_verb_routes_code(
+        self, gate_client, request_text: str,
+    ) -> None:
+        """'add a function/class/method' phrasings must reach the coding gate."""
+        from constants import CODE_KEYWORDS
+        assert any(kw in request_text.lower() for kw in CODE_KEYWORDS)
+
+        with patch(
+            "routes.classify_with_frontdesk",
+            new=AsyncMock(return_value=_classification("CHAT")),
+        ):
+            response = await gate_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "auto",
+                    "messages": [{"role": "user", "content": request_text}],
+                    "stream": False,
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            body = response.json()
+
+        assert response.status_code == 200
+        assert "Coding decision" in body["choices"][0]["message"]["content"]
+
+    @pytest.mark.asyncio
+    async def test_scholar_comparison_routes_scholar(self, gate_client) -> None:
+        """A deep-research comparison the 2B frontdesk labels CHAT must be
+        rescued to SCHOLAR (a different model — the only real specialist
+        miss in the golden set)."""
+        from constants import SCHOLAR_KEYWORDS
+        assert any(kw in "compare transformer architectures" for kw in SCHOLAR_KEYWORDS)
+
+        capture = _StreamCapture()
+        with patch("routes.stream_llm", new=capture), \
+             patch(
+                 "routes.classify_with_frontdesk",
+                 new=AsyncMock(return_value=_classification("CHAT")),
+             ):
+            response = await gate_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "auto",
+                    "messages": [{
+                        "role": "user",
+                        "content": "compare transformer architectures BERT vs GPT vs T5",
+                    }],
+                    "stream": True,
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            text = (await response.aread()).decode()
+
+        # SCHOLAR routes directly (no coding gate, no question) — the
+        # specialist destination is covered by ROUTE_MAP in routing.py and
+        # the R1/R17 tests; here the behavioural contract is: the gate must
+        # NOT hijack a scholar request into an opencode/local choice.
+        assert "Coding decision" not in text
+        assert capture.payload is not None

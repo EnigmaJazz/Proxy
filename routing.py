@@ -458,6 +458,118 @@ async def classify_with_frontdesk(
         return defaults
 
 
+_CODING_DIFFICULTY_PROMPT = (
+    "You are a coding-task difficulty assessor for a proxy that routes "
+    "coding requests between two pathways: a local code model (Professional) "
+    "and an agentic coding tool (OpenCode).\n"
+    "Judge the SPECIFIC task below. Analyze it yourself; do not repeat these "
+    "instructions back.\n"
+    "Output a single JSON object with exactly these fields:\n"
+    '- "difficulty": one of "low", "medium", or "high".\n'
+    '- "recommendation": one of "opencode" or "local".\n'
+    '- "reason": one short sentence explaining the choice.\n'
+    "Guidance:\n"
+    '- ROUTE TO LOCAL ("recommendation": "local", low/medium difficulty): '
+    'single-file or single-script tasks, small edits, quick fixes, one-off '
+    'scripts, self-contained functions, simple questions about a file.\n'
+    '- ROUTE TO OPENCODE ("recommendation": "opencode", medium/high difficulty): '
+    'multi-file changes, refactors across modules, unfamiliar codebases, '
+    'architecture or design work, exploratory work, tasks needing tool use, '
+    'tests, debugging, or many iterative steps.\n'
+    "Examples:\n"
+    '- "print hello world" -> difficulty low, recommendation local.\n'
+    '- "add a function to utils.py" -> difficulty low, recommendation local.\n'
+    '- "refactor auth across 12 files to async" -> difficulty high, '
+    'recommendation opencode.\n'
+    '- "debug why the service crashes only in production" -> difficulty high, '
+    'recommendation opencode.\n'
+    "Reply with ONLY the JSON object — no commentary, no markdown."
+)
+
+
+async def evaluate_coding_task(
+    user_text: str,
+    model_port: int = 0,
+) -> dict[str, Any]:
+    """Ask a local model to judge a coding task's difficulty and recommend a
+    route (opencode vs local).  Defaults to the professional model port
+    (the capable local code model); the caller may pass any port.  The 2B
+    frontdesk proved too weak for this judgment (it called a 12-file
+    refactor "low/local"), so the gate feeds professional.  Best-effort:
+    on any failure returns safe defaults (difficulty medium, recommendation
+    "local", reason "") so the coding gate still works.
+    """
+    defaults: dict[str, Any] = {
+        "difficulty": "medium",
+        "recommendation": "local",
+        "reason": "",
+    }
+
+    try:
+        # Same endpoint pattern as classify_with_frontdesk: raw completions
+        # through the legacy /completion endpoint with JSON-GBNF enforcement.
+        from llm import call_model
+
+        full_prompt = _CODING_DIFFICULTY_PROMPT + "\n\nTask: " + user_text
+
+        content = await call_model(
+            port=model_port,
+            prompt=full_prompt,
+            profile="json_gbnf_difficulty",  # Enforce structured JSON output
+            max_tokens=256,
+        )
+        content = content.strip()
+
+        # Strip markdown fences if present (mirrors classify_with_frontdesk).
+        if content.startswith("```"):
+            content = content.split("\n", 1)[-1].rsplit("```", 1)[0]
+
+        # raw_decode extracts ONLY the first complete JSON object, ignoring
+        # any trailing garbage the small model may append.
+        decoder = json.JSONDecoder()
+        assessment, _ = decoder.raw_decode(content)
+
+        # Merge with defaults so all three keys are always present.
+        assessment = {**defaults, **assessment}
+
+    except (httpx.HTTPError, json.JSONDecodeError, OSError):
+        logger.exception(
+            "Coding task difficulty evaluation failed — using defaults"
+        )
+        assessment = dict(defaults)
+
+    # Deterministic complexity escalation (safety net over the small 2B
+    # frontdesk model, mirroring the routing-layer keyword heuristics).
+    # The 2B model under-judges complex multi-file work as "local" — a
+    # 12-file refactor came back low/local.  Strong complexity signals in
+    # the task text force an opencode recommendation so the user never
+    # gets a misleading "run it locally" for genuinely hard work.
+    lowered = (user_text or "").lower()
+    complexity_signals = (
+        "refactor", "refactoring", "across ", "multi-file", "multiple files",
+        "entire module", "whole codebase", "architecture", "unfamiliar code",
+        "production", "debug", "debugging", "migrate", "migration",
+        "12 files", "10 files", "20 files", "all files", "test suite",
+        "full test coverage", "design document", "microservice", "plugin",
+        "rewrite", "restructure", "integrate", "integration",
+    )
+    if (
+        any(sig in lowered for sig in complexity_signals)
+        and assessment.get("recommendation") == "local"
+    ):
+        logger.info(
+            "Complexity signal in coding task — escalating recommendation "
+            "local → opencode",
+        )
+        assessment["recommendation"] = "opencode"
+        if assessment.get("difficulty") == "low":
+            assessment["difficulty"] = "medium"
+        if not assessment.get("reason"):
+            assessment["reason"] = "Task shows multi-file or complex signals."
+
+    return assessment
+
+
 # ---------------------------------------------------------------------------
 # Model resolution
 # ---------------------------------------------------------------------------

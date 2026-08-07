@@ -536,6 +536,10 @@ async def opencode_chat_stream(
     "question" → the agent is waiting for user input (stop streaming).
     On failure yields a status tuple (never raises).
     """
+    # SDD-autonomous mode passes a long timeout: force a fresh serve BEFORE
+    # spawning so the cycle never runs on a progressively-wedged tool runner.
+    if timeout > OPENCODE_SERVE_TIMEOUT:  # SDD mode (1h budget)
+        await _force_recycle_serve()
     if not await ensure_opencode_serve():
         yield ("status", "[OpenCode Bridge Failed: opencode serve not reachable.]")
         return
@@ -548,10 +552,6 @@ async def opencode_chat_stream(
     async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
         try:
             await _recycle_serve_if_low_memory()
-            # SDD-autonomous mode passes a long timeout: force a fresh serve
-            # so the cycle never runs on a progressively-wedged tool runner.
-            if timeout > OPENCODE_SERVE_TIMEOUT:  # SDD mode (1h budget)
-                await _force_recycle_serve()
             protected = set(session_map.values()) if session_map else None
             await _abort_zombie_sessions(client, protected)
             session_id = (

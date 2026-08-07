@@ -36,7 +36,6 @@ from constants import (
     OPENCODE_AGENT,
     OPENCODE_BIN,
     OPENCODE_SERVE_TIMEOUT,
-    OPENCODE_SDD_TIMEOUT,
     OPENCODE_SERVE_URL,
     OPENCODE_BRIDGE_DIRECTORY,
     OPENCODE_WORKSPACE_DIR,
@@ -551,7 +550,7 @@ async def opencode_chat_stream(
             await _recycle_serve_if_low_memory()
             # SDD-autonomous mode passes a long timeout: force a fresh serve
             # so the cycle never runs on a progressively-wedged tool runner.
-            if timeout > OPENCODE_SERVE_TIMEOUT:
+            if timeout > OPENCODE_SERVE_TIMEOUT:  # SDD mode (1h budget)
                 await _force_recycle_serve()
             protected = set(session_map.values()) if session_map else None
             await _abort_zombie_sessions(client, protected)

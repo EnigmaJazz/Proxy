@@ -43,7 +43,7 @@ async def main() -> None:
         session_map=session_map,
         session_key=SESSION_KEY,
         system_prompt=opencode_bridge._SDD_AUTONOMOUS_SYSTEM_PROMPT,
-        timeout=3600.0,
+        timeout=3600.0,  # matches OPENCODE_SDD_TIMEOUT
     ):
         if kind == "question":
             print("\n[QUESTION - should not happen in autonomous mode]\n"

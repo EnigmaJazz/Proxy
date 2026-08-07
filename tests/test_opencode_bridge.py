@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import Any, AsyncIterator, Optional
 
 import httpx
@@ -56,6 +57,7 @@ class _FakeClient:
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self.calls: list[tuple[str, str]] = []
+        self.post_calls: list[tuple[str, Any]] = []
         self.session_id = "ses_0001"
         self.session_status = 200
         self.message_status = 200
@@ -85,6 +87,7 @@ class _FakeClient:
 
     async def post(self, url: str, **kwargs: Any) -> _FakeResp:
         self.calls.append(("post", url))
+        self.post_calls.append((url, kwargs.get("json")))
         if self.raise_on == "post":
             raise httpx.ConnectError("conn refused")
         if url.endswith("/session"):
@@ -97,11 +100,45 @@ class _FakeClient:
         return _FakeStream(self.stream_lines)
 
 
+class _BusyThenIdleClient(_FakeClient):
+    """_FakeClient variant whose /session/status reports "busy" for the
+    first ``busy_polls`` status GETs, then "idle" — keeps the polling
+    fallback in its busy loop for a few poll cycles so keepalives fire."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.busy_polls: int = 3
+
+    async def get(self, url: str, **kwargs: Any) -> _FakeResp:
+        if "/session/status" in url:
+            if self.busy_polls > 0:
+                self.busy_polls -= 1
+                return _FakeResp(200, {self.session_id: {"type": "busy"}})
+            return _FakeResp(200, {self.session_id: {"type": "idle"}})
+        return await super().get(url, **kwargs)
+
+
 @pytest.fixture
 def fake_client(monkeypatch: pytest.MonkeyPatch) -> _FakeClient:
     client = _FakeClient()
     monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
     return client
+
+
+# Shared pending-permission map for tests that exercise the permission
+# relay: the bridge no longer holds module-level mutable state (Rule 6), so
+# tests pass this dict in and assert against it.
+PP: dict[str, str] = {}
+
+
+@pytest.fixture(autouse=True)
+def _clean_pending_permissions() -> None:
+    """PP survives across tests — clear it before AND after each test so a
+    stored write permission never leaks into another test (keyed by session
+    id; tests reuse "ses_0001")."""
+    PP.clear()
+    yield
+    PP.clear()
 
 
 TRIAGE_TEXT = "\u200b🔍 Proxy triage: classified as CODE (priority 1). Routing to Professional (35B MoE) on port 13109.DONE"
@@ -235,6 +272,7 @@ class TestRoutesOpenCode:
             model_id: Optional[str] = None, provider_id: str = "kinver",
             session_map: Optional[dict[str, str]] = None,
             session_key: Optional[str] = None,
+            pending_permissions: Optional[dict[str, str]] = None,
         ) -> AsyncIterator[tuple[str, str]]:
             yield ("text", "STREAMED_")
             yield ("text", "DONE")
@@ -335,15 +373,16 @@ class TestChatStream:
         client.stream_lines = _stream_events()
         monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
 
-        deltas = [d async for d in opencode_chat_stream("task")]
+        deltas = [d async for d in opencode_chat_stream("task", pending_permissions=PP)]
         kinds = [k for k, _ in deltas]
         joined = "".join(t for _, t in deltas)
-        # Reasoning streamed with its own kind; user echo excluded.
-        assert "reasoning" in kinds
-        assert "text" in kinds
-        assert "think about it" in joined
+        # Reasoning is announced once as a compact status chunk; the raw
+        # chain-of-thought text is NOT streamed to the client.
+        assert "reasoning" not in kinds
+        assert ("status", "🧠 thinking…\n") in deltas
+        assert "think about it" not in joined
+        # User echo excluded; both assistant messages' text streamed.
         assert "the echoed prompt" not in joined
-        # Both assistant messages' text streamed.
         assert "Created file." in joined
         assert "Done." in joined
         # Exactly one prompt_async POST (the reviewer-duplicate regression).
@@ -364,9 +403,400 @@ class TestChatStream:
         client.session_status = 500
         monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
 
-        deltas = [d async for d in opencode_chat_stream("task")]
+        deltas = [d async for d in opencode_chat_stream("task", pending_permissions=PP)]
         joined = "".join(t for _, t in deltas)
         assert any("session HTTP 500" in t for _, t in deltas)
+
+    @pytest.mark.asyncio
+    async def test_polling_fallback_emits_keepalives_while_busy(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Regression (2026-08-07): once the /event SSE bus closes, the
+        polling fallback must keep emitting "still working" status chunks
+        while the agent is busy but quiet (a long tool run with no output).
+        Before the fix the polling path yielded ZERO chunks during real
+        work, so nanobot's 90s stall detector killed the stream."""
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        # Keepalives after 0.05s of client silence instead of 8.0s.
+        monkeypatch.setattr(opencode_bridge, "_EVENT_QUIET_TIMEOUT", 0.05)
+        client = _BusyThenIdleClient()
+        # Empty event bus → first anext() raises StopAsyncIteration → the
+        # stream drops straight into the polling fallback.
+        client.stream_lines = []
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        keepalives: list[str] = []
+        async for kind, text in opencode_chat_stream("task"):
+            if kind == "status" and "still working" in text:
+                keepalives.append(text)
+
+        # The session stayed busy for three 1s poll cycles; each quiet
+        # cycle after the first must have emitted a keepalive (poll cadence
+        # 1.0s ≫ patched quiet timeout 0.05s), never a silent gap.
+        assert len(keepalives) >= 2, f"polling fallback went silent: {keepalives}"
+        # Keepalives carry the polling-phase progress feedback.
+        assert any("(polling" in k for k in keepalives)
+
+
+class _PollClient(_FakeClient):
+    """_FakeClient variant whose /session/{id}/message GET (the polling
+    fallback's read) returns a scripted assistant-message list."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.poll_messages: list[dict[str, Any]] = []
+
+    async def get(self, url: str, **kwargs: Any) -> _FakeResp:
+        if url.endswith(f"/session/{self.session_id}/message"):
+            return _FakeResp(200, self.poll_messages)
+        return await super().get(url, **kwargs)
+
+
+def _assistant_msg(parts: list[dict[str, Any]]) -> dict[str, Any]:
+    return {"info": {"role": "assistant"}, "parts": parts}
+
+
+class TestToolStatePartKeyed:
+    """Tool-state tracking must be keyed by PART ID, not tool name.
+
+    Regression (2026-08-07): two bash parts with different states (one
+    "error", one "running") flip-flopped the name-keyed tool_state["bash"]
+    on every poll, so the running part re-emitted "🔧 bash…" once per
+    second — "bash 100s of times" in the client.
+    """
+
+    @pytest.mark.asyncio
+    async def test_running_part_emits_once_across_polls(self) -> None:
+        """A running tool part yields "🔧 bash…" exactly once, even when
+        the same part is polled repeatedly."""
+        from opencode_bridge import _poll_session_deltas
+
+        client = _PollClient()
+        client.poll_messages = [_assistant_msg([{
+            "id": "prt_bash_run", "messageID": "msg_a", "type": "tool",
+            "tool": "bash", "state": {"status": "running"},
+        }])]
+        tool_state: dict[str, str] = {}
+        text_lens: dict[str, int] = {}
+
+        first = [
+            d async for d in _poll_session_deltas(
+                client, client.session_id, set(), text_lens, tool_state,
+            )
+        ]
+        second = [
+            d async for d in _poll_session_deltas(
+                client, client.session_id, set(), text_lens, tool_state,
+            )
+        ]
+        assert (first + second).count(("status", "🔧 bash…\n")) == 1
+
+    @pytest.mark.asyncio
+    async def test_same_name_parts_do_not_reemit_running(self) -> None:
+        """A second part with the SAME tool name but a different state must
+        not make the running part re-emit: with an error and a running bash
+        part polled together twice, "🔧 bash…" appears once and "⚠️ bash
+        failed" appears once."""
+        from opencode_bridge import _poll_session_deltas
+
+        client = _PollClient()
+        client.poll_messages = [_assistant_msg([
+            {
+                "id": "prt_bash_err", "messageID": "msg_a", "type": "tool",
+                "tool": "bash", "state": {"status": "error"},
+            },
+            {
+                "id": "prt_bash_run", "messageID": "msg_a", "type": "tool",
+                "tool": "bash", "state": {"status": "running"},
+            },
+        ])]
+        tool_state: dict[str, str] = {}
+        text_lens: dict[str, int] = {}
+
+        first = [
+            d async for d in _poll_session_deltas(
+                client, client.session_id, set(), text_lens, tool_state,
+            )
+        ]
+        second = [
+            d async for d in _poll_session_deltas(
+                client, client.session_id, set(), text_lens, tool_state,
+            )
+        ]
+        deltas = first + second
+        assert deltas.count(("status", "🔧 bash…\n")) == 1
+        assert deltas.count(("status", "⚠️ bash failed\n")) == 1
+
+    @pytest.mark.asyncio
+    async def test_error_part_yields_failed_status(self) -> None:
+        """A tool part in the error state surfaces "⚠️ {name} failed" to
+        the user (previously the error transition was silent)."""
+        from opencode_bridge import _yield_part_deltas
+
+        part = {
+            "id": "prt_bash_err", "messageID": "msg_a", "type": "tool",
+            "tool": "bash", "state": {"status": "error"},
+        }
+        deltas = [
+            d async for d in _yield_part_deltas(
+                part, {}, {}, "ses_0001", _FakeClient(),
+            )
+        ]
+        assert deltas == [("status", "⚠️ bash failed\n")]
+
+
+# ---------------------------------------------------------------------------
+# External-directory permission relay (opencode >= 1.18 external_directory
+# gate): reads auto-allowed, writes asked to the user.
+# ---------------------------------------------------------------------------
+class TestClassifyExternalAccess:
+    """_classify_external_access must tag mutating commands WRITE (needs
+    user approval) and read-only commands READ (auto-allowed)."""
+
+    @pytest.mark.parametrize("cmd", [
+        "echo x > /etc/foo",
+        "echo x >> ~/log",
+        "mv /etc/foo /etc/bar",
+        "cp /etc/passwd ~/",
+        "rm -rf ~/cache",
+        "touch ~/foo",
+        "mkdir ~/out",
+        "rmdir ~/old",
+        "ln -s /etc/hosts ~/hosts",
+        "chmod 644 ~/file",
+        "chown james ~/file",
+        "tee /etc/foo",
+        "sed -i s/x/y/ /etc/hosts",
+        "install -m 755 app /usr/local/bin/app",
+        "dd if=/dev/zero of=~/big",
+        "git commit -m bump",
+        "git push",
+        "git reset --hard HEAD",
+        "git checkout -- src/x.py",
+        "write /dev/tty1",
+        "printf x > /etc/foo",
+    ])
+    def test_mutating_commands_are_write(self, cmd: str) -> None:
+        from opencode_bridge import _classify_external_access
+        assert _classify_external_access(cmd) == "write"
+
+    @pytest.mark.parametrize("cmd", [
+        "cat /etc/os-release",
+        "ls /home",
+        "head -5 /etc/passwd",
+        "grep james /etc/passwd",
+        "stat /etc/hosts",
+    ])
+    def test_read_only_commands_are_read(self, cmd: str) -> None:
+        from opencode_bridge import _classify_external_access
+        assert _classify_external_access(cmd) == "read"
+
+    def test_empty_cmd_is_read(self) -> None:
+        from opencode_bridge import _classify_external_access
+        assert _classify_external_access("") == "read"
+
+
+class TestParsePermissionAnswer:
+    """_parse_permission_answer maps the user's reply to a permission
+    response value understood by POST /session/{id}/permissions/{pid}."""
+
+    @pytest.mark.parametrize("answer", ["always", "allow always", "ALWAYS", "always allow"])
+    def test_always(self, answer: str) -> None:
+        from opencode_bridge import _parse_permission_answer
+        assert _parse_permission_answer(answer) == "always"
+
+    @pytest.mark.parametrize("answer", ["reject", "no", "deny", "No thanks", "reject it"])
+    def test_reject(self, answer: str) -> None:
+        from opencode_bridge import _parse_permission_answer
+        assert _parse_permission_answer(answer) == "reject"
+
+    @pytest.mark.parametrize("answer", ["allow", "yes", "y", "ok", "go ahead", ""])
+    def test_once(self, answer: str) -> None:
+        from opencode_bridge import _parse_permission_answer
+        assert _parse_permission_answer(answer) == "once"
+
+
+class TestPermissionRelay:
+    """The event-bus permission.updated handler relays external_directory
+    gates: READ is auto-allowed with {"response": "always"}, WRITE yields a
+    question and stops the stream with the permission stored for the next
+    request."""
+
+    @pytest.mark.asyncio
+    async def test_read_permission_auto_allowed_no_question(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        client = _FakeClient()
+        client.stream_lines = [
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_user", "role": "user"}),
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_a", "role": "assistant"}),
+            _evt("permission.updated", sessionID="ses_0001",
+                 id="perm_2", type="external_directory",
+                 title="Allow reading external file",
+                 metadata={"command": "cat /etc/os-release"}),
+        ]
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        deltas = [d async for d in opencode_chat_stream("task", pending_permissions=PP)]
+
+        # No question surfaced; the tool proceeds silently.
+        assert [k for k, _ in deltas if k == "question"] == []
+        perm_posts = [(u, b) for u, b in client.post_calls if "/permissions/" in u]
+        assert any(
+            u.endswith("/permissions/perm_2") and b == {"response": "always"}
+            for u, b in perm_posts
+        )
+        assert PP.get("ses_0001") is None
+
+    @pytest.mark.asyncio
+    async def test_write_permission_yields_question_and_stops(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        client = _FakeClient()
+        client.stream_lines = [
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_user", "role": "user"}),
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_a", "role": "assistant"}),
+            _evt("permission.updated", sessionID="ses_0001",
+                 id="perm_1", type="external_directory",
+                 title="Allow writing external file",
+                 metadata={"command": "mv /etc/foo /etc/bar",
+                           "filepath": "/etc/foo"}),
+        ]
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        deltas = [d async for d in opencode_chat_stream("task", pending_permissions=PP)]
+
+        assert len(deltas) == 1
+        kind, text = deltas[0]
+        assert kind == "question"
+        assert "outside its workspace" in text
+        assert "Target: /etc/foo" in text
+        assert "Command: mv /etc/foo /etc/bar" in text
+        assert "Reply" in text
+        # No permission POST fired; the pending entry awaits the user's
+        # answer on the next (pinned-continuation) request.
+        assert [u for u, _ in client.post_calls if "/permissions/" in u] == []
+        assert PP.get("ses_0001") == "perm_1"
+
+    @pytest.mark.asyncio
+    async def test_other_permission_types_ignored(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A permission.updated event whose type is NOT relayed
+        (external_directory or bash) is ignored: no question, no pending
+        store, no permission POST."""
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        client = _FakeClient()
+        client.stream_lines = [
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_user", "role": "user"}),
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_a", "role": "assistant"}),
+            _evt("permission.updated", sessionID="ses_0001",
+                 id="perm_x", type="webfetch",
+                 title="Allow web fetch",
+                 metadata={"command": "curl https://x"}),
+            _evt("message.part.updated", sessionID="ses_0001",
+                 part={"id": "prt_t", "messageID": "msg_a", "type": "text",
+                       "text": "ok"}),
+        ]
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        deltas = [d async for d in opencode_chat_stream("task", pending_permissions=PP)]
+
+        assert [k for k, _ in deltas if k == "question"] == []
+        assert [u for u, _ in client.post_calls if "/permissions/" in u] == []
+        assert PP.get("ses_0001") is None
+
+    @pytest.mark.asyncio
+    async def test_git_permission_yields_question_and_stops(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A bash-type permission.updated (the git ask-rules: commit/push/
+        reset/rebase) is relayed to the user with the git question template
+        and stops the stream with the permission stored."""
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        client = _FakeClient()
+        client.stream_lines = [
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_user", "role": "user"}),
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_a", "role": "assistant"}),
+            _evt("permission.updated", sessionID="ses_0001",
+                 id="perm_g", type="bash",
+                 title="Allow git commit",
+                 metadata={"command": "git commit -m bump"}),
+        ]
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        deltas = [d async for d in opencode_chat_stream("task", pending_permissions=PP)]
+
+        assert len(deltas) == 1
+        kind, text = deltas[0]
+        assert kind == "question"
+        assert "git command" in text
+        assert "Command: git commit -m bump" in text
+        assert "Reply" in text
+        assert [u for u, _ in client.post_calls if "/permissions/" in u] == []
+        assert PP.get("ses_0001") == "perm_g"
+
+    @pytest.mark.asyncio
+    async def test_post_permission_response_posts_body(
+        self, fake_client: _FakeClient,
+    ) -> None:
+        """_post_permission_response POSTs {"response": ...} to the serve's
+        permission endpoint and reports success on 200."""
+        from opencode_bridge import _post_permission_response
+
+        ok = await _post_permission_response("ses_0001", "perm_1", "once")
+        assert ok is True
+        assert (
+            f"{opencode_bridge.OPENCODE_SERVE_URL}/session/ses_0001/permissions/perm_1",
+            {"response": "once"},
+        ) in fake_client.post_calls
+
+    @pytest.mark.asyncio
+    async def test_post_permission_response_error_degrades(
+        self, fake_client: _FakeClient,
+    ) -> None:
+        """A network error while answering a permission degrades to False
+        (the pinned continuation still runs), never raises."""
+        from opencode_bridge import _post_permission_response
+
+        fake_client.raise_on = "post"
+        ok = await _post_permission_response("ses_0001", "perm_1", "always")
+        assert ok is False
 
 
 # ---------------------------------------------------------------------------
@@ -435,8 +865,67 @@ class TestPinnedSessionAndQuestions:
         ]
         monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
 
-        deltas = [d async for d in opencode_chat_stream("task")]
+        deltas = [d async for d in opencode_chat_stream("task", pending_permissions=PP)]
         assert deltas == [("question", "Which source? (Options: Logs | Git)")]
+
+    @pytest.mark.asyncio
+    async def test_multigroup_preflight_relays_every_group(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A multi-group question (SDD Session Preflight: Pace / Artifacts /
+        PRs / Review) must be relayed LOSSESSLY — every group in order with
+        its header, body, and option labels.  Regression: the renderer only
+        took questions[0], so the other three groups vanished and the
+        bridge emitted a bare "Could you clarify?"."""
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        client = _FakeClient()
+        client.message_get_parts = [{
+            "id": "prt_q", "messageID": "msg_a", "type": "tool", "tool": "question",
+            "state": {"status": "running", "input": {"questions": [
+                {"header": "Pace", "question": "How should the SDD phases run?",
+                 "options": [{"label": "Automatic (Recommended)"},
+                             {"label": "Interactive"}]},
+                {"header": "Artifacts", "question": "Where should the SDD artifacts live?",
+                 "options": [{"label": "Engram"}, {"label": "OpenSpec"},
+                             {"label": "Both"}]},
+                {"header": "PRs", "question": "How should PRs be handled?",
+                 "options": [{"label": "Ask me"}, {"label": "Single PR"},
+                             {"label": "Auto"}]},
+                {"header": "Review", "question": "What review budget?",
+                 "options": [{"label": "400 lines"}, {"label": "800 lines"}]},
+            ]}},
+        }]
+        client.stream_lines = [
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_user", "role": "user"}),
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_a", "role": "assistant"}),
+            _evt("message.part.updated", sessionID="ses_0001",
+                 part={"id": "prt_q", "messageID": "msg_a", "type": "tool",
+                       "tool": "question",
+                       "state": {"status": "running",
+                                 "input": {"questions": client.message_get_parts[0]["state"]["input"]["questions"]}}}),
+        ]
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        deltas = [d async for d in opencode_chat_stream("task", pending_permissions=PP)]
+        assert len(deltas) == 1
+        kind, text = deltas[0]
+        assert kind == "question"
+        assert "Pace: How should the SDD phases run?" in text
+        assert "Artifacts: Where should the SDD artifacts live?" in text
+        assert "PRs: How should PRs be handled?" in text
+        assert "Review: What review budget?" in text
+        assert "Automatic (Recommended)" in text
+        assert "OpenSpec" in text
+        assert "800 lines" in text
+        # Order preserved: Pace comes before Review.
+        assert text.index("Pace:") < text.index("Review:")
 
     @pytest.mark.asyncio
     async def test_tool_feedback_tuples(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -462,9 +951,9 @@ class TestPinnedSessionAndQuestions:
         ]
         monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
 
-        deltas = [d async for d in opencode_chat_stream("task")]
-        assert ("status", "🔧 write…") in deltas
-        assert ("status", "✅ write done") in deltas
+        deltas = [d async for d in opencode_chat_stream("task", pending_permissions=PP)]
+        assert ("status", "🔧 write…\n") in deltas
+        assert ("status", "✅ write done\n") in deltas
 
 
 # ---------------------------------------------------------------------------
@@ -510,6 +999,53 @@ class TestServeHealth:
         await _recycle_serve_if_low_memory()
         assert killed == []
 
+    def test_find_serve_pid_matches_nul_separated_cmdline(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Regression (2026-08-07): /proc/<pid>/cmdline separates argv with
+        NUL bytes, so the old space-form match ("--port 18900") never
+        matched ANY process — serve recycling silently did nothing and a
+        wedged tool runner lived forever.  The matcher must normalize NULs
+        to spaces first."""
+        from opencode_bridge import _find_serve_pid
+
+        real_listdir = opencode_bridge.os.listdir
+        real_open = open
+
+        fake_cmdline = (
+            b"~/.opencode/bin/opencode\x00serve\x00"
+            b"--port\x0018999\x00--hostname\x00127.0.0.1\x00"
+        )
+
+        def _fake_listdir(path: str) -> list[str]:
+            if path == "/proc":
+                return ["4242"]
+            return real_listdir(path)
+
+        def _fake_open(path: str, *a: Any, **kw: Any):
+            if str(path) == "/proc/4242/cmdline":
+                return _FakeProc(fake_cmdline)
+            return real_open(path, *a, **kw)
+
+        class _FakeProc:
+            def __init__(self, data: bytes) -> None:
+                self._data = data
+
+            def __enter__(self) -> "_FakeProc":
+                return self
+
+            def __exit__(self, *a: Any) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return self._data
+
+        monkeypatch.setattr(opencode_bridge.os, "listdir", _fake_listdir)
+        monkeypatch.setattr("builtins.open", _fake_open)
+
+        assert _find_serve_pid("18999") == 4242
+        assert _find_serve_pid("18000") is None
+
     def test_serve_health_parses_proc(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """_serve_health reads /proc/<pid>/stat start ticks + uptime."""
         import tempfile
@@ -551,3 +1087,345 @@ class TestServeHealth:
         assert elapsed is not None
         # start_ticks 1000 @ 100Hz = 10s after boot; uptime 6000 → ~5990s up
         assert 5900 < elapsed < 6000
+
+
+# ---------------------------------------------------------------------------
+# Zombie sweep / pinned-session protection
+# ---------------------------------------------------------------------------
+class _ZombieSessionClient(_FakeClient):
+    """_FakeClient whose GET /session returns scripted session records.
+
+    The default _FakeClient returns {} for /session, but the sweep iterates
+    the JSON list — this variant scripts the exact record list it needs."""
+
+    def __init__(self, sessions: list[dict[str, Any]]) -> None:
+        super().__init__()
+        self.sessions = sessions
+
+    async def get(self, url: str, **kwargs: Any) -> _FakeResp:
+        if url == f"{opencode_bridge.OPENCODE_SERVE_URL}/session":
+            return _FakeResp(200, self.sessions)
+        return await super().get(url, **kwargs)
+
+
+class TestZombieSweep:
+    @pytest.mark.asyncio
+    async def test_pinned_session_never_aborted_unpinned_stale_is(self) -> None:
+        """A session pinned in the session map survives the zombie sweep
+        even when idle far past the 240s threshold, while an unpinned
+        session with the same stale age is still aborted.
+
+        Regression (2026-08-07): the sweep killed pinned sessions
+        legitimately waiting for user input (clarifying questions,
+        multi-turn pauses), so the follow-up posted into a dead session
+        and the agent lost all conversation context."""
+        from opencode_bridge import _abort_zombie_sessions
+
+        stale_ms = int(time.time() * 1000) - 1_000_000  # ~17 min idle
+        pinned_id = "ses_pinned_waiting_on_user"
+        unpinned_id = "ses_unpinned_stale"
+        client = _ZombieSessionClient([
+            {"id": pinned_id, "time": {"updated": stale_ms}},
+            {"id": unpinned_id, "time": {"updated": stale_ms}},
+        ])
+
+        await _abort_zombie_sessions(client, protected_ids={pinned_id})
+
+        aborts = [
+            url for method, url in client.calls
+            if method == "post" and "/abort" in url
+        ]
+        assert len(aborts) == 1
+        assert unpinned_id in aborts[0]
+        assert pinned_id not in aborts[0]
+
+    @pytest.mark.asyncio
+    async def test_no_protected_set_sweeps_all_stale(self) -> None:
+        """Without a protected set (no session map at the call site) the
+        sweep behaves as before: every stale session is aborted."""
+        from opencode_bridge import _abort_zombie_sessions
+
+        stale_ms = int(time.time() * 1000) - 1_000_000
+        client = _ZombieSessionClient([
+            {"id": "ses_a", "time": {"updated": stale_ms}},
+            {"id": "ses_b", "time": {"updated": stale_ms}},
+        ])
+
+        await _abort_zombie_sessions(client)
+
+        aborts = [
+            url for method, url in client.calls
+            if method == "post" and "/abort" in url
+        ]
+        assert len(aborts) == 2
+
+
+# ---------------------------------------------------------------------------
+# Wedged-tool detection (tool part stuck in "running" with no output)
+# ---------------------------------------------------------------------------
+class TestDetectWedgedTool:
+    @pytest.mark.asyncio
+    async def test_old_running_bash_part_without_output_is_wedged(self) -> None:
+        """A bash part running with no output for past the wedge threshold
+        is detected as wedged."""
+        from opencode_bridge import _detect_wedged_tool
+
+        client = _PollClient()
+        client.poll_messages = [_assistant_msg([{
+            "id": "prt_bash", "messageID": "msg_a", "type": "tool",
+            "tool": "bash",
+            "state": {
+                "status": "running",
+                "time": {"start": int(time.time() * 1000) - 180_000},
+            },
+        }])]
+
+        assert await _detect_wedged_tool(client, client.session_id) is True
+
+    @pytest.mark.asyncio
+    async def test_recent_start_not_wedged(self) -> None:
+        """A running tool started just now is real work, not a wedge."""
+        from opencode_bridge import _detect_wedged_tool
+
+        client = _PollClient()
+        client.poll_messages = [_assistant_msg([{
+            "id": "prt_bash", "messageID": "msg_a", "type": "tool",
+            "tool": "bash",
+            "state": {
+                "status": "running",
+                "time": {"start": int(time.time() * 1000) - 5_000},
+            },
+        }])]
+
+        assert await _detect_wedged_tool(client, client.session_id) is False
+
+    @pytest.mark.asyncio
+    async def test_running_with_output_not_wedged(self) -> None:
+        """A running tool that IS producing output is healthy even past the
+        age threshold."""
+        from opencode_bridge import _detect_wedged_tool
+
+        client = _PollClient()
+        client.poll_messages = [_assistant_msg([{
+            "id": "prt_bash", "messageID": "msg_a", "type": "tool",
+            "tool": "bash",
+            "state": {
+                "status": "running",
+                "output": "downloading deps…",
+                "time": {"start": int(time.time() * 1000) - 180_000},
+            },
+        }])]
+
+        assert await _detect_wedged_tool(client, client.session_id) is False
+
+    @pytest.mark.asyncio
+    async def test_question_tool_not_wedged(self) -> None:
+        """The "question" tool sits in "running" BY DESIGN while waiting
+        for user input — never a wedge."""
+        from opencode_bridge import _detect_wedged_tool
+
+        client = _PollClient()
+        client.poll_messages = [_assistant_msg([{
+            "id": "prt_q", "messageID": "msg_a", "type": "tool",
+            "tool": "question",
+            "state": {
+                "status": "running",
+                "time": {"start": int(time.time() * 1000) - 180_000},
+            },
+        }])]
+
+        assert await _detect_wedged_tool(client, client.session_id) is False
+
+    @pytest.mark.asyncio
+    async def test_no_tool_parts_not_wedged(self) -> None:
+        """A session with only text parts is never wedged."""
+        from opencode_bridge import _detect_wedged_tool
+
+        client = _PollClient()
+        client.poll_messages = [_assistant_msg([{
+            "id": "prt_t", "messageID": "msg_a", "type": "text", "text": "hi",
+        }])]
+
+        assert await _detect_wedged_tool(client, client.session_id) is False
+
+    @pytest.mark.asyncio
+    async def test_http_error_not_wedged(self) -> None:
+        """A client error while probing degrades to False, never raises."""
+        from opencode_bridge import _detect_wedged_tool
+
+        client = _FakeClient()
+        client.raise_on = "get"
+
+        assert await _detect_wedged_tool(client, client.session_id) is False
+
+
+class TestWedgedToolStream:
+    @pytest.mark.asyncio
+    async def test_wedged_tool_aborts_drops_pin_and_recycles(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A wedged tool part terminates the stream with a clear error:
+        the session is aborted, the pin dropped, and the serve recycled
+        (never streaming keepalives indefinitely)."""
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        async def _always_wedged(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        async def _noop(*args: Any, **kwargs: Any) -> None:
+            return None
+
+        killed: list[int] = []
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        monkeypatch.setattr(opencode_bridge, "_recycle_serve_if_low_memory", _noop)
+        monkeypatch.setattr(opencode_bridge, "_detect_wedged_tool", _always_wedged)
+        # Never kill a real opencode serve on this box.
+        monkeypatch.setattr(opencode_bridge, "_find_serve_pid", lambda port: None)
+        monkeypatch.setattr(opencode_bridge.os, "kill", lambda pid, sig: killed.append(pid))
+        monkeypatch.setattr(opencode_bridge, "_EVENT_QUIET_TIMEOUT", 0.05)
+        monkeypatch.setattr(opencode_bridge, "_WEDGE_CHECK_INTERVAL_S", 0.05)
+
+        client = _BusyThenIdleClient()
+        client.stream_lines = []  # empty event bus → polling fallback
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        smap: dict[str, str] = {}
+        deltas = [
+            d async for d in opencode_chat_stream(
+                "task", session_map=smap, session_key="conv-1",
+            )
+        ]
+
+        wedged = [t for k, t in deltas if k == "status" and "wedged" in t]
+        assert len(wedged) == 1
+        assert "session aborted, serve recycled" in wedged[0]
+        # Pin dropped and the session aborted.
+        assert "conv-1" not in smap
+        aborts = [
+            url for method, url in client.calls
+            if method == "post" and "/abort" in url
+        ]
+        assert len(aborts) == 1
+        assert killed == []
+
+
+class _RunningToolPermissionClient(_FakeClient):
+    """Fake whose polling read shows a RUNNING tool in the newest assistant
+    message plus optionally a pending write permission."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.permission_records: list[dict[str, Any]] = []
+        self.status_type = "busy"
+
+    async def get(self, url: str, **kwargs: Any) -> _FakeResp:
+        if url.endswith(f"/session/{self.session_id}/message"):
+            return _FakeResp(200, [_assistant_msg([
+                {
+                    "id": "prt_running", "type": "tool", "tool": "bash",
+                    "state": {
+                        "status": "running",
+                        "input": {"command": "cat /etc/systemd/system/x.service"},
+                        "time": {"start": 1786124255392},
+                    },
+                },
+            ])])
+        if url.endswith("/permission"):
+            return _FakeResp(200, self.permission_records)
+        if "/message/" in url:
+            return _FakeResp(200, {"info": {}, "parts": []})
+        if "/session/status" in url:
+            return _FakeResp(200, {self.session_id: {"type": self.status_type}})
+        return await super().get(url, **kwargs)
+
+
+class TestCompletionResolvesPermissions:
+    """Root-cause regression (2026-08-07): the bridge used to pop pending
+    permissions without answering them on completion, so the serve parked
+    the tool forever and the next follow-up's wedge detector killed the
+    session.  Two fixes: (1) completion must not fire while a running tool
+    exists in the newest message; (2) when it does complete, it must
+    RESOLVE the pending permission (auto-allow READ, question for WRITE)."""
+
+    @pytest.mark.asyncio
+    async def test_completion_does_not_fire_with_running_tool(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A running tool in the newest message must keep the stream alive —
+        NOT declare the session done (regression: stream ended 4s into a
+        wedged bash run).  The stream must emit keepalives while the tool
+        runs; it must not return early."""
+        import asyncio as _asyncio
+
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        monkeypatch.setattr(opencode_bridge, "_EVENT_QUIET_TIMEOUT", 0.02)
+        monkeypatch.setattr(opencode_bridge, "_TOOL_WEDGE_AFTER_S", 60.0)
+        client = _RunningToolPermissionClient()
+        client.stream_lines = []  # force polling fallback
+        client.permission_records = []  # no pending permission
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        keepalives: list[str] = []
+
+        async def _collect() -> None:
+            async for kind, text in opencode_chat_stream("task"):
+                if kind == "status" and "still working" in text:
+                    keepalives.append(text)
+
+        collector = _asyncio.create_task(_collect())
+        try:
+            await _asyncio.wait_for(
+                _asyncio.shield(collector),
+                timeout=1.5,
+            )
+        except _asyncio.TimeoutError:
+            pass
+        finally:
+            collector.cancel()
+            try:
+                await collector
+            except _asyncio.CancelledError:
+                pass
+
+        # The running tool suppressed completion: the stream was still alive
+        # after 1.5s and emitting keepalives.
+        assert len(keepalives) >= 1, "stream ended while tool running"
+
+    @pytest.mark.asyncio
+    async def test_completion_resolves_pending_read_permission(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When the agent looks done (idle) but a READ permission is pending,
+        the bridge auto-allows it (POST "always") instead of abandoning it."""
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        monkeypatch.setattr(opencode_bridge, "_EVENT_QUIET_TIMEOUT", 0.02)
+        monkeypatch.setattr(opencode_bridge, "_TOOL_WEDGE_AFTER_S", 60.0)
+        client = _RunningToolPermissionClient()
+        client.status_type = "idle"  # completion path
+        client.permission_records = [{
+            "id": "perm_read", "sessionID": "ses_0001",
+            "permission": "external_directory",
+            "patterns": ["/etc/systemd/system/*"],
+            "tool": {"messageID": "msg_a", "callID": "call_x"},
+        }]
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        deltas = [d async for d in opencode_chat_stream("task", pending_permissions=PP)]
+
+        # The permission was ANSWERED (POST always), not abandoned.
+        perm_posts = [(u, b) for u, b in client.post_calls if "/permissions/" in u]
+        assert any(u.endswith("/permissions/perm_read") and b == {"response": "always"}
+                   for u, b in perm_posts)
+        # No pending entry leaked.
+        assert PP.get("ses_0001") is None

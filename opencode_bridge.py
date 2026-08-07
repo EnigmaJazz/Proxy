@@ -37,6 +37,7 @@ from constants import (
     OPENCODE_BIN,
     OPENCODE_SERVE_TIMEOUT,
     OPENCODE_SERVE_URL,
+    OPENCODE_BRIDGE_DIRECTORY,
     OPENCODE_WORKSPACE_DIR,
     get_logger,
 )
@@ -72,6 +73,13 @@ _EVENT_QUIET_TIMEOUT: float = 8.0
 # the end) arrives within milliseconds, so 3s of silence means done.
 _EVENT_FINAL_TIMEOUT: float = 3.0
 
+# A tool part stuck in "running" with no output for this long is WEDGED:
+# the serve's tool runner marked the tool started but never executed it,
+# so the session stays "busy" forever while the client sees keepalives.
+_TOOL_WEDGE_AFTER_S: float = 120.0
+# How often the stream checks the session for a wedged tool part.
+_WEDGE_CHECK_INTERVAL_S: float = 10.0
+
 # Sentinel-prefixed proxy status the opencode client accumulates into the
 # assistant text (the proxy emits triage as the first SSE chunk).  The
 # triage formats are stable (routes._build_triage_message).  Stripping the
@@ -83,6 +91,254 @@ _STATUS_SEGMENT_RE = re.compile(
     r"|🔀 Client specified.*?on port \d+\."
     r")"
 )
+
+# Permission requests from the opencode serve (opencode >= 1.18): the
+# external_directory gate fires when a bash tool touches paths outside the
+# session workspace.  In headless serve mode there is no interactive user
+# to answer, so an unanswered gate silently auto-rejects AND leaves the
+# tool wedged in "running" — the root cause of the bridge wedges.  The
+# bridge auto-allows READ commands and asks the USER about WRITE commands.
+# Pending write permissions are keyed by session id so the next request
+# (which resumes the pinned session) can answer them.
+
+# Bounded WRITE classifier for the external_directory gate: any redirect,
+# a whole-word "write", or one of these mutating command tokens marks the
+# command WRITE (needs user approval); everything else (cat/ls/head on
+# /etc or /home) is READ and auto-allowed.  echo-with-redirect is covered
+# by the ">" check alone.
+_EXTERNAL_WRITE_TOKENS: tuple[str, ...] = (
+    "mv ", "cp ", "rm ", "touch ", "mkdir ", "rmdir ", "ln ",
+    "chmod ", "chown ", "tee ", "sed -i", "install ", "dd ",
+    "git commit", "git push", "git reset", "git checkout", "printf ",
+)
+
+_PERMISSION_QUESTION_TEMPLATE: str = (
+    "🔒 The coding agent wants to access a path outside its workspace.\n\n"
+    "Target: {target}\n"
+    "Command: {cmd}\n\n"
+    "Reply `allow` (this once), `always` (auto-allow access like this), "
+    "or `reject`."
+)
+
+# Git ask-rules (git commit/push/reset/rebase) fire the "bash" permission
+# type.  Every one of those is mutating, so relay ALL of them to the user
+# (there is no read variant worth auto-allowing).
+_GIT_PERMISSION_QUESTION_TEMPLATE: str = (
+    "🔒 The coding agent wants to run a git command.\n\n"
+    "Command: {cmd}\n\n"
+    "Reply `allow` (this once), `always` (auto-allow git commands like "
+    "this), or `reject`."
+)
+
+
+def _permission_target(perm: dict[str, Any]) -> str:
+    """Best human-readable description of what a permissioned access
+    targets: the exact file path when the tool knows one (write/edit
+    tools carry ``metadata.filepath``), else the parent directory, else
+    the matched pattern.  Never raises."""
+    try:
+        meta = perm.get("metadata") or {}
+        if isinstance(meta, dict):
+            fp = str(meta.get("filepath") or "").strip()
+            if fp:
+                return fp
+            parent = str(meta.get("parentDir") or "").strip()
+            if parent:
+                return parent + "/"
+        patterns = perm.get("patterns") or []
+        if patterns:
+            return str(patterns[0])
+    except (TypeError, ValueError):
+        pass
+    return "(unknown path)"
+
+
+# Permission types the bridge relays to the user.  external_directory is
+# the write-outside-workspace gate; bash is the command-pattern gate (the
+# git ask-rules in opencode.json permission.bash).
+_RELAYED_PERMISSION_TYPES: tuple[str, ...] = ("external_directory", "bash")
+
+
+def _classify_external_access(cmd: str) -> str:
+    """Classify a permissioned external-directory command as "read"/"write".
+
+    Bounded heuristic (kept intentionally simple): any redirect or a known
+    mutating command token ⇒ "write"; everything else (``cat /etc/os-release``,
+    ``ls /home``, ``head -5 /etc/passwd``) ⇒ "read".
+    """
+    c = (cmd or "").strip()
+    if ">" in c:
+        return "write"
+    if re.search(r"\bwrite\b", c):
+        return "write"
+    if any(token in c for token in _EXTERNAL_WRITE_TOKENS):
+        return "write"
+    return "read"
+
+
+_WRITE_TOOL_TYPES: frozenset[str] = frozenset({
+    "write", "edit", "patch", "create", "append", "delete", "remove",
+})
+
+
+def _classify_permission_access(perm_type: str, tool_name: str, cmd: str) -> str:
+    """Classify a permissioned external access as "read"/"write".
+
+    Tool-type aware: a ``write``/``edit``/``patch`` tool is a WRITE by
+    definition (it has no bash command for the operator heuristic).  Bash
+    commands fall back to ``_classify_external_access`` (redirects / known
+    mutating tokens ⇒ write; cat/ls/head ⇒ read).  Used by both the event-
+    bus permission handler and the polling resolver so a ``write`` tool to
+    an external dir surfaces a question instead of being auto-allowed.
+    """
+    if perm_type == "external_directory" and tool_name in _WRITE_TOOL_TYPES:
+        return "write"
+    return _classify_external_access(cmd)
+
+
+def _parse_permission_answer(answer: str) -> str:
+    """Map the user's reply to a permission response: "once"|"always"|"reject".
+
+    "always" wins (so "allow always" is not misread as a one-shot);
+    "reject"/"deny"/a standalone "no" rejects; anything else (allow, yes,
+    y, ok, go ahead) grants once.
+    """
+    lowered = (answer or "").strip().lower()
+    if "always" in lowered:
+        return "always"
+    if "reject" in lowered or "deny" in lowered or re.search(r"\bno\b", lowered):
+        return "reject"
+    return "once"
+
+
+async def _post_permission_response(
+    session_id: str,
+    permission_id: str,
+    response: str,
+) -> bool:
+    """POST a permission decision to the opencode serve (best-effort).
+
+    Returns True when the serve accepted the response; False on network
+    errors (the caller proceeds with the pinned continuation either way).
+    Never raises.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{OPENCODE_SERVE_URL}/session/{session_id}/permissions/{permission_id}",
+                json={"response": response},
+                timeout=10.0,
+            )
+            return resp.status_code == 200
+    except (httpx.HTTPError, OSError):
+        return False
+
+
+async def _resolve_pending_permission(
+    client: httpx.AsyncClient,
+    session_id: str,
+    pending_permissions: dict[str, str],
+) -> Optional[str]:
+    """Answer any pending relayed permission for a session before the
+    bridge returns.
+
+    Root-cause fix (2026-08-07): the bridge used to ``pop`` pending
+    permissions on every return path without answering them.  The serve
+    parks the tool forever (no one ever POSTs a response), the session
+    looks busy, and the next follow-up's wedge detector finds the stale
+    part and kills the session.  This helper answers the pending request:
+
+    - READ external_directory commands -> auto-allow (POST "always") so the
+      tool proceeds.
+    - WRITE / git commands -> store the pending id and return a question
+      string for the pinned continuation to answer on the next request.
+
+    Returns None when there is no pending permission (or it was resolved
+    silently); returns a question string when the USER must decide.  Never
+    raises.
+    """
+    pending = await _detect_pending_permission(client, session_id)
+    if not pending:
+        return None
+    pid = str(pending.get("id") or "")
+    perm_type = str(pending.get("permission") or "")
+    if not pid:
+        return None
+    # Pull the command for read/write classification where possible.
+    cmd = str((pending.get("patterns") or [""])[0])
+    try:
+        tool_info = pending.get("tool") or {}
+        mid = tool_info.get("messageID")
+        call_id = tool_info.get("callID")
+        if mid:
+            msg_resp = await client.get(
+                f"{OPENCODE_SERVE_URL}/session/{session_id}/message/{mid}",
+                timeout=10.0,
+            )
+            if msg_resp.status_code == 200:
+                for part in (msg_resp.json().get("parts") or []):
+                    if part.get("callID") == call_id or part.get("id") == call_id:
+                        cmd = str(((part.get("state") or {}).get("input") or {}).get("command") or cmd)
+                        break
+    except (httpx.HTTPError, OSError, ValueError):
+        pass
+    # Resolve the tool type from the message part when available so a
+    # ``write`` tool to an external dir surfaces a question rather than
+    # being auto-allowed as a "read" (no bash command to inspect).
+    tool_name = ""
+    try:
+        tool_info = pending.get("tool") or {}
+        mid = tool_info.get("messageID")
+        call_id = tool_info.get("callID")
+        if mid:
+            msg_resp = await client.get(
+                f"{OPENCODE_SERVE_URL}/session/{session_id}/message/{mid}",
+                timeout=10.0,
+            )
+            if msg_resp.status_code == 200:
+                for part in (msg_resp.json().get("parts") or []):
+                    if part.get("callID") == call_id or part.get("id") == call_id:
+                        tool_name = str(part.get("tool") or "")
+                        break
+    except (httpx.HTTPError, OSError, ValueError):
+        pass
+    if (_classify_permission_access(perm_type, tool_name, cmd) == "read"):
+        await _post_permission_response(session_id, pid, "always")
+        return None
+    pending_permissions[session_id] = pid
+    template = (_GIT_PERMISSION_QUESTION_TEMPLATE
+                if perm_type == "bash" else _PERMISSION_QUESTION_TEMPLATE)
+    return template.format(target=_permission_target(pending), cmd=cmd[:300])
+
+
+async def _detect_pending_permission(
+    client: httpx.AsyncClient,
+    session_id: str,
+) -> Optional[dict[str, Any]]:
+    """Return the first pending relayed permission for a session.
+
+    The polling fallback cannot see ``permission.updated`` SSE events (the
+    bus is closed), but the serve exposes pending requests at GET
+    /permission.  A tool waiting on the gate looks identical to a wedged
+    tool in the message list (status=running, no output), so this must be
+    checked BEFORE the wedge detector fires — otherwise a write that is
+    simply waiting for the user would be killed as a wedge.
+
+    Returns the permission record dict (with id/sessionID/patterns/tool) or
+    None.  Never raises.
+    """
+    try:
+        resp = await client.get(f"{OPENCODE_SERVE_URL}/permission", timeout=10.0)
+        if resp.status_code != 200:
+            return None
+        for perm in resp.json():
+            if perm.get("sessionID") != session_id:
+                continue
+            if perm.get("permission") in _RELAYED_PERMISSION_TYPES:
+                return perm
+    except (httpx.HTTPError, OSError, ValueError):
+        pass
+    return None
 
 
 def _strip_proxy_status_text(text: str) -> str:
@@ -170,7 +426,7 @@ async def opencode_chat(
             # ---- 1. Create a fresh session --------------------------------
             resp = await client.post(
                 f"{OPENCODE_SERVE_URL}/session",
-                json={},
+                params={"directory": OPENCODE_BRIDGE_DIRECTORY},
                 timeout=30.0,
             )
             if resp.status_code != 200:
@@ -220,6 +476,7 @@ async def opencode_chat_stream(
     provider_id: str = "kinver",
     session_map: Optional[dict[str, str]] = None,
     session_key: Optional[str] = None,
+    pending_permissions: Optional[dict[str, str]] = None,
 ) -> AsyncIterator[tuple[str, str]]:
     """Stream a task through headless opencode, yielding assistant content live.
 
@@ -240,10 +497,17 @@ async def opencode_chat_stream(
     if not await ensure_opencode_serve():
         yield ("status", "[OpenCode Bridge Failed: opencode serve not reachable.]")
         return
+    # Rule 6: pending-permission state lives on app.state in routes.py and is
+    # threaded in; standalone callers (scripts/tests) fall back to a fresh
+    # per-call dict.
+    pending_permissions = (
+        pending_permissions if pending_permissions is not None else {}
+    )
     async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
         try:
             await _recycle_serve_if_low_memory()
-            await _abort_zombie_sessions(client)
+            protected = set(session_map.values()) if session_map else None
+            await _abort_zombie_sessions(client, protected)
             session_id = (
                 session_map.get(session_key)
                 if session_map and session_key else None
@@ -274,12 +538,15 @@ async def opencode_chat_stream(
                         )
                     except (httpx.HTTPError, OSError):
                         pass
+                    pending_permissions.pop(session_id, None)
                     if session_map is not None and session_key:
                         session_map.pop(session_key, None)
                     session_id = None
             if not session_id:
                 resp = await client.post(
-                    f"{OPENCODE_SERVE_URL}/session", json={}, timeout=30.0,
+                    f"{OPENCODE_SERVE_URL}/session",
+                    params={"directory": OPENCODE_BRIDGE_DIRECTORY},
+                    timeout=30.0,
                 )
                 if resp.status_code != 200:
                     yield ("status", f"[OpenCode Bridge Error: session HTTP {resp.status_code}]")
@@ -333,6 +600,7 @@ async def opencode_chat_stream(
                 # running.  Only complete when the session went idle.
                 ev_iter = ev.aiter_lines()
                 started = time.monotonic()
+                bus_last_wedge_check = time.monotonic()
                 while True:
                     # Bounded total duration: a hung agent tool (e.g. a
                     # package-manager command stuck on a lock) leaves the
@@ -353,6 +621,7 @@ async def opencode_chat_stream(
                             pass
                         if session_map is not None and session_key:
                             session_map.pop(session_key, None)
+                        pending_permissions.pop(session_id, None)
                         yield ("status", "[OpenCode Bridge Error: timed out waiting for the agent]",)
                         return
                     try:
@@ -366,6 +635,26 @@ async def opencode_chat_stream(
                         # connections) but the session may still be working.
                         # Fall back to polling the session's message list
                         # until it completes or the total timeout fires.
+                        # The event-bus keepalive path is gone here, so a
+                        # genuinely busy but quiet agent (a long tool run
+                        # with no output) would send the client ZERO chunks
+                        # and trip its stall detector (nanobot kills streams
+                        # silent for 90s).  Track the last client-visible
+                        # emission and emit "still working" status chunks on
+                        # quiet, mirroring the event-bus phase.
+                        polling_started = time.monotonic()
+                        last_emit = polling_started
+                        last_wedge_check = time.monotonic()
+                        # The serve's /session/status reports "busy" FOREVER
+                        # for prompt_async sessions even after the agent
+                        # finished (observed live 2026-08-07: a fully
+                        # completed session never flipped to "idle"), so the
+                        # st == "idle" check below alone never returns and
+                        # the bridge burns the full OPENCODE_SERVE_TIMEOUT.
+                        # Completion is detectable from the message list: a
+                        # step-finish with no new content across two
+                        # consecutive poll cycles means the agent is done.
+                        finish_quiet_cycles = 0
                         while True:
                             if time.monotonic() - started > OPENCODE_SERVE_TIMEOUT:
                                 logger.error(
@@ -381,8 +670,10 @@ async def opencode_chat_stream(
                                     pass
                                 if session_map is not None and session_key:
                                     session_map.pop(session_key, None)
+                                pending_permissions.pop(session_id, None)
                                 yield ("status", "[OpenCode Bridge Error: timed out waiting for the agent]")
                                 return
+                            cycle_content = False
                             async for delta in _poll_session_deltas(
                                 client, session_id, user_mids, text_lens, tool_state,
                             ):
@@ -393,6 +684,63 @@ async def opencode_chat_stream(
                                     pending_done = True
                                     continue
                                 yield delta
+                                cycle_content = True
+                                last_emit = time.monotonic()
+                            # A RUNNING tool in the newest assistant
+                            # message means the agent is still working — a
+                            # freshly started tool produces no content delta
+                            # until it emits output, so the quiet-cycles
+                            # logic below would otherwise declare the session
+                            # "done" seconds after a tool starts (regression
+                            # 2026-08-07: stream ended 4s into a wedged
+                            # bash run, stranding its pending permission).
+                            if pending_done and not cycle_content:
+                                still_running = False
+                                try:
+                                    msg_resp = await client.get(
+                                        f"{OPENCODE_SERVE_URL}/session/{session_id}/message",
+                                        timeout=10.0,
+                                    )
+                                    if msg_resp.status_code == 200:
+                                        msgs = msg_resp.json()
+                                        for m in msgs:
+                                            if (m.get("info") or {}).get("role") != "assistant":
+                                                continue
+                                            for p in m.get("parts") or []:
+                                                if p.get("type") == "tool" and p.get("tool") != "question":
+                                                    st = p.get("state") or {}
+                                                    if st.get("status") == "running" and not st.get("output"):
+                                                        still_running = True
+                                                        break
+                                            if still_running:
+                                                break
+                                except (httpx.HTTPError, OSError, ValueError):
+                                    pass
+                                if still_running:
+                                    finish_quiet_cycles = 0
+                                    # Do not emit "done" — the agent is mid
+                                    # tool; keep the stream alive.
+                                    cycle_content = True
+                            # Multi-step agents pause between steps; a
+                            # finished session shows a step-finish then goes
+                            # quiet.  Two consecutive cycles with a step-
+                            # finish and zero new content = done.
+                            if pending_done and not cycle_content:
+                                finish_quiet_cycles += 1
+                                if finish_quiet_cycles >= 2:
+                                    # The agent looks done, but it may be
+                                    # parked on a permission the bridge
+                                    # never answered.  Resolve it BEFORE
+                                    # returning: READ -> auto-allow (tool
+                                    # proceeds), WRITE -> surface a question
+                                    # so the next request answers it.
+                                    question = await _resolve_pending_permission(client, session_id, pending_permissions)
+                                    if question:
+                                        yield ("question", question)
+                                        return
+                                    return
+                            else:
+                                finish_quiet_cycles = 0
                             try:
                                 st_resp = await client.get(
                                     f"{OPENCODE_SERVE_URL}/session/status", timeout=10.0,
@@ -401,11 +749,172 @@ async def opencode_chat_stream(
                             except (httpx.HTTPError, ValueError):
                                 st = None
                             if st == "idle":
+                                question = await _resolve_pending_permission(client, session_id, pending_permissions)
+                                if question:
+                                    yield ("question", question)
+                                    return
                                 return
+                            # Real agent work with no new parts (long bash
+                            # run, model generation) must not read as a
+                            # dead stream: emit a keepalive after quiet.
+                            if time.monotonic() - last_emit > _EVENT_QUIET_TIMEOUT:
+                                yield (
+                                    "status",
+                                    "⏳ still working… "
+                                    f"(polling {time.monotonic() - polling_started:.0f}s)",
+                                )
+                                last_emit = time.monotonic()
+                            # A tool part wedged in "running" with no output
+                            # (the runner never executed it) would hold the
+                            # session busy forever.  Detect it, abort the
+                            # session, drop the pin, recycle the serve, and
+                            # surface a clear error instead of streaming
+                            # keepalives indefinitely.  First check for a
+                            # PENDING PERMISSION — a write waiting for the
+                            # user looks identical to a wedge in the message
+                            # list (status=running, no output), and must be
+                            # relayed instead of killed.
+                            if time.monotonic() - last_wedge_check >= _WEDGE_CHECK_INTERVAL_S:
+                                last_wedge_check = time.monotonic()
+                                pending_perm = await _detect_pending_permission(client, session_id)
+                                if pending_perm:
+                                    pid = str(pending_perm.get("id") or "")
+                                    perm_type = str(pending_perm.get("permission") or "")
+                                    tool_info = pending_perm.get("tool") or {}
+                                    # Pull the command from the tool part for
+                                    # classification (read → auto-allow).
+                                    cmd = ""
+                                    try:
+                                        msg_resp = await client.get(
+                                            f"{OPENCODE_SERVE_URL}/session/{session_id}/message"
+                                            + (
+                                                f"/{tool_info.get('messageID')}"
+                                                if tool_info.get("messageID") else ""
+                                            ),
+                                            timeout=10.0,
+                                        )
+                                        if msg_resp.status_code == 200:
+                                            parts = msg_resp.json().get("parts") if isinstance(msg_resp.json(), dict) else msg_resp.json()
+                                            for part in (parts or []):
+                                                if (part.get("callID") == tool_info.get("callID")
+                                                        or part.get("id") == tool_info.get("callID")):
+                                                    cmd = str(((part.get("state") or {}).get("input") or {}).get("command") or "")
+                                                    break
+                                    except (httpx.HTTPError, OSError, ValueError):
+                                        pass
+                                    cmd = cmd or str((pending_perm.get("patterns") or [""])[0])
+                                    if (perm_type == "external_directory"
+                                            and _classify_external_access(cmd) == "read"):
+                                        await _post_permission_response(session_id, pid, "always")
+                                        continue
+                                    pending_permissions[session_id] = pid
+                                    template = (_GIT_PERMISSION_QUESTION_TEMPLATE
+                                                if perm_type == "bash"
+                                                else _PERMISSION_QUESTION_TEMPLATE)
+                                    yield ("question", template.format(target=_permission_target(pending_perm), cmd=cmd[:300]))
+                                    return
+                                if await _detect_wedged_tool(client, session_id):
+                                    try:
+                                        await client.post(
+                                            f"{OPENCODE_SERVE_URL}/session/{session_id}/abort",
+                                            timeout=10.0,
+                                        )
+                                    except (httpx.HTTPError, OSError):
+                                        pass
+                                    if session_map is not None and session_key:
+                                        session_map.pop(session_key, None)
+                                    pending_permissions.pop(session_id, None)
+                                    try:
+                                        pid = await asyncio.to_thread(_find_serve_pid, OPENCODE_SERVE_URL.rsplit(":", 1)[-1])
+                                        if pid:
+                                            os.kill(pid, 15)
+                                    except (OSError, ProcessLookupError):
+                                        pass
+                                    yield ("status", "[OpenCode Bridge Error: agent tool runner wedged — session aborted, serve recycled. Please retry.]")
+                                    return
                             await asyncio.sleep(1.0)
                     except asyncio.TimeoutError:
                         if pending_done and not session_busy:
                             return
+                        # A parked WRITE tool never emits permission.updated
+                        # (opencode 1.18.15 write/edit tools omit the SSE
+                        # event; only bash emits it), so the event-bus path
+                        # must poll GET /permission too.  A write waiting
+                        # for the user looks identical to a wedge in the
+                        # message list (status=running, no output) — relay
+                        # it as a question, never kill it.
+                        if time.monotonic() - bus_last_wedge_check >= _WEDGE_CHECK_INTERVAL_S:
+                            bus_last_wedge_check = time.monotonic()
+                            pending_perm = await _detect_pending_permission(client, session_id)
+                            if pending_perm:
+                                pid = str(pending_perm.get("id") or "")
+                                perm_type = str(pending_perm.get("permission") or "")
+                                tool_info = pending_perm.get("tool") or {}
+                                cmd = ""
+                                try:
+                                    msg_resp = await client.get(
+                                        f"{OPENCODE_SERVE_URL}/session/{session_id}/message"
+                                        + (
+                                            f"/{tool_info.get('messageID')}"
+                                            if tool_info.get("messageID") else ""
+                                        ),
+                                        timeout=10.0,
+                                    )
+                                    if msg_resp.status_code == 200:
+                                        parts = msg_resp.json().get("parts") if isinstance(msg_resp.json(), dict) else msg_resp.json()
+                                        for part in (parts or []):
+                                            if (part.get("callID") == tool_info.get("callID")
+                                                    or part.get("id") == tool_info.get("callID")):
+                                                cmd = str(((part.get("state") or {}).get("input") or {}).get("command") or "")
+                                                break
+                                except (httpx.HTTPError, OSError, ValueError):
+                                    pass
+                                cmd = cmd or str((pending_perm.get("patterns") or [""])[0])
+                                tool_name = ""
+                                try:
+                                    tool_info2 = pending_perm.get("tool") or {}
+                                    mid = tool_info2.get("messageID")
+                                    call_id = tool_info2.get("callID")
+                                    if mid:
+                                        m_resp = await client.get(
+                                            f"{OPENCODE_SERVE_URL}/session/{session_id}/message/{mid}",
+                                            timeout=10.0,
+                                        )
+                                        if m_resp.status_code == 200:
+                                            for part in (m_resp.json().get("parts") or []):
+                                                if part.get("callID") == call_id or part.get("id") == call_id:
+                                                    tool_name = str(part.get("tool") or "")
+                                                    break
+                                except (httpx.HTTPError, OSError, ValueError):
+                                    pass
+                                if (_classify_permission_access(perm_type, tool_name, cmd) == "read"):
+                                    await _post_permission_response(session_id, pid, "always")
+                                    continue
+                                pending_permissions[session_id] = pid
+                                template = (_GIT_PERMISSION_QUESTION_TEMPLATE
+                                            if perm_type == "bash"
+                                            else _PERMISSION_QUESTION_TEMPLATE)
+                                yield ("question", template.format(target=_permission_target(pending_perm), cmd=cmd[:300]))
+                                return
+                            if await _detect_wedged_tool(client, session_id):
+                                try:
+                                    await client.post(
+                                        f"{OPENCODE_SERVE_URL}/session/{session_id}/abort",
+                                        timeout=10.0,
+                                    )
+                                except (httpx.HTTPError, OSError):
+                                    pass
+                                if session_map is not None and session_key:
+                                    session_map.pop(session_key, None)
+                                pending_permissions.pop(session_id, None)
+                                try:
+                                    pid = await asyncio.to_thread(_find_serve_pid, OPENCODE_SERVE_URL.rsplit(":", 1)[-1])
+                                    if pid:
+                                        os.kill(pid, 15)
+                                except (OSError, ProcessLookupError):
+                                    pass
+                                yield ("status", "[OpenCode Bridge Error: agent tool runner wedged — session aborted, serve recycled. Please retry.]")
+                                return
                         # Keep the client connection alive during long tool
                         # phases (and show the agent is still working).
                         yield ("status", "⏳ still working…")
@@ -420,6 +929,62 @@ async def opencode_chat_stream(
                     if props.get("sessionID") != session_id:
                         continue
                     etype = evt.get("type")
+                    if etype == "permission.updated":
+                        # The serve asked for a permission decision.  The
+                        # external_directory gate fires when a bash tool
+                        # touches paths outside the session workspace; the
+                        # bash gate fires for git ask-rules (commit/push/
+                        # reset/rebase).  A headless serve auto-rejects
+                        # silently and leaves the tool stuck "running" (the
+                        # bridge wedges).  Auto-allow READ external-dir
+                        # commands; WRITE and git commands yield a question
+                        # and stop so the USER decides on the next request
+                        # (the session stays pinned).
+                        if props.get("type") in _RELAYED_PERMISSION_TYPES:
+                            pid = str(props.get("id") or "")
+                            meta = props.get("metadata") or {}
+                            title = str(props.get("title") or "")
+                            cmd = str(meta.get("command") or "") if isinstance(meta, dict) else ""
+                            cmd = cmd or title
+                            tool_name = ""
+                            try:
+                                tool_info = props.get("tool") or {}
+                                mid = tool_info.get("messageID")
+                                call_id = tool_info.get("callID")
+                                if mid:
+                                    m_resp = await client.get(
+                                        f"{OPENCODE_SERVE_URL}/session/{session_id}/message/{mid}",
+                                        timeout=10.0,
+                                    )
+                                    if m_resp.status_code == 200:
+                                        for part in (m_resp.json().get("parts") or []):
+                                            if part.get("callID") == call_id or part.get("id") == call_id:
+                                                tool_name = str(part.get("tool") or "")
+                                                break
+                            except (httpx.HTTPError, OSError, ValueError):
+                                pass
+                            if (_classify_permission_access(
+                                    props.get("type"), tool_name, cmd) == "read"):
+                                try:
+                                    await client.post(
+                                        f"{OPENCODE_SERVE_URL}/session/{session_id}/permissions/{pid}",
+                                        json={"response": "always"},
+                                        timeout=10.0,
+                                    )
+                                except (httpx.HTTPError, OSError):
+                                    pass
+                                continue
+                            pending_permissions[session_id] = pid
+                            template = (_GIT_PERMISSION_QUESTION_TEMPLATE
+                                        if props.get("type") == "bash"
+                                        else _PERMISSION_QUESTION_TEMPLATE)
+                            yield (
+                                "question",
+                                template.format(target=_permission_target(props), cmd=cmd[:300]),
+                            )
+                            return
+                        # Other permission types: no existing branch matches,
+                        # so fall through to the rest of the loop body.
                     if etype == "session.status":
                         # Track whether the agent is still working:
                         # properties.status.type is "busy" | "idle".
@@ -509,66 +1074,205 @@ async def _yield_part_deltas(
         prev = text_lens.get(pid, 0)
         if len(text) > prev:
             text_lens[pid] = len(text)
-            delta = text[prev:]
-            if delta.strip():
-                yield ("reasoning", delta)
+            # Announce thinking ONCE per part (first text only) instead of
+            # streaming the raw reasoning tokens — the user wants to know
+            # the agent is thinking without dumping the chain-of-thought.
+            if prev == 0 and text[prev:].strip():
+                yield ("status", "🧠 thinking…\n")
         return
     if ptype == "tool":
         name = str(part.get("tool") or "")
         if name == "question":
             # The agent is asking the user.  The event part often omits the
             # input; fetch the persisted part to read state.input.questions[].
+            # A single question OR a MULTI-GROUP preflight (SDD Session
+            # Preflight asks Pace/Artifacts/PRs/Review in one call) must be
+            # relayed losslessly: every group in order, with headers and
+            # option labels.
             qtext = ""
             opts: list[str] = []
+            multi: list[tuple[str, str, list[str]]] = []
             state = part.get("state") or {}
             inp = state.get("input") if isinstance(state, dict) else None
             if isinstance(inp, dict):
                 questions = inp.get("questions")
                 if isinstance(questions, list) and questions:
-                    q0 = questions[0]
-                    if isinstance(q0, dict):
-                        qtext = str(q0.get("question") or "")
-                        opts = [str(o.get("label") or "") for o in (q0.get("options") or [])
-                                if isinstance(o, dict) and o.get("label")]
+                    for q in questions:
+                        if not isinstance(q, dict):
+                            continue
+                        header = str(q.get("header") or "")
+                        body = str(q.get("question") or "")
+                        qopts = [str(o.get("label") or "") for o in (q.get("options") or [])
+                                 if isinstance(o, dict) and o.get("label")]
+                        multi.append((header, body, qopts))
+                    if multi:
+                        qtext = multi[0][1]
+                        opts = multi[0][2]
                 else:
                     qtext = str(inp.get("question") or "")
             else:
                 qtext = str(inp or "")
-            if not qtext:
-                for _attempt in range(6):
+            if not qtext and not multi:
+                # The serve persists question parts lazily: the event carries
+                # the tool marker immediately but state.input (the actual
+                # questions) only lands 5-8s later.  Wait long enough for
+                # persistence (30 x 0.4s = 12s) before giving up, so the
+                # SDD preflight's full multi-group envelope is relayed
+                # losslessly rather than collapsing to "Could you clarify?".
+                for _attempt in range(30):
+                    fetched: bool = False
                     try:
-                        msg_resp = await client.get(
-                            f"{OPENCODE_SERVE_URL}/session/{session_id}/message/{part.get('messageID')}",
-                            timeout=10.0,
-                        )
-                        for p2 in (msg_resp.json().get("parts") or []):
-                            if p2.get("id") == pid and isinstance(p2.get("state"), dict):
-                                i2 = (p2.get("state") or {}).get("input")
-                                if isinstance(i2, dict):
-                                    qs = i2.get("questions")
-                                    if isinstance(qs, list) and qs and isinstance(qs[0], dict):
-                                        qtext = str(qs[0].get("question") or "")
-                                        opts = [str(o.get("label") or "") for o in (qs[0].get("options") or [])
-                                                if isinstance(o, dict) and o.get("label")]
-                                    else:
-                                        qtext = str(i2.get("question") or "")
+                        # Preferred: the part's own message (carries input).
+                        mid = part.get("messageID") or ""
+                        if mid:
+                            msg_resp = await client.get(
+                                f"{OPENCODE_SERVE_URL}/session/{session_id}/message/{mid}",
+                                timeout=10.0,
+                            )
+                            if msg_resp.status_code == 200:
+                                fetched = True
+                                for p2 in (msg_resp.json().get("parts") or []):
+                                    if p2.get("id") == pid and isinstance(p2.get("state"), dict):
+                                        i2 = (p2.get("state") or {}).get("input")
+                                        if isinstance(i2, dict):
+                                            qs = i2.get("questions")
+                                            if isinstance(qs, list) and qs:
+                                                for q in qs:
+                                                    if not isinstance(q, dict):
+                                                        continue
+                                                    header = str(q.get("header") or "")
+                                                    body = str(q.get("question") or "")
+                                                    qopts = [str(o.get("label") or "") for o in (q.get("options") or [])
+                                                             if isinstance(o, dict) and o.get("label")]
+                                                    multi.append((header, body, qopts))
+                                                if multi:
+                                                    qtext = multi[0][1]
+                                                    opts = multi[0][2]
+                                            else:
+                                                qtext = str(i2.get("question") or "")
                     except (httpx.HTTPError, ValueError):
                         pass
-                    if qtext:
+                    if not qtext and not multi:
+                        # Fallback: the serve omits messageID on some part
+                        # objects; scan the full message list and find the
+                        # question part by its persisted id (it carries the
+                        # complete multi-group input there).
+                        try:
+                            msg_resp = await client.get(
+                                f"{OPENCODE_SERVE_URL}/session/{session_id}/message",
+                                timeout=10.0,
+                            )
+                            if msg_resp.status_code == 200:
+                                fetched = True
+                                for m in msg_resp.json():
+                                    for p2 in (m.get("parts") or []):
+                                        if p2.get("type") == "tool" and p2.get("tool") == "question":
+                                            st2 = p2.get("state") or {}
+                                            i2 = st2.get("input") if isinstance(st2, dict) else None
+                                            if not isinstance(i2, dict):
+                                                continue
+                                            qs = i2.get("questions")
+                                            if isinstance(qs, list) and qs:
+                                                for q in qs:
+                                                    if not isinstance(q, dict):
+                                                        continue
+                                                    header = str(q.get("header") or "")
+                                                    body = str(q.get("question") or "")
+                                                    qopts = [str(o.get("label") or "") for o in (q.get("options") or [])
+                                                             if isinstance(o, dict) and o.get("label")]
+                                                    multi.append((header, body, qopts))
+                                                if multi:
+                                                    qtext = multi[0][1]
+                                                    opts = multi[0][2]
+                                                    break
+                                            elif i2.get("question"):
+                                                qtext = str(i2.get("question") or "")
+                                                opts = [str(o.get("label") or "") for o in (i2.get("options") or [])
+                                                        if isinstance(o, dict) and o.get("label")]
+                                            if qtext or multi:
+                                                break
+                        except (httpx.HTTPError, ValueError):
+                            pass
+                    if qtext or multi:
                         break
-                    await asyncio.sleep(0.3)
+                    if not fetched:
+                        break
+                    await asyncio.sleep(0.4)
+            if len(multi) > 1:
+                # Multi-group preflight: relay every group losslessly.
+                lines = []
+                for header, body, qopts in multi:
+                    if header:
+                        lines.append(f"{header}: {body}")
+                    else:
+                        lines.append(body)
+                    if qopts:
+                        lines.append(f"  Options: {' | '.join(qopts)}")
+                yield ("question", "\n".join(lines))
+                return
             if opts:
                 qtext = f"{qtext} (Options: {' | '.join(opts)})"
             yield ("question", qtext or "Could you clarify?")
             return
         state = str((part.get("state") or {}).get("status") or "")
-        if name and state != tool_state.get(name):
-            tool_state[name] = state
+        # Track each tool part's state by PART ID (like text_lens above):
+        # the same tool name can appear in several parts with different
+        # states (e.g. two bash parts, one errored, one still running), and
+        # name-keying flips the recorded state on every poll so the running
+        # part re-emits its status chunk once per second.  Keying by part id
+        # keeps each part's transitions independent and monotonic.
+        if name and state != tool_state.get(pid):
+            tool_state[pid] = state
             if state == "running":
-                yield ("status", f"🔧 {name}…")
+                st = part.get("state") or {}
+                inp = st.get("input") if isinstance(st, dict) else None
+                cmd = str(inp.get("command") or "") if isinstance(inp, dict) else ""
+                if cmd:
+                    yield ("status", f"🔧 {name}: {cmd[:120]}\n")
+                else:
+                    yield ("status", f"🔧 {name}…\n")
             elif state == "completed":
-                yield ("status", f"✅ {name} done")
+                yield ("status", f"✅ {name} done\n")
+            elif state == "error":
+                yield ("status", f"⚠️ {name} failed\n")
         return
+
+
+async def _detect_wedged_tool(client: httpx.AsyncClient, session_id: str) -> bool:
+    """Detect a tool part stuck in "running" with no output.
+
+    The serve's tool runner can mark a tool part as started (status
+    "running") but never actually execute it, leaving the session busy
+    forever.  A running tool part with no output whose start is older than
+    ``_TOOL_WEDGE_AFTER_S`` is wedged, not working.  Never raises.
+    """
+    try:
+        resp = await client.get(
+            f"{OPENCODE_SERVE_URL}/session/{session_id}/message", timeout=10.0,
+        )
+        if resp.status_code != 200:
+            return False
+        now_ms = int(time.time() * 1000)
+        for m in resp.json():
+            for p in m.get("parts") or []:
+                if p.get("type") != "tool" or p.get("tool") == "question":
+                    continue
+                st = p.get("state") or {}
+                if st.get("status") != "running" or st.get("output"):
+                    continue
+                start = (st.get("time") or {}).get("start")
+                if start is None:
+                    continue
+                elapsed_s = (now_ms - int(start)) / 1000
+                if now_ms - int(start) > _TOOL_WEDGE_AFTER_S * 1000:
+                    logger.warning(
+                        "wedged tool part %r running without output for %.0fs — session %s",
+                        p.get("tool"), elapsed_s, str(session_id)[:16],
+                    )
+                    return True
+    except (httpx.HTTPError, OSError, ValueError):
+        return False
+    return False
 
 
 async def _poll_session_deltas(
@@ -700,6 +1404,12 @@ def _find_serve_pid(port: str) -> Optional[int]:
             try:
                 with open(f"/proc/{entry}/cmdline", "rb") as fh:
                     cmd = fh.read().decode("utf-8", "ignore")
+                # /proc/<pid>/cmdline separates argv with NUL bytes, not
+                # spaces — the old space-form match NEVER matched any
+                # process, so serve recycling (age, low-memory, wedge
+                # recovery) silently did nothing and a wedged tool runner
+                # lived forever.  Normalize NULs to spaces before matching.
+                cmd = cmd.replace("\x00", " ")
                 if "opencode" in cmd and "serve" in cmd and f"--port {port}" in cmd:
                     return int(entry)
             except (OSError, ValueError):
@@ -709,7 +1419,10 @@ def _find_serve_pid(port: str) -> Optional[int]:
     return None
 
 
-async def _abort_zombie_sessions(client: httpx.AsyncClient) -> None:
+async def _abort_zombie_sessions(
+    client: httpx.AsyncClient,
+    protected_ids: Optional[set[str]] = None,
+) -> None:
     """Abort sessions that are stuck (busy with no recent activity).
 
     The opencode serve processes agent sessions through a sequential tool
@@ -719,6 +1432,12 @@ async def _abort_zombie_sessions(client: httpx.AsyncClient) -> None:
     zombie session accumulated.  A busy session whose last update is older
     than a few minutes is stuck, not working; abort it so new tasks get a
     free slot.  Never raises (best-effort hygiene).
+
+    ``protected_ids`` holds sessions currently pinned as active
+    conversations in the session map.  Pinned sessions sit idle BY DESIGN
+    between user messages (clarifying questions, multi-turn coding), so
+    they are never swept here — the busy-status check at resume time
+    handles the genuinely stuck pinned session instead.
     """
     try:
         resp = await client.get(f"{OPENCODE_SERVE_URL}/session", timeout=10.0)
@@ -729,6 +1448,9 @@ async def _abort_zombie_sessions(client: httpx.AsyncClient) -> None:
         for s in resp.json():
             sid = s.get("id")
             if not sid:
+                continue
+            if protected_ids and sid in protected_ids:
+                # Pinned conversation waiting on the user — not a zombie.
                 continue
             updated = ((s.get("time") or {}).get("updated") or 0)
             if updated and now_ms - updated > threshold_ms:

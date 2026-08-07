@@ -60,7 +60,12 @@ from llm import (
     stream_llm,
     openrouter_cloud_escalation,
 )
-from opencode_bridge import opencode_chat, opencode_chat_stream
+from opencode_bridge import (
+    _parse_permission_answer,
+    _post_permission_response,
+    opencode_chat,
+    opencode_chat_stream,
+)
 from routing import (
     RouteDecision,
     discriminate_caller,
@@ -173,6 +178,23 @@ def _opencode_session_state(app: FastAPI) -> dict[str, str]:
         # mutations are disk-persisted off the event loop).
         state.opencode_sessions = _load_opencode_sessions()
     return state.opencode_sessions
+
+
+def _pending_permissions_state(app: FastAPI) -> dict[str, str]:
+    """Lazy accessor for the bridge's pending-permission map on app.state.
+
+    Rule 6: mutable cross-request state must live on ``app.state``, not at
+    module scope.  Keyed by opencode session id → permission id that the
+    bridge relayed to the user and is waiting for an answer on.  In-memory
+    only (a proxy restart between the question and the answer orphans the
+    parked tool, which the wedge detector later kills — acceptable: the
+    serve parks the tool forever either way, and a restart clears the
+    session).
+    """
+    state = app.state
+    if not hasattr(state, "opencode_pending_permissions"):
+        state.opencode_pending_permissions = {}
+    return state.opencode_pending_permissions
 
 
 async def _persist_opencode_sessions(app: FastAPI) -> None:
@@ -765,6 +787,7 @@ async def chat_completions(request: Request) -> Response:
             client_stream,
             session_map=_opencode_session_state(request.app),
             session_key=session_key,
+            pending_permissions=_pending_permissions_state(request.app),
         )
         await _persist_opencode_sessions(request.app)
         return resp
@@ -779,6 +802,19 @@ async def chat_completions(request: Request) -> Response:
     pinned = _opencode_session_state(request.app).get(session_key)
     if pinned and _find_coding_question_index(processed_messages) is None:
         answer = _last_user_text(processed_messages)
+        # Pending external_directory WRITE permission from the previous
+        # stream: the agent is paused waiting on the gate.  Parse the user's
+        # reply into a permission response, POST it so the tool resumes,
+        # then run the normal pinned continuation.
+        pending_permission = _pending_permissions_state(request.app).get(pinned)
+        if pending_permission:
+            permission_response = _parse_permission_answer(answer or "continue")
+            await _post_permission_response(pinned, pending_permission, permission_response)
+            _pending_permissions_state(request.app).pop(pinned, None)
+            logger.info(
+                "Answered pending permission %s for session %s (%s)",
+                pending_permission[:16], pinned[:16], permission_response,
+            )
         logger.info(
             "Resuming pinned opencode session for %s (answer=%r)",
             session_key[:16], answer[:60],
@@ -788,6 +824,7 @@ async def chat_completions(request: Request) -> Response:
             client_stream,
             session_map=_opencode_session_state(request.app),
             session_key=session_key,
+            pending_permissions=_pending_permissions_state(request.app),
         )
         await _persist_opencode_sessions(request.app)
         return resp
@@ -2151,6 +2188,7 @@ async def _opencode_task_response(
     client_stream: bool,
     session_map: Optional[dict[str, str]] = None,
     session_key: Optional[str] = None,
+    pending_permissions: Optional[dict[str, str]] = None,
 ) -> Response:
     """Run a task through the opencode bridge and return the response.
 
@@ -2179,6 +2217,7 @@ async def _opencode_task_response(
             agent=OPENCODE_AGENT,
             session_map=session_map,
             session_key=session_key,
+            pending_permissions=pending_permissions,
         ):
             stop_after = False
             if not text_delta:
@@ -2241,6 +2280,7 @@ async def _handle_opencode_request(
     client_stream: bool,
     session_map: Optional[dict[str, str]] = None,
     session_key: Optional[str] = None,
+    pending_permissions: Optional[dict[str, str]] = None,
 ) -> Response:
     """Handle ``model: "opencode"`` — direct the task to the opencode agent.
 
@@ -2259,6 +2299,7 @@ async def _handle_opencode_request(
         client_stream,
         session_map=session_map,
         session_key=session_key,
+        pending_permissions=pending_permissions,
     )
     return resp
 
@@ -2355,6 +2396,7 @@ async def _apply_coding_decision_gate(
                 client_stream,
                 session_map=_opencode_session_state(app),
                 session_key=session_id,
+                pending_permissions=_pending_permissions_state(app),
             )
             await _persist_opencode_sessions(app)
             return resp
@@ -2373,6 +2415,7 @@ async def _apply_coding_decision_gate(
                 client_stream,
                 session_map=_opencode_session_state(app),
                 session_key=session_id,
+                pending_permissions=_pending_permissions_state(app),
             )
             await _persist_opencode_sessions(app)
             return resp

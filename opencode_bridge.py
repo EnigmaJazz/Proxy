@@ -1273,8 +1273,16 @@ async def _detect_wedged_tool(client: httpx.AsyncClient, session_id: str) -> boo
     "running") but never actually execute it, leaving the session busy
     forever.  A running tool part with no output whose start is older than
     ``_TOOL_WEDGE_AFTER_S`` is wedged, not working.  Never raises.
+
+    STALE-PART GUARD (2026-08-08): tool parts started BEFORE the current
+    serve process are debris from a dead serve (the serve dies silently
+    under load; the session storage survives and the pinned session is
+    resumed on a fresh serve).  Aborting the session for stale debris
+    kills a healthy resumed cycle, so parts older than the serve's start
+    are ignored.
     """
     try:
+        serve_start_ms = await asyncio.to_thread(_serve_start_epoch_ms)
         resp = await client.get(
             f"{OPENCODE_SERVE_URL}/session/{session_id}/message", timeout=10.0,
         )
@@ -1291,8 +1299,12 @@ async def _detect_wedged_tool(client: httpx.AsyncClient, session_id: str) -> boo
                 start = (st.get("time") or {}).get("start")
                 if start is None:
                     continue
-                elapsed_s = (now_ms - int(start)) / 1000
-                if now_ms - int(start) > _TOOL_WEDGE_AFTER_S * 1000:
+                start_ms = int(start)
+                if serve_start_ms is not None and start_ms < serve_start_ms:
+                    # Stale part from a previous serve — not a live wedge.
+                    continue
+                elapsed_s = (now_ms - start_ms) / 1000
+                if now_ms - start_ms > _TOOL_WEDGE_AFTER_S * 1000:
                     logger.warning(
                         "wedged tool part %r running without output for %.0fs — session %s",
                         p.get("tool"), elapsed_s, str(session_id)[:16],
@@ -1301,6 +1313,24 @@ async def _detect_wedged_tool(client: httpx.AsyncClient, session_id: str) -> boo
     except (httpx.HTTPError, OSError, ValueError):
         return False
     return False
+
+
+def _serve_start_epoch_ms() -> Optional[int]:
+    """Epoch-ms when the current serve process started (from /proc), or
+    None when it cannot be determined (no stale guard)."""
+    try:
+        pid = _find_serve_pid(OPENCODE_SERVE_URL.rsplit(":", 1)[-1])
+        if not pid:
+            return None
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+            parts = fh.read().split()
+        start_ticks = int(parts[21])
+        with open("/proc/uptime", encoding="utf-8") as fh:
+            uptime_s = float(fh.read().split()[0])
+        start_s = time.time() - uptime_s + start_ticks / os.sysconf("SC_CLK_TCK")
+        return int(start_s * 1000)
+    except (OSError, ValueError, IndexError):
+        return None
 
 
 async def _poll_session_deltas(

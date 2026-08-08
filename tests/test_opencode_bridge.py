@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from types import SimpleNamespace
 from typing import Any, AsyncIterator, Optional
 
 import httpx
@@ -98,6 +99,23 @@ class _FakeClient:
 
     def stream(self, *args: Any, **kwargs: Any) -> _FakeStream:
         return _FakeStream(self.stream_lines)
+
+
+class _FakeApp:
+    """Minimal FastAPI stand-in: ``app.state`` with a real pending-permissions map.
+
+    Lets route-level tests (``_handle_opencode_command``) exercise the true
+    ``_pending_permissions_state(app)`` accessor instead of a fake dict, so
+    the relay state lands where the pinned-session continuation reads it.
+    """
+
+    def __init__(
+        self, pending: Optional[dict[str, tuple[str, bool]]] = None,
+    ) -> None:
+        self.state = SimpleNamespace()
+        self.state.opencode_pending_permissions = (
+            pending if pending is not None else {}
+        )
 
 
 class _BusyThenIdleClient(_FakeClient):
@@ -406,12 +424,24 @@ class TestRoutesOpenCode:
 
         captured: list[str] = []
 
-        async def _fake_chat(text: str, *, agent: str = "gentle-orchestrator") -> str:
+        async def _fake_stream(
+            text: str, *, agent: str = "gentle-orchestrator",
+            model_id: Optional[str] = None, provider_id: str = "kinver",
+            session_map: Optional[dict[str, str]] = None,
+            session_key: Optional[str] = None,
+            pending_permissions: Optional[dict[str, tuple[str, bool]]] = None,
+            just_approved_permission: bool = False,
+            system_prompt: str = "",
+            timeout: float = 600.0,
+            autonomous: bool = False,
+        ) -> AsyncIterator[tuple[str, str]]:
             captured.append(text)
-            return "CMD_DONE"
+            yield ("text", "CMD_DONE")
 
-        monkeypatch.setattr("routes.opencode_chat", _fake_chat)
-        resp = await _handle_opencode_command("/opencode implement the parser")
+        monkeypatch.setattr("routes.opencode_chat_stream", _fake_stream)
+        resp = await _handle_opencode_command(
+            "/opencode implement the parser", _FakeApp(),
+        )
         text = await _drain_stream(resp)
         assert captured == ["implement the parser"]
         assert "CMD_DONE" in text
@@ -1083,6 +1113,69 @@ class TestPermissionRelayPolicy:
         perm_posts = [(u, b) for u, b in client.post_calls if "/permissions/" in u]
         assert all("perm_w" not in u for u, _ in perm_posts)
         assert PP.get("ses_0001") == ("perm_w", True)
+
+    @pytest.mark.asyncio
+    async def test_opencode_command_write_relay(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """REQ-3 Scenario-1 + threat-matrix (routing parity): the /opencode
+        command must flow through ``opencode_chat_stream`` (the relay path),
+        NOT the bare blocking ``opencode_chat`` (the old silent write/edit
+        drop).  A write gate inside a /opencode task surfaces as an SSE
+        content question in interactive mode (no auto-allow), and the SAME
+        stream path auto-allows it in autonomous mode."""
+        from routes import _handle_opencode_command
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+
+        # ---- Interactive leg: write gate surfaces as a question ---------
+        client = _FakeClient()
+        client.stream_lines = [
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_user", "role": "user"}),
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_a", "role": "assistant"}),
+            _evt("permission.updated", sessionID="ses_0001",
+                 id="perm_w", type="write",
+                 title="Allow writing to ~/out.txt",
+                 metadata={"filepath": "~/out.txt"}),
+        ]
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        resp = await _handle_opencode_command(
+            "/opencode write config", _FakeApp(pending=PP),
+        )
+        text = await _drain_stream(resp)
+        # The write question is relayed as visible SSE content — never dropped.
+        assert "Target: ~/out.txt" in text
+        # Interactive: no auto-allow POST fired; the gate awaits the user.
+        assert [u for u, _ in client.post_calls if "/permissions/" in u] == []
+        assert PP.get("ses_0001") == ("perm_w", True)
+        # The stream relay path is used: prompt_async (streaming send) fired
+        # and NO bare blocking /message POST (the old opencode_chat drop path).
+        assert any("prompt_async" in u for u, _ in client.post_calls)
+        assert not any("/message" in u for u, _ in client.post_calls)
+
+        # ---- Autonomous leg: the same stream path auto-allows -----------
+        PP.clear()
+        client2 = _FakeClient()
+        client2.stream_lines = list(client.stream_lines)
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client2)
+        deltas = [d async for d in opencode_chat_stream(
+            "write config", pending_permissions=PP, autonomous=True,
+        )]
+        assert [k for k, _ in deltas if k == "question"] == []
+        perm_posts = [(u, b) for u, b in client2.post_calls if "/permissions/" in u]
+        assert any(
+            u.endswith("/permissions/perm_w") and b == {"response": "always"}
+            for u, b in perm_posts
+        )
+        assert PP.get("ses_0001") is None
+        PP.clear()
 
 
 # ---------------------------------------------------------------------------

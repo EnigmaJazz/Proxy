@@ -180,6 +180,31 @@ OPENCODE_AGENT: str = "gentle-orchestrator"
 # How long to wait for the opencode agent to finish a task.
 OPENCODE_SERVE_TIMEOUT: float = 600.0
 
+# Serve stability mode (REQ-4): candidate B (serve-scoped config dir via
+# XDG_CONFIG_HOME, default) vs candidate A (`--pure` arg).  When True the
+# serve spawns with `--pure`, disabling ALL external plugin auto-load
+# incl. the rate-limit-fallback plugin — kept as a documented fallback
+# only; the reduced-config path is the default.  Subprocess-scoped toggle,
+# never touches the user's TUI config.
+OPENCODE_SERVE_PURE: bool = False
+
+# Scratch config dir the proxy OWNS for the headless serve (candidate B).
+# The serve spawns with XDG_CONFIG_HOME pointing here, and the proxy
+# syncs a REDUCED opencode.jsonc template into its ``opencode/`` subdir
+# (opencode-serve-config.opencode.jsonc) so ONLY the rate-limit-fallback
+# plugin loads.  Never points at ~/.config/opencode — the user's TUI
+# config stays untouched.
+OPENCODE_SERVE_CONFIG_DIR: str = (
+    "~/opencode-workspace/serve-config"
+)
+
+# Path whose mtime drives config-drift detection (REQ-5): the committed
+# serve template.  Hot-editing it while a serve runs recycles the serve
+# before the next request so the new config actually loads.
+OPCODE_CONFIG_PATH: str = (
+    "<REPO_ROOT>/opencode-serve-config.opencode.jsonc"
+)
+
 # Bridge model keys exposed to clients, validated alongside ALL_MODEL_KEYS.
 # "opencode" routes to the opencode serve bridge instead of llama.cpp.
 BRIDGE_MODEL_KEYS: frozenset[str] = frozenset({"opencode", "opencode-sdd"})

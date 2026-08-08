@@ -38,7 +38,10 @@ from constants import (
     OPENCODE_SERVE_TIMEOUT,
     OPENCODE_SERVE_URL,
     OPENCODE_BRIDGE_DIRECTORY,
+    OPENCODE_SERVE_CONFIG_DIR,
+    OPENCODE_SERVE_PURE,
     OPENCODE_WORKSPACE_DIR,
+    OPCODE_CONFIG_PATH,
     get_logger,
 )
 
@@ -415,14 +418,57 @@ async def ensure_opencode_serve() -> bool:
     Returns True when the backend is answering.  Spawns ``opencode serve``
     as a detached child process bound to ``OPENCODE_SERVE_URL`` — the
     proxy owns its lifecycle so no systemd unit is required.  Never raises.
+
+    Config-drift gate (REQ-5): when a serve IS running and the serve
+    template (OPCODE_CONFIG_PATH) is newer than the mtime cached at the
+    last successful spawn, the serve is recycled via ``_force_recycle_serve``
+    and respawned so the edited config actually loads.  An unreadable
+    template is treated as no-drift.
     """
+    global _serve_config_mtime
+    mtime = await asyncio.to_thread(_config_mtime)
     if await is_opencode_serve_running():
-        return True
+        if mtime is None:
+            return True  # template unreadable — treat as no-drift
+        if _serve_config_mtime is not None and mtime > _serve_config_mtime:
+            logger.warning(
+                "opencode serve config drifted (mtime %.3f > cached %.3f) — "
+                "recycling serve", mtime, _serve_config_mtime,
+            )
+            await _force_recycle_serve()
+            # Drain the old listener so the respawn can bind the port.
+            for _ in range(4):
+                if not await is_opencode_serve_running():
+                    break
+                await asyncio.sleep(0.25)
+        else:
+            if _serve_config_mtime is None:
+                # Proxy restarted while the serve survived: adopt the
+                # current template as the baseline, no recycle.
+                _serve_config_mtime = mtime
+            return True
+    return await _spawn_serve(mtime)
+
+
+async def _spawn_serve(mtime: Optional[float]) -> bool:
+    """Spawn the opencode serve with the serve-scoped config (candidate B).
+
+    Syncs the reduced template into ``OPENCODE_SERVE_CONFIG_DIR`` and
+    spawns with ``XDG_CONFIG_HOME`` pointing there, so ONLY the referenced
+    plugins load (the rate-limit-fallback plugin; the wedge-prone
+    skill-registry / review-result-artifacts / model-variants .ts plugins
+    never auto-load — the serve-config dir holds no .ts files).
+    ``OPENCODE_SERVE_PURE`` toggles candidate A (``--pure``, no plugins).
+    Records ``_serve_config_mtime`` on success so the drift gate can
+    compare.  Never raises.
+    """
+    global _serve_config_mtime
     try:
         port = OPENCODE_SERVE_URL.rsplit(":", 1)[-1]
+        await asyncio.to_thread(_sync_serve_config)
         serve_log = await asyncio.to_thread(_open_serve_log)
         # The serve inherits a minimal systemd PATH; give it the usual
-        # user paths so plugins (e.g. skill-registry → gentle-ai) resolve.
+        # user paths so the fallback plugin's gentle-ai binary resolves.
         serve_env = dict(os.environ)
         serve_env["PATH"] = (
             "/home/linuxbrew/.linuxbrew/bin:"
@@ -430,22 +476,29 @@ async def ensure_opencode_serve() -> bool:
             "~/.opencode/bin:"
             "/usr/local/bin:/usr/bin:/bin"
         )
+        # Candidate B: serve-scoped config dir (never ~/.config/opencode).
+        serve_env["XDG_CONFIG_HOME"] = OPENCODE_SERVE_CONFIG_DIR
+        args = [
+            OPENCODE_BIN, "serve", "--port", port, "--hostname", "127.0.0.1",
+        ]
+        if OPENCODE_SERVE_PURE:
+            args.append("--pure")  # candidate A fallback: no plugins at all
         proc = await asyncio.create_subprocess_exec(
-            OPENCODE_BIN,
-            "serve",
-            "--port", port,
-            "--hostname", "127.0.0.1",
+            *args,
             stdout=serve_log,
             stderr=serve_log,
             start_new_session=True,
             cwd=OPENCODE_WORKSPACE_DIR,
             env=serve_env,
         )
-        logger.info("Opened opencode serve (pid=%s) on %s", proc.pid, OPENCODE_SERVE_URL)
+        logger.info(
+            "Opened opencode serve (pid=%s) on %s", proc.pid, OPENCODE_SERVE_URL,
+        )
         # Wait briefly for the listener to come up.
         for _ in range(10):
             await asyncio.sleep(0.5)
             if await is_opencode_serve_running():
+                _serve_config_mtime = mtime
                 return True
     except asyncio.CancelledError:
         # Cancellation must propagate (never swallow it).
@@ -1316,25 +1369,90 @@ async def _recycle_serve_if_low_memory() -> None:
         return
 
 
-async def _force_recycle_serve() -> None:
+async def _force_recycle_serve(reason: str = "long-lived call") -> None:
     """Kill the opencode serve unconditionally so the next
     ``ensure_opencode_serve`` respawns a fresh one.
 
-    Used by long-lived calls (SDD-autonomous mode): the serve's tool runner
-    progressively wedges (bash hangs on trivial commands), and an SDD cycle
-    can burn a full hour on a wedged runner.  A fresh serve at cycle start
-    removes that risk.  Never raises.
+    Used by long-lived calls (SDD-autonomous mode) and the config-drift
+    gate (REQ-5): the serve's tool runner progressively wedges (bash hangs
+    on trivial commands), and an SDD cycle can burn a full hour on a
+    wedged runner.  A fresh serve at cycle start removes that risk.  The
+    drift gate recycles when the serve template changes under a running
+    serve.  Never raises.
     """
     try:
         port = OPENCODE_SERVE_URL.rsplit(":", 1)[-1]
         pid = await asyncio.to_thread(_find_serve_pid, port)
         if pid:
-            logger.warning("Forcing opencode serve recycle (long-lived call)")
+            logger.warning("Forcing opencode serve recycle (%s)", reason)
             os.kill(pid, 15)
     except (OSError, ProcessLookupError):
         pass
     except (OSError, ValueError):
         return
+
+
+# F5 (tasks 4.4): the config-mtime cache lives module-level, NOT on
+# proxy.app.state — the spawn gate (ensure_opencode_serve) is a
+# bridge-internal function with no request/app handle (pending_permissions
+# is threaded IN from routes as a plain dict; this cache is owned by the
+# spawn gate itself, so there is no clean app.state channel).  Design.md
+# chose module-level; review-accepted via F5.  Set after every successful
+# spawn; drives the REQ-5 drift recycle.
+_serve_config_mtime: Optional[float] = None
+
+
+def _config_mtime() -> Optional[float]:
+    """mtime of OPCODE_CONFIG_PATH, or None when unreadable (no drift)."""
+    try:
+        return os.path.getmtime(OPCODE_CONFIG_PATH)
+    except OSError:
+        return None
+
+
+def _sync_serve_config() -> None:
+    """Idempotently copy the serve template + fallback-plugin config into the
+    serve-config dir.
+
+    opencode is an XDG app: with XDG_CONFIG_HOME=OPENCODE_SERVE_CONFIG_DIR it
+    reads <dir>/opencode/opencode.jsonc — so the template lands in the
+    ``opencode/`` subdir (empirically verified 2026-08-08: the file at the
+    XDG base root is NOT read).  The reduced file there (file:// plugin ref
+    for the fallback plugin ONLY, no .ts plugin files) is the serve's whole
+    config.  The fallback plugin resolves its OWN config
+    (rate-limit-fallback.json) via $XDG_CONFIG_HOME/opencode/ too — without
+    a copy there it initializes with its defaults (logging OFF, which
+    would blind the REQ-4 fallback-log evidence), so the proxy syncs the
+    user's plugin config alongside the template.  Copies are skipped when
+    the destination already matches, so repeated spawns do not churn the
+    dir."""
+    dst_dir = os.path.join(OPENCODE_SERVE_CONFIG_DIR, "opencode")
+    os.makedirs(dst_dir, exist_ok=True)
+    _copy_if_changed(
+        OPCODE_CONFIG_PATH, os.path.join(dst_dir, "opencode.jsonc"),
+    )
+    plugin_cfg = os.path.expanduser(
+        "~/.config/opencode/rate-limit-fallback.json"
+    )
+    if os.path.exists(plugin_cfg):
+        _copy_if_changed(
+            plugin_cfg, os.path.join(dst_dir, "rate-limit-fallback.json"),
+        )
+
+
+def _copy_if_changed(src: str, dst: str) -> None:
+    """Copy ``src`` to ``dst`` when the contents differ (idempotent)."""
+    with open(src, encoding="utf-8") as fh:
+        data = fh.read()
+    try:
+        with open(dst, encoding="utf-8") as fh:
+            if fh.read() == data:
+                return
+    except OSError:
+        pass
+    with open(dst, "w", encoding="utf-8") as fh:
+        fh.write(data)
+    logger.info("Synced opencode serve config template -> %s", dst)
 
 
 def _serve_health(port: str) -> tuple[bool, Optional[float]]:

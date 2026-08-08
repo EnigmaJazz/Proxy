@@ -1683,6 +1683,194 @@ class TestServeHealth:
 
 
 # ---------------------------------------------------------------------------
+# Serve stability mode + config-drift (REQ-4/5)
+# ---------------------------------------------------------------------------
+def _scripted_running(script: list[bool]) -> Any:
+    """Factory for ``is_opencode_serve_running`` scripts: yields the given
+    values in order, then True forever."""
+    state = {"i": 0}
+
+    async def _running() -> bool:
+        i = state["i"]
+        state["i"] += 1
+        if i < len(script):
+            return script[i]
+        return True
+
+    return _running
+
+
+@pytest.mark.real_recycle
+class TestServeStability:
+    """Serve stability mode (REQ-4) + config-drift auto-recycle (REQ-5).
+
+    The real process boundary is patched everywhere (create_subprocess_exec,
+    _find_serve_pid → fake 12345, os.kill → recorder) so nothing real is
+    spawned or killed.  ``real_recycle`` keeps the hermetic fixture's noop
+    patches from masking the recycle path; the fake pid keeps the
+    serve-untouched guard vacuously satisfied."""
+
+    @pytest.mark.asyncio
+    async def test_serve_spawn_pure_flag(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Candidate B is the default: spawn carries NO ``--pure`` and the
+        serve env gets XDG_CONFIG_HOME=serve-config; ``OPENCODE_SERVE_PURE``
+        toggles candidate A (``--pure`` appended)."""
+        calls: list[list[str]] = []
+        envs: list[dict[str, str]] = []
+        monkeypatch.setattr(opencode_bridge, "is_opencode_serve_running",
+                            _scripted_running([False]))
+        monkeypatch.setattr(opencode_bridge, "_sync_serve_config", lambda: None)
+        monkeypatch.setattr(opencode_bridge, "_open_serve_log", lambda: None)
+
+        async def _exec(*args: Any, **kwargs: Any) -> Any:
+            calls.append(list(args))
+            envs.append(kwargs.get("env", {}))
+            return SimpleNamespace(pid=4242)
+
+        monkeypatch.setattr(opencode_bridge.asyncio, "create_subprocess_exec", _exec)
+
+        ok = await opencode_bridge.ensure_opencode_serve()
+        assert ok is True
+        assert len(calls) == 1
+        assert calls[0][0] == opencode_bridge.OPENCODE_BIN
+        assert "serve" in calls[0]
+        assert "--pure" not in calls[0]
+        assert envs[0]["XDG_CONFIG_HOME"] == opencode_bridge.OPENCODE_SERVE_CONFIG_DIR
+        # Cache updated after the successful spawn (drift gate baseline).
+        assert opencode_bridge._serve_config_mtime == \
+            opencode_bridge.os.path.getmtime(opencode_bridge.OPCODE_CONFIG_PATH)
+
+        # Candidate A: OPENCODE_SERVE_PURE appends --pure.
+        monkeypatch.setattr(opencode_bridge, "OPENCODE_SERVE_PURE", True)
+        monkeypatch.setattr(opencode_bridge, "is_opencode_serve_running",
+                            _scripted_running([False]))
+        ok = await opencode_bridge.ensure_opencode_serve()
+        assert ok is True
+        assert "--pure" in calls[-1]
+
+    @pytest.mark.asyncio
+    async def test_config_drift_recycles_serve(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A serve running with an older cached mtime is recycled (fake pid
+        12345) and respawned when OPCODE_CONFIG_PATH is newer, and the cache
+        is updated (REQ-5 Scenario-1)."""
+        killed: list[int] = []
+        spawns: list[list[str]] = []
+        monkeypatch.setattr(opencode_bridge, "_serve_config_mtime", 1000.0)
+        monkeypatch.setattr(opencode_bridge, "_config_mtime", lambda: 2000.0)
+        monkeypatch.setattr(opencode_bridge, "is_opencode_serve_running",
+                            _scripted_running([True, False, True]))
+        monkeypatch.setattr(opencode_bridge, "_find_serve_pid", lambda port: 12345)
+        monkeypatch.setattr(opencode_bridge.os, "kill",
+                            lambda pid, sig: killed.append(pid))
+        monkeypatch.setattr(opencode_bridge, "_sync_serve_config", lambda: None)
+        monkeypatch.setattr(opencode_bridge, "_open_serve_log", lambda: None)
+
+        async def _exec(*args: Any, **kwargs: Any) -> Any:
+            spawns.append(list(args))
+            return SimpleNamespace(pid=4242)
+
+        monkeypatch.setattr(opencode_bridge.asyncio, "create_subprocess_exec", _exec)
+
+        ok = await opencode_bridge.ensure_opencode_serve()
+        assert ok is True
+        assert killed == [12345]  # recycle fired exactly once
+        assert len(spawns) == 1  # respawned once
+        assert opencode_bridge._serve_config_mtime == 2000.0  # cache updated
+
+    @pytest.mark.asyncio
+    async def test_no_drift_no_recycle(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A running serve whose template mtime matches the cache is left
+        alone: no recycle, no respawn."""
+        killed: list[int] = []
+        spawns: list[list[str]] = []
+        monkeypatch.setattr(opencode_bridge, "_serve_config_mtime", 2000.0)
+        monkeypatch.setattr(opencode_bridge, "_config_mtime", lambda: 2000.0)
+        monkeypatch.setattr(opencode_bridge, "is_opencode_serve_running",
+                            _scripted_running([True]))
+        monkeypatch.setattr(opencode_bridge, "_find_serve_pid", lambda port: 12345)
+        monkeypatch.setattr(opencode_bridge.os, "kill",
+                            lambda pid, sig: killed.append(pid))
+
+        async def _exec(*args: Any, **kwargs: Any) -> Any:
+            spawns.append(list(args))
+            return SimpleNamespace(pid=4242)
+
+        monkeypatch.setattr(opencode_bridge.asyncio, "create_subprocess_exec", _exec)
+
+        ok = await opencode_bridge.ensure_opencode_serve()
+        assert ok is True
+        assert killed == []
+        assert spawns == []
+
+    @pytest.mark.asyncio
+    async def test_cache_adopts_baseline_after_restart(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Proxy restarted while the serve survived: the empty cache adopts
+        the current template mtime as baseline without recycling."""
+        killed: list[int] = []
+        monkeypatch.setattr(opencode_bridge, "_serve_config_mtime", None)
+        monkeypatch.setattr(opencode_bridge, "_config_mtime", lambda: 2000.0)
+        monkeypatch.setattr(opencode_bridge, "is_opencode_serve_running",
+                            _scripted_running([True]))
+        monkeypatch.setattr(opencode_bridge, "_find_serve_pid", lambda port: 12345)
+        monkeypatch.setattr(opencode_bridge.os, "kill",
+                            lambda pid, sig: killed.append(pid))
+
+        ok = await opencode_bridge.ensure_opencode_serve()
+        assert ok is True
+        assert killed == []
+        assert opencode_bridge._serve_config_mtime == 2000.0
+
+    @pytest.mark.asyncio
+    async def test_recycle_never_touches_unmatched_pid(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The drift recycle signals ONLY the pid ``_find_serve_pid``
+        matched (fake 12345) — never any other process (e.g. the user TUI);
+        when no pid matches, nothing is signaled."""
+        killed: list[int] = []
+        spawns: list[list[str]] = []
+        monkeypatch.setattr(opencode_bridge, "_serve_config_mtime", 1000.0)
+        monkeypatch.setattr(opencode_bridge, "_config_mtime", lambda: 2000.0)
+        monkeypatch.setattr(opencode_bridge, "_find_serve_pid", lambda port: 12345)
+        monkeypatch.setattr(opencode_bridge.os, "kill",
+                            lambda pid, sig: killed.append(pid))
+        monkeypatch.setattr(opencode_bridge, "_sync_serve_config", lambda: None)
+        monkeypatch.setattr(opencode_bridge, "_open_serve_log", lambda: None)
+
+        async def _exec(*args: Any, **kwargs: Any) -> Any:
+            spawns.append(list(args))
+            return SimpleNamespace(pid=4242)
+
+        monkeypatch.setattr(opencode_bridge.asyncio, "create_subprocess_exec", _exec)
+
+        # Matched pid → exactly that one is signaled, nothing else.
+        monkeypatch.setattr(opencode_bridge, "is_opencode_serve_running",
+                            _scripted_running([True, False, True]))
+        ok = await opencode_bridge.ensure_opencode_serve()
+        assert ok is True
+        assert killed == [12345]
+        assert len(spawns) == 1
+
+        # No matching pid → nothing signaled; spawn still proceeds.
+        monkeypatch.setattr(opencode_bridge, "_serve_config_mtime", 1000.0)
+        monkeypatch.setattr(opencode_bridge, "_find_serve_pid", lambda port: None)
+        monkeypatch.setattr(opencode_bridge, "is_opencode_serve_running",
+                            _scripted_running([True, False, True]))
+        ok = await opencode_bridge.ensure_opencode_serve()
+        assert ok is True
+        assert killed == [12345]  # unchanged — no new signals
+        assert len(spawns) == 2
+
+
+# ---------------------------------------------------------------------------
 # Zombie sweep / pinned-session protection
 # ---------------------------------------------------------------------------
 class _ZombieSessionClient(_FakeClient):

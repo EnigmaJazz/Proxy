@@ -30,6 +30,17 @@ SESSION_KEY_PREFIX = "sdd-autonomous-cycle"
 ARTIFACT_WAIT_S: float = 2400.0
 ARTIFACT_POLL_S: float = 20.0
 
+#: The opencode serve can die mid-cycle (1.18.15: silent death under
+#: sustained multi-session traffic — 2026-08-08).  The bridge auto-
+#: respawns it on the next call, and the pinned session survives; the
+#: driver RESUMES the session instead of giving up.  Max stream attempts.
+MAX_STREAM_ATTEMPTS: int = 5
+
+
+def _artifacts_for(change: str) -> list[str]:
+    """Sorted *.md artifacts for a change dir (or [])."""
+    return sorted(glob.glob(f"openspec/changes/{change}/*.md"))
+
 
 def build_task(change: str) -> str:
     """Compose the SDD task prompt for a change name."""
@@ -67,48 +78,59 @@ async def main(change: str) -> None:
     session_key = f"{SESSION_KEY_PREFIX}-{change}-{int(time.time())}"
     print("== autonomous SDD cycle ==", flush=True)
     try:
-        async for kind, text in guard_stall(
-            opencode_bridge.opencode_chat_stream(
-                build_task(change),
-                agent="gentle-orchestrator",
-                session_map=session_map,
-                session_key=session_key,
-                system_prompt=opencode_bridge._SDD_AUTONOMOUS_SYSTEM_PROMPT,
-                timeout=3600.0,  # matches OPENCODE_SDD_TIMEOUT
-                autonomous=True,  # explicit flag (PR-1): force-recycle + auto-allow
-            )
-        ):
-            if kind == "question":
-                print("\n[QUESTION - should not happen in autonomous mode]\n"
-                      + text[:400] + "\n[/QUESTION]\n", flush=True)
-            elif kind == "status":
-                print(f"  {text[:130]}", flush=True)
-            elif kind == "text":
-                print(f"  text: {text[:200]}", flush=True)
-    except CycleStalled as exc:
-        print(f"\n[STALL] {exc}", flush=True)
-        print("[RECOVERY] force-recycling the serve, aborting the cycle with "
-              "non-zero exit; report persistent stalls with the driver output "
-              "attached.", flush=True)
-        await opencode_bridge._force_recycle_serve("SDD cycle stalled")
+        for attempt in range(MAX_STREAM_ATTEMPTS):
+            # Resume the SAME pinned session across attempts: the serve
+            # may die mid-cycle (silent death, opencode 1.18.15) and the
+            # next bridge call respawns it — the pinned session resumes
+            # where it stalled.  No-op after the cycle completes.
+            try:
+                async for kind, text in guard_stall(
+                    opencode_bridge.opencode_chat_stream(
+                        build_task(change),
+                        agent="gentle-orchestrator",
+                        session_map=session_map,
+                        session_key=session_key,
+                        system_prompt=opencode_bridge._SDD_AUTONOMOUS_SYSTEM_PROMPT,
+                        timeout=3600.0,  # matches OPENCODE_SDD_TIMEOUT
+                        autonomous=True,  # PR-1: force-recycle + auto-allow
+                    )
+                ):
+                    if kind == "question":
+                        print("\n[QUESTION - should not happen in autonomous mode]\n"
+                              + text[:400] + "\n[/QUESTION]\n", flush=True)
+                    elif kind == "status":
+                        print(f"  {text[:130]}", flush=True)
+                    elif kind == "text":
+                        print(f"  text: {text[:200]}", flush=True)
+            except CycleStalled as exc:
+                print(f"\n[STALL attempt {attempt + 1}] {exc}", flush=True)
+                # Force-recycle + resume on the next attempt.
+                await opencode_bridge._force_recycle_serve("SDD cycle stalled")
+                continue
+            if _artifacts_for(change):
+                break
+            print(f"[stream {attempt + 1} ended; cycle still working — waiting]",
+                  flush=True)
+            # Let the orchestrator/sub-agents work, then resume the stream.
+            for _ in range(int(ARTIFACT_WAIT_S / ARTIFACT_POLL_S)):
+                if _artifacts_for(change):
+                    break
+                await asyncio.sleep(ARTIFACT_POLL_S)
+            if _artifacts_for(change):
+                break
+    except SystemExit:
+        raise
+    except Exception as exc:  # never crash the driver on a transport error
+        print(f"[ERROR] {exc}", flush=True)
         raise SystemExit(1) from None
 
     print("\n== openspec artifacts ==", flush=True)
-    # The bridge stream can end while the orchestrator still works in
-    # sub-agent sessions — poll for the artifacts instead of checking once.
-    deadline = time.monotonic() + ARTIFACT_WAIT_S
-    found: list[str] = []
-    while time.monotonic() < deadline:
-        found = sorted(glob.glob(f"openspec/changes/{change}/*.md"))
-        if found:
-            break
-        await asyncio.sleep(ARTIFACT_POLL_S)
-    for p in found:
+    for p in _artifacts_for(change):
         print(" ", p, flush=True)
-    if not found:
+    if not _artifacts_for(change):
         print(
             f"[NO ARTIFACTS] change {change!r} produced no OpenSpec artifacts "
-            "within the wait window — the cycle is still in flight or failed.",
+            "across all stream attempts — the cycle is still in flight or failed.",
             flush=True,
         )
         raise SystemExit(2) from None

@@ -42,8 +42,14 @@ def _artifacts_for(change: str) -> list[str]:
     return sorted(glob.glob(f"openspec/changes/{change}/*.md"))
 
 
-def build_task(change: str) -> str:
-    """Compose the SDD task prompt for a change name."""
+def build_task(change: str, code_writer: str = "local") -> str:
+    """Compose the SDD task prompt for a change name.
+
+    ``code_writer`` is "local" (apply uses the local model — may contend
+    with other local-model traffic) or "cloud" (apply uses the cloud
+    model, keeping the local models free for communication).
+    """
+    writer_label = "Local model" if code_writer == "local" else "Cloud model"
     return f"""Use SDD to make this change:
 
 CHANGE NAME: {change}
@@ -53,7 +59,7 @@ SDD SESSION PREFLIGHT (user-supplied, do NOT ask):
 - Artifacts: Both (Engram + OpenSpec)
 - PRs: Single PR
 - Review budget: 400 lines
-- Code writer: Local model
+- Code writer: {writer_label}
 
 Run the complete SDD cycle end-to-end now."""
 
@@ -67,16 +73,25 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Change name (openspec/changes/<name>) the cycle runs against.",
     )
+    parser.add_argument(
+        "--code-writer",
+        choices=("local", "cloud"),
+        default="local",
+        help="Who writes the apply-phase code: 'local' (default; may contend "
+             "with other local-model traffic) or 'cloud' (keeps the local "
+             "models free for communication).",
+    )
     return parser
 
 
-async def main(change: str) -> None:
+async def main(change: str, code_writer: str = "local") -> None:
     opencode_bridge.OPENCODE_SERVE_URL = OPENCODE_SERVE_URL
     session_map: dict[str, str] = {}
     # Unique per run: a fresh key avoids colliding with a concurrent cycle
     # on the same serve (each run pins its own session).
     session_key = f"{SESSION_KEY_PREFIX}-{change}-{int(time.time())}"
     print("== autonomous SDD cycle ==", flush=True)
+    print(f"[code writer: {code_writer}]", flush=True)
     try:
         for attempt in range(MAX_STREAM_ATTEMPTS):
             # Resume the SAME pinned session across attempts: the serve
@@ -86,7 +101,7 @@ async def main(change: str) -> None:
             try:
                 async for kind, text in guard_stall(
                     opencode_bridge.opencode_chat_stream(
-                        build_task(change),
+                        build_task(change, code_writer),
                         agent="gentle-orchestrator",
                         session_map=session_map,
                         session_key=session_key,
@@ -146,4 +161,4 @@ async def main(change: str) -> None:
 
 if __name__ == "__main__":
     args = build_parser().parse_args()
-    asyncio.run(main(args.change))
+    asyncio.run(main(args.change, args.code_writer))

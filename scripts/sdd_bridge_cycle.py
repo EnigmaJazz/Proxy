@@ -53,6 +53,14 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Optional change description appended to the SDD prompt.",
     )
+    parser.add_argument(
+        "--code-writer",
+        choices=("local", "cloud"),
+        default="local",
+        help="Who writes the apply-phase code: 'local' (default; may contend "
+             "with other local-model traffic) or 'cloud' (keeps the local "
+             "models free for communication).",
+    )
     return parser
 
 
@@ -114,7 +122,7 @@ async def find_question_mid(sid: str) -> Optional[str]:
     return None
 
 
-async def main(change: str, change_desc: str) -> None:
+async def main(change: str, change_desc: str, code_writer: str = "local") -> None:
     opencode_bridge.OPENCODE_SERVE_URL = OPENCODE_SERVE_URL
     session_map: dict[str, str] = {}
 
@@ -129,7 +137,11 @@ async def main(change: str, change_desc: str) -> None:
 
     print(f"== full SDD cycle: {change} ==\n", flush=True)
     turns = 0
-    user_text = f"Use SDD for a change. Change name: {change}."
+    writer_label = "Local model" if code_writer == "local" else "Cloud model"
+    user_text = (
+        f"Use SDD for a change. Change name: {change}. "
+        f"Code writer: {writer_label} (user-supplied preflight, do NOT ask)."
+    )
     if change_desc:
         user_text += f" {change_desc}"
     while turns < 40:
@@ -179,4 +191,4 @@ async def main(change: str, change_desc: str) -> None:
 
 if __name__ == "__main__":
     args = build_parser().parse_args()
-    asyncio.run(main(args.change, args.desc))
+    asyncio.run(main(args.change, args.desc, args.code_writer))

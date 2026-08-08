@@ -1334,6 +1334,35 @@ def _serve_start_epoch_ms() -> Optional[int]:
         return None
 
 
+async def _session_busy_on_current_serve(
+    client: httpx.AsyncClient, session_id: str, serve_start_ms: int,
+) -> bool:
+    """True when the session has a tool part that is RUNNING on the current
+    serve (started after the serve process).  Such sessions are quiet-but-
+    working (e.g. a cycle's main session during a sub-agent phase) and must
+    not be swept as zombies.  Never raises.
+    """
+    try:
+        resp = await client.get(
+            f"{OPENCODE_SERVE_URL}/session/{session_id}/message", timeout=10.0,
+        )
+        if resp.status_code != 200:
+            return False
+        for m in resp.json():
+            for p in m.get("parts") or []:
+                if p.get("type") != "tool" or p.get("tool") == "question":
+                    continue
+                st = p.get("state") or {}
+                if st.get("status") != "running" or st.get("output"):
+                    continue
+                start = (st.get("time") or {}).get("start")
+                if start is not None and int(start) >= serve_start_ms:
+                    return True
+    except (httpx.HTTPError, OSError, ValueError):
+        pass
+    return False
+
+
 async def _poll_session_deltas(
     client: httpx.AsyncClient,
     session_id: str,
@@ -1590,6 +1619,7 @@ async def _abort_zombie_sessions(
             return
         now_ms = int(time.time() * 1000)
         threshold_ms = 240_000
+        serve_start_ms = await asyncio.to_thread(_serve_start_epoch_ms)
         for s in resp.json():
             sid = s.get("id")
             if not sid:
@@ -1599,6 +1629,19 @@ async def _abort_zombie_sessions(
                 continue
             updated = ((s.get("time") or {}).get("updated") or 0)
             if updated and now_ms - updated > threshold_ms:
+                if (
+                    serve_start_ms is not None
+                    and updated >= serve_start_ms
+                    and await _session_busy_on_current_serve(
+                        client, sid, serve_start_ms,
+                    )
+                ):
+                    # Quiet but working (sub-agent phase) — not a zombie.
+                    logger.debug(
+                        "opencode session %s quiet but busy — skipped by sweep",
+                        str(sid)[:16],
+                    )
+                    continue
                 logger.warning(
                     "opencode zombie session %s idle for %.0fs — aborting",
                     str(sid)[:16], (now_ms - updated) / 1000,

@@ -118,9 +118,7 @@ async def main(change: str) -> None:
             for _ in range(int(ARTIFACT_WAIT_S / ARTIFACT_POLL_S)):
                 if _artifacts_for(change):
                     break
-                serve_up = await asyncio.to_thread(
-                    opencode_bridge.is_opencode_serve_running
-                )
+                serve_up = await opencode_bridge.is_opencode_serve_running()
                 dead_polls = 0 if serve_up else dead_polls + 1
                 if dead_polls >= 3:  # ~60s with a dead serve → resume now
                     print("[serve down; resuming pinned session]", flush=True)

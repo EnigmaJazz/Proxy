@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import glob
 import sys
+import time
 
 sys.path.insert(0, ".")
 
@@ -18,7 +19,13 @@ import opencode_bridge
 from scripts.sdd_cycle_common import STALL_S, CycleStalled, guard_stall
 
 OPENCODE_SERVE_URL = "http://127.0.0.1:18900"
-SESSION_KEY = "sdd-autonomous-cycle"
+SESSION_KEY_PREFIX = "sdd-autonomous-cycle"
+
+#: After the bridge stream ends (the orchestrator keeps working in
+#: sub-agent sessions, so the stream can end before the cycle does), wait
+#: up to this long for the change's OpenSpec artifacts to appear.
+ARTIFACT_WAIT_S: float = 900.0
+ARTIFACT_POLL_S: float = 20.0
 
 
 def build_task(change: str) -> str:
@@ -52,6 +59,9 @@ def build_parser() -> argparse.ArgumentParser:
 async def main(change: str) -> None:
     opencode_bridge.OPENCODE_SERVE_URL = OPENCODE_SERVE_URL
     session_map: dict[str, str] = {}
+    # Unique per run: a fresh key avoids colliding with a concurrent cycle
+    # on the same serve (each run pins its own session).
+    session_key = f"{SESSION_KEY_PREFIX}-{change}-{int(time.time())}"
     print("== autonomous SDD cycle ==", flush=True)
     try:
         async for kind, text in guard_stall(
@@ -59,7 +69,7 @@ async def main(change: str) -> None:
                 build_task(change),
                 agent="gentle-orchestrator",
                 session_map=session_map,
-                session_key=SESSION_KEY,
+                session_key=session_key,
                 system_prompt=opencode_bridge._SDD_AUTONOMOUS_SYSTEM_PROMPT,
                 timeout=3600.0,  # matches OPENCODE_SDD_TIMEOUT
                 autonomous=True,  # explicit flag (PR-1): force-recycle + auto-allow
@@ -81,8 +91,24 @@ async def main(change: str) -> None:
         raise SystemExit(1) from None
 
     print("\n== openspec artifacts ==", flush=True)
-    for p in glob.glob(f"openspec/changes/{change}/*.md"):
+    # The bridge stream can end while the orchestrator still works in
+    # sub-agent sessions — poll for the artifacts instead of checking once.
+    deadline = time.monotonic() + ARTIFACT_WAIT_S
+    found: list[str] = []
+    while time.monotonic() < deadline:
+        found = sorted(glob.glob(f"openspec/changes/{change}/*.md"))
+        if found:
+            break
+        await asyncio.sleep(ARTIFACT_POLL_S)
+    for p in found:
         print(" ", p, flush=True)
+    if not found:
+        print(
+            f"[NO ARTIFACTS] change {change!r} produced no OpenSpec artifacts "
+            "within the wait window — the cycle is still in flight or failed.",
+            flush=True,
+        )
+        raise SystemExit(2) from None
 
 
 if __name__ == "__main__":

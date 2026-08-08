@@ -112,8 +112,18 @@ async def main(change: str) -> None:
             print(f"[stream {attempt + 1} ended; cycle still working — waiting]",
                   flush=True)
             # Let the orchestrator/sub-agents work, then resume the stream.
+            # Resume EARLY when the serve dies (its sessions stall): the
+            # next attempt force-recycles + respawns + resumes the pin.
+            dead_polls = 0
             for _ in range(int(ARTIFACT_WAIT_S / ARTIFACT_POLL_S)):
                 if _artifacts_for(change):
+                    break
+                serve_up = await asyncio.to_thread(
+                    opencode_bridge.is_opencode_serve_running
+                )
+                dead_polls = 0 if serve_up else dead_polls + 1
+                if dead_polls >= 3:  # ~60s with a dead serve → resume now
+                    print("[serve down; resuming pinned session]", flush=True)
                     break
                 await asyncio.sleep(ARTIFACT_POLL_S)
             if _artifacts_for(change):

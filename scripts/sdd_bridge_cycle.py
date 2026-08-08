@@ -190,5 +190,7 @@ async def main(change: str, change_desc: str, code_writer: str = "local") -> Non
 
 
 if __name__ == "__main__":
+    from scripts.sdd_autonomous_cycle import choose_code_writer
     args = build_parser().parse_args()
-    asyncio.run(main(args.change, args.desc, args.code_writer))
+    writer = choose_code_writer(args.code_writer)
+    asyncio.run(main(args.change, args.desc, writer))

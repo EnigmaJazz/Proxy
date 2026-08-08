@@ -84,6 +84,25 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+
+def choose_code_writer(code_writer: Optional[str]) -> str:
+    """Resolve the apply-phase writer: an explicit --code-writer wins; a
+    non-interactive run (no stdin) defaults to 'local'; otherwise the user
+    is asked BEFORE the cycle starts."""
+    if code_writer:
+        return code_writer
+    try:
+        answer = input(
+            "Apply-phase code writer — 'local' (may contend with other "
+            "local-model traffic) or 'cloud' (keeps local models free for "
+            "communication)? [local/cloud] "
+        ).strip().lower()
+    except (EOFError, OSError):
+        print("[no stdin — defaulting code writer to 'local']", flush=True)
+        return "local"
+    return "cloud" if answer == "cloud" else "local"
+
+
 async def main(change: str, code_writer: str = "local") -> None:
     opencode_bridge.OPENCODE_SERVE_URL = OPENCODE_SERVE_URL
     session_map: dict[str, str] = {}
@@ -161,4 +180,5 @@ async def main(change: str, code_writer: str = "local") -> None:
 
 if __name__ == "__main__":
     args = build_parser().parse_args()
-    asyncio.run(main(args.change, args.code_writer))
+    writer = choose_code_writer(args.code_writer)
+    asyncio.run(main(args.change, writer))

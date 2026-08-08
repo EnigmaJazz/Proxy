@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 import pytest_asyncio
 
 # Ensure project root is importable when pytest loads conftest from tests/.
@@ -151,7 +152,19 @@ import proxy  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# 4. Fixtures
+# 4. Markers
+# ---------------------------------------------------------------------------
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "real_recycle: exercise the REAL serve recycle primitive; "
+        "hermetic_serve skips its noop patches while the teardown guard "
+        "still runs (fake pids never match the live serve)",
+    )
+
+
+# ---------------------------------------------------------------------------
+# 5. Fixtures
 # ---------------------------------------------------------------------------
 @pytest_asyncio.fixture
 async def app_client() -> AsyncIterator[httpx.AsyncClient]:

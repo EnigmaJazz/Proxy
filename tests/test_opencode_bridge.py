@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import time
 from types import SimpleNamespace
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Iterator, Optional
 
 import httpx
 import pytest
@@ -157,6 +158,175 @@ def _clean_pending_permissions() -> None:
     PP.clear()
     yield
     PP.clear()
+
+
+# ---------------------------------------------------------------------------
+# Hermetic serve guard (test-infrastructure REQ-2)
+# ---------------------------------------------------------------------------
+#
+# The bridge suite must NEVER kill or recycle a live ``opencode serve``.
+# A real-stream test that lets ``_recycle_serve_if_low_memory`` /
+# ``_force_recycle_serve`` — or the DIRECT wedge-kill ``os.kill`` at
+# opencode_bridge.py:876/918, which the noop patches cannot cover — reach
+# the live serve pid would take the dev's serve down mid-run.
+#
+# ``hermetic_serve`` (autouse, function-scoped, module-level) records the
+# live serve pid ONCE per run, noops the two recycle primitives (async),
+# wraps ``opencode_bridge.os.kill`` with a recorder, and asserts at every
+# teardown that the recorded serve pid is still alive and was never killed.
+# ``TestServeHealth`` exercises the REAL recycle primitive and opts out via
+# ``@pytest.mark.real_recycle``: the fixture skips the patches but still
+# runs the guard — its patched ``_find_serve_pid`` returns 12345/None,
+# never the live serve pid, so the guard is vacuously satisfied.
+
+_HERMETIC_SERVE_PID: Optional[int] = None  # recorded once, first fixture run
+_HERMETIC_REAL_KILL = opencode_bridge.os.kill  # captured before any patch
+HERMETIC_KILLED_PIDS: list[int] = []
+
+
+def _serve_port() -> str:
+    return opencode_bridge.OPENCODE_SERVE_URL.rsplit(":", 1)[-1]
+
+
+def _pid_alive(pid: int, real_kill: Any) -> bool:
+    """True when pid exists (real os.kill signal-0 probe)."""
+    try:
+        real_kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by another user
+
+
+def _assert_serve_untouched(
+    serve_pid: Optional[int], killed_pids: list[int], real_kill: Any,
+) -> None:
+    """REQ-2 Scenario-1/3 guard: the live serve must still be alive and its
+    pid must never have been killed during the test.  Vacuous when no live
+    serve exists (serve_pid is None)."""
+    if serve_pid is None:
+        return
+    assert serve_pid not in killed_pids, (
+        "hermetic_serve guard: os.kill fired against the live opencode "
+        f"serve pid {serve_pid} (REQ-2) — the bridge suite must never "
+        "recycle a live serve"
+    )
+    assert _pid_alive(serve_pid, real_kill), (
+        "hermetic_serve guard: live opencode serve pid "
+        f"{serve_pid} is no longer alive after the test (REQ-2 Scenario-1)"
+    )
+
+
+def _record_os_kill(target_pid: int, sig: int) -> None:
+    """Recorder installed on ``opencode_bridge.os.kill`` while the hermetic
+    fixture is active: logs every kill so the teardown guard can detect a
+    serve-pid kill, and lets non-serve kills pass through untouched."""
+    HERMETIC_KILLED_PIDS.append(target_pid)
+    if target_pid != _HERMETIC_SERVE_PID:
+        _HERMETIC_REAL_KILL(target_pid, sig)
+
+
+@pytest.fixture(autouse=True)
+def hermetic_serve(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest,
+) -> Iterator[None]:
+    """Never kill or recycle a live opencode serve during the bridge suite.
+
+    Records the live serve pid once (``_find_serve_pid``), noops the two
+    recycle primitives (async noops), and wraps ``opencode_bridge.os.kill``
+    with a recorder.  Teardown asserts the recorded serve pid is still
+    alive and never appears in the kill recorder (REQ-2 Scenario-1/3).
+    ``@pytest.mark.real_recycle`` tests (TestServeHealth) skip the patches
+    but keep the guard.
+    """
+    global _HERMETIC_SERVE_PID
+    if _HERMETIC_SERVE_PID is None:
+        _HERMETIC_SERVE_PID = opencode_bridge._find_serve_pid(_serve_port())
+    serve_pid = _HERMETIC_SERVE_PID
+    real_kill = opencode_bridge.os.kill  # pre-patch reference for teardown
+
+    if request.node.get_closest_marker("real_recycle") is None:
+        async def _noop_recycle(*args: Any, **kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr(
+            opencode_bridge, "_recycle_serve_if_low_memory", _noop_recycle,
+        )
+        monkeypatch.setattr(
+            opencode_bridge, "_force_recycle_serve", _noop_recycle,
+        )
+        monkeypatch.setattr(opencode_bridge.os, "kill", _record_os_kill)
+    yield
+    _assert_serve_untouched(serve_pid, HERMETIC_KILLED_PIDS, real_kill)
+
+
+class TestHermeticServe:
+    """The hermetic guard itself (test-infrastructure REQ-2 Scenario-3): a
+    serve-pid kill must fail the run, and the recorder must capture the
+    wedge-path kills the noop patches cannot cover."""
+
+    def test_guard_rejects_kill_of_live_serve_pid(self) -> None:
+        """A run whose os.kill recorder saw the live serve pid FAILS."""
+        real_kill = opencode_bridge.os.kill
+
+        with pytest.raises(AssertionError, match="REQ-2"):
+            _assert_serve_untouched(424242, [424242], real_kill)
+
+    def test_guard_passes_when_serve_untouched(self) -> None:
+        """Guard is satisfied when the serve pid was never killed, and is
+        vacuously satisfied when no live serve exists (the real_recycle
+        fake-pid case)."""
+        _assert_serve_untouched(424242, [], lambda *a, **k: None)
+        _assert_serve_untouched(None, [1, 2, 3], opencode_bridge.os.kill)
+
+    @pytest.mark.asyncio
+    async def test_recorder_captures_wedge_kill(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The direct wedge-recycle ``os.kill`` (opencode_bridge.py:876/918)
+        is NOT routed through the nooped primitives — the recorder must
+        capture it so a future serve-pid kill trips the teardown guard."""
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        async def _always_wedged(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        async def _noop(*args: Any, **kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        monkeypatch.setattr(
+            opencode_bridge, "_recycle_serve_if_low_memory", _noop,
+        )
+        monkeypatch.setattr(opencode_bridge, "_detect_wedged_tool", _always_wedged)
+        # Fake, non-matching pid — never a real process.  Stub the captured
+        # real os.kill so the recorder's pass-through cannot signal anything.
+        monkeypatch.setattr(opencode_bridge, "_find_serve_pid", lambda port: 424242)
+        monkeypatch.setattr(
+            sys.modules[__name__], "_HERMETIC_REAL_KILL", lambda *a, **k: None,
+        )
+        monkeypatch.setattr(opencode_bridge, "_EVENT_QUIET_TIMEOUT", 0.05)
+        monkeypatch.setattr(opencode_bridge, "_WEDGE_CHECK_INTERVAL_S", 0.05)
+
+        client = _BusyThenIdleClient()
+        client.stream_lines = []  # empty event bus → polling fallback
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        smap: dict[str, str] = {}
+        deltas = [
+            d async for d in opencode_chat_stream(
+                "task", session_map=smap, session_key="conv-1",
+            )
+        ]
+
+        wedged = [t for k, t in deltas if k == "status" and "wedged" in t]
+        assert len(wedged) == 1
+        # The wedge-kill os.kill was recorded → the guard can detect it.
+        assert 424242 in HERMETIC_KILLED_PIDS
 
 
 TRIAGE_TEXT = "\u200b🔍 Proxy triage: classified as CODE (priority 1). Routing to Professional (35B MoE) on port 13109.DONE"
@@ -1381,6 +1551,7 @@ class TestPinnedSessionAndQuestions:
 # ---------------------------------------------------------------------------
 # Serve health / age-based recycling
 # ---------------------------------------------------------------------------
+@pytest.mark.real_recycle
 class TestServeHealth:
     @pytest.mark.asyncio
     async def test_recycles_old_serve(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1444,7 +1615,7 @@ class TestServeHealth:
                 return ["4242"]
             return real_listdir(path)
 
-        def _fake_open(path: str, *a: Any, **kw: Any):
+        def _fake_open(path: str, *a: Any, **kw: Any) -> Any:
             if str(path) == "/proc/4242/cmdline":
                 return _FakeProc(fake_cmdline)
             return real_open(path, *a, **kw)
@@ -1481,7 +1652,7 @@ class TestServeHealth:
         stat = "0 (serve) S " + " 0 " * 18 + " 1000"  # start_ticks=1000 at index 21
         real_open = open
 
-        def _fake_open(path: str, *a: Any, **kw: Any):
+        def _fake_open(path: str, *a: Any, **kw: Any) -> Any:
             if f"/proc/{fake_pid}/stat" in str(path):
                 return _FakeProc(stat.encode())
             if path == "/proc/uptime":

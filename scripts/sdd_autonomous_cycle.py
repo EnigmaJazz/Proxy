@@ -34,7 +34,7 @@ ARTIFACT_POLL_S: float = 20.0
 #: sustained multi-session traffic — 2026-08-08).  The bridge auto-
 #: respawns it on the next call, and the pinned session survives; the
 #: driver RESUMES the session instead of giving up.  Max stream attempts.
-MAX_STREAM_ATTEMPTS: int = 5
+MAX_STREAM_ATTEMPTS: int = 12
 
 
 def _artifacts_for(change: str) -> list[str]:

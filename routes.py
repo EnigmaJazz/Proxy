@@ -1579,7 +1579,10 @@ async def _event_stream(
     ) or last_msg.get("role") == "tool"
     triage_msg = _build_triage_message(route, client_named_model=client_named_model)
     if not mid_tool_flow:
-        yield _make_status_chunk(triage_msg, kind="triage")
+        # Trailing newline: the triage must not run straight into the
+        # model's response — frontends render them adjacent, so the
+        # response starts on a fresh line (2026-08-08).
+        yield _make_status_chunk(triage_msg + "\n", kind="triage")
 
     # Terminal outcome of this stream: completed | failed | cancelled.
     # Stays "unknown" if the generator is closed early (client disconnect

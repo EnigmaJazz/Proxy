@@ -874,7 +874,10 @@ class TestClientDisconnectCancellation:
 
         # Consume the triage chunk + one model chunk, then close the
         # generator (GeneratorExit) mid-stream inside the try block.
-        await gen.__anext__()  # triage
+        triage_chunk = await gen.__anext__()  # triage
+        # The triage must end on a newline so the model response does not
+        # run straight into it (2026-08-08).
+        assert triage_chunk.endswith("\n\n"), triage_chunk[-60:]
         await gen.__anext__()  # first model chunk
         await gen.aclose()
 

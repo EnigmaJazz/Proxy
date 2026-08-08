@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import time
-from typing import Any, AsyncIterator, Optional
+from types import SimpleNamespace
+from typing import Any, AsyncIterator, Iterator, Optional
 
 import httpx
 import pytest
@@ -100,6 +102,23 @@ class _FakeClient:
         return _FakeStream(self.stream_lines)
 
 
+class _FakeApp:
+    """Minimal FastAPI stand-in: ``app.state`` with a real pending-permissions map.
+
+    Lets route-level tests (``_handle_opencode_command``) exercise the true
+    ``_pending_permissions_state(app)`` accessor instead of a fake dict, so
+    the relay state lands where the pinned-session continuation reads it.
+    """
+
+    def __init__(
+        self, pending: Optional[dict[str, tuple[str, bool]]] = None,
+    ) -> None:
+        self.state = SimpleNamespace()
+        self.state.opencode_pending_permissions = (
+            pending if pending is not None else {}
+        )
+
+
 class _BusyThenIdleClient(_FakeClient):
     """_FakeClient variant whose /session/status reports "busy" for the
     first ``busy_polls`` status GETs, then "idle" — keeps the polling
@@ -139,6 +158,175 @@ def _clean_pending_permissions() -> None:
     PP.clear()
     yield
     PP.clear()
+
+
+# ---------------------------------------------------------------------------
+# Hermetic serve guard (test-infrastructure REQ-2)
+# ---------------------------------------------------------------------------
+#
+# The bridge suite must NEVER kill or recycle a live ``opencode serve``.
+# A real-stream test that lets ``_recycle_serve_if_low_memory`` /
+# ``_force_recycle_serve`` — or the DIRECT wedge-kill ``os.kill`` at
+# opencode_bridge.py:876/918, which the noop patches cannot cover — reach
+# the live serve pid would take the dev's serve down mid-run.
+#
+# ``hermetic_serve`` (autouse, function-scoped, module-level) records the
+# live serve pid ONCE per run, noops the two recycle primitives (async),
+# wraps ``opencode_bridge.os.kill`` with a recorder, and asserts at every
+# teardown that the recorded serve pid is still alive and was never killed.
+# ``TestServeHealth`` exercises the REAL recycle primitive and opts out via
+# ``@pytest.mark.real_recycle``: the fixture skips the patches but still
+# runs the guard — its patched ``_find_serve_pid`` returns 12345/None,
+# never the live serve pid, so the guard is vacuously satisfied.
+
+_HERMETIC_SERVE_PID: Optional[int] = None  # recorded once, first fixture run
+_HERMETIC_REAL_KILL = opencode_bridge.os.kill  # captured before any patch
+HERMETIC_KILLED_PIDS: list[int] = []
+
+
+def _serve_port() -> str:
+    return opencode_bridge.OPENCODE_SERVE_URL.rsplit(":", 1)[-1]
+
+
+def _pid_alive(pid: int, real_kill: Any) -> bool:
+    """True when pid exists (real os.kill signal-0 probe)."""
+    try:
+        real_kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by another user
+
+
+def _assert_serve_untouched(
+    serve_pid: Optional[int], killed_pids: list[int], real_kill: Any,
+) -> None:
+    """REQ-2 Scenario-1/3 guard: the live serve must still be alive and its
+    pid must never have been killed during the test.  Vacuous when no live
+    serve exists (serve_pid is None)."""
+    if serve_pid is None:
+        return
+    assert serve_pid not in killed_pids, (
+        "hermetic_serve guard: os.kill fired against the live opencode "
+        f"serve pid {serve_pid} (REQ-2) — the bridge suite must never "
+        "recycle a live serve"
+    )
+    assert _pid_alive(serve_pid, real_kill), (
+        "hermetic_serve guard: live opencode serve pid "
+        f"{serve_pid} is no longer alive after the test (REQ-2 Scenario-1)"
+    )
+
+
+def _record_os_kill(target_pid: int, sig: int) -> None:
+    """Recorder installed on ``opencode_bridge.os.kill`` while the hermetic
+    fixture is active: logs every kill so the teardown guard can detect a
+    serve-pid kill, and lets non-serve kills pass through untouched."""
+    HERMETIC_KILLED_PIDS.append(target_pid)
+    if target_pid != _HERMETIC_SERVE_PID:
+        _HERMETIC_REAL_KILL(target_pid, sig)
+
+
+@pytest.fixture(autouse=True)
+def hermetic_serve(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest,
+) -> Iterator[None]:
+    """Never kill or recycle a live opencode serve during the bridge suite.
+
+    Records the live serve pid once (``_find_serve_pid``), noops the two
+    recycle primitives (async noops), and wraps ``opencode_bridge.os.kill``
+    with a recorder.  Teardown asserts the recorded serve pid is still
+    alive and never appears in the kill recorder (REQ-2 Scenario-1/3).
+    ``@pytest.mark.real_recycle`` tests (TestServeHealth) skip the patches
+    but keep the guard.
+    """
+    global _HERMETIC_SERVE_PID
+    if _HERMETIC_SERVE_PID is None:
+        _HERMETIC_SERVE_PID = opencode_bridge._find_serve_pid(_serve_port())
+    serve_pid = _HERMETIC_SERVE_PID
+    real_kill = opencode_bridge.os.kill  # pre-patch reference for teardown
+
+    if request.node.get_closest_marker("real_recycle") is None:
+        async def _noop_recycle(*args: Any, **kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr(
+            opencode_bridge, "_recycle_serve_if_low_memory", _noop_recycle,
+        )
+        monkeypatch.setattr(
+            opencode_bridge, "_force_recycle_serve", _noop_recycle,
+        )
+        monkeypatch.setattr(opencode_bridge.os, "kill", _record_os_kill)
+    yield
+    _assert_serve_untouched(serve_pid, HERMETIC_KILLED_PIDS, real_kill)
+
+
+class TestHermeticServe:
+    """The hermetic guard itself (test-infrastructure REQ-2 Scenario-3): a
+    serve-pid kill must fail the run, and the recorder must capture the
+    wedge-path kills the noop patches cannot cover."""
+
+    def test_guard_rejects_kill_of_live_serve_pid(self) -> None:
+        """A run whose os.kill recorder saw the live serve pid FAILS."""
+        real_kill = opencode_bridge.os.kill
+
+        with pytest.raises(AssertionError, match="REQ-2"):
+            _assert_serve_untouched(424242, [424242], real_kill)
+
+    def test_guard_passes_when_serve_untouched(self) -> None:
+        """Guard is satisfied when the serve pid was never killed, and is
+        vacuously satisfied when no live serve exists (the real_recycle
+        fake-pid case)."""
+        _assert_serve_untouched(424242, [], lambda *a, **k: None)
+        _assert_serve_untouched(None, [1, 2, 3], opencode_bridge.os.kill)
+
+    @pytest.mark.asyncio
+    async def test_recorder_captures_wedge_kill(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The direct wedge-recycle ``os.kill`` (opencode_bridge.py:876/918)
+        is NOT routed through the nooped primitives — the recorder must
+        capture it so a future serve-pid kill trips the teardown guard."""
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        async def _always_wedged(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        async def _noop(*args: Any, **kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        monkeypatch.setattr(
+            opencode_bridge, "_recycle_serve_if_low_memory", _noop,
+        )
+        monkeypatch.setattr(opencode_bridge, "_detect_wedged_tool", _always_wedged)
+        # Fake, non-matching pid — never a real process.  Stub the captured
+        # real os.kill so the recorder's pass-through cannot signal anything.
+        monkeypatch.setattr(opencode_bridge, "_find_serve_pid", lambda port: 424242)
+        monkeypatch.setattr(
+            sys.modules[__name__], "_HERMETIC_REAL_KILL", lambda *a, **k: None,
+        )
+        monkeypatch.setattr(opencode_bridge, "_EVENT_QUIET_TIMEOUT", 0.05)
+        monkeypatch.setattr(opencode_bridge, "_WEDGE_CHECK_INTERVAL_S", 0.05)
+
+        client = _BusyThenIdleClient()
+        client.stream_lines = []  # empty event bus → polling fallback
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        smap: dict[str, str] = {}
+        deltas = [
+            d async for d in opencode_chat_stream(
+                "task", session_map=smap, session_key="conv-1",
+            )
+        ]
+
+        wedged = [t for k, t in deltas if k == "status" and "wedged" in t]
+        assert len(wedged) == 1
+        # The wedge-kill os.kill was recorded → the guard can detect it.
+        assert 424242 in HERMETIC_KILLED_PIDS
 
 
 TRIAGE_TEXT = "\u200b🔍 Proxy triage: classified as CODE (priority 1). Routing to Professional (35B MoE) on port 13109.DONE"
@@ -258,6 +446,7 @@ class TestRoutesOpenCode:
             just_approved_permission: bool = False,
             system_prompt: str = "",
             timeout: float = 600.0,
+            autonomous: bool = False,
         ) -> AsyncIterator[tuple[str, str]]:
             captured.append(text)
             yield ("text", "BRIDGE_DONE")
@@ -288,6 +477,7 @@ class TestRoutesOpenCode:
             just_approved_permission: bool = False,
             system_prompt: str = "",
             timeout: float = 600.0,
+            autonomous: bool = False,
         ) -> AsyncIterator[tuple[str, str]]:
             yield ("text", "STREAMED_")
             yield ("text", "DONE")
@@ -333,9 +523,11 @@ class TestRoutesOpenCode:
             just_approved_permission: bool = False,
             system_prompt: str = "",
             timeout: float = 600.0,
+            autonomous: bool = False,
         ) -> AsyncIterator[tuple[str, str]]:
             seen["system_prompt"] = system_prompt
             seen["timeout"] = timeout
+            seen["autonomous"] = autonomous
             yield ("text", "SDD_CYCLE_DONE")
 
         monkeypatch.setattr("routes.opencode_chat_stream", _fake_stream)
@@ -348,6 +540,51 @@ class TestRoutesOpenCode:
         assert "SDD_CYCLE_DONE" in text
         assert seen.get("system_prompt") == _SDD_AUTONOMOUS_SYSTEM_PROMPT
         assert seen.get("timeout") == OPENCODE_SDD_TIMEOUT
+        # Task 1.6: the autonomous flag must ride the SDD dispatch.
+        assert seen.get("autonomous") is True
+
+    @pytest.mark.asyncio
+    async def test_model_opencode_sdd_non_streaming_carries_prompt_timeout_autonomous(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The NON-streaming SDD dispatch must pass the same autonomous
+        prompt, long timeout, and autonomous flag as the streaming path —
+        otherwise a ``stream: false`` opencode-sdd request (nanobot-style)
+        would run with the interactive prompt and the 600s serve timeout,
+        aborting a long cycle mid-run."""
+        from routes import _handle_opencode_request
+        from opencode_bridge import _SDD_AUTONOMOUS_SYSTEM_PROMPT
+        from constants import OPENCODE_SDD_TIMEOUT
+
+        seen: dict[str, object] = {}
+
+        async def _fake_stream(
+            text: str, *, agent: str = "gentle-orchestrator",
+            model_id: Optional[str] = None, provider_id: str = "kinver",
+            session_map: Optional[dict[str, str]] = None,
+            session_key: Optional[str] = None,
+            pending_permissions: Optional[dict[str, str]] = None,
+            just_approved_permission: bool = False,
+            system_prompt: str = "",
+            timeout: float = 600.0,
+            autonomous: bool = False,
+        ) -> AsyncIterator[tuple[str, str]]:
+            seen["system_prompt"] = system_prompt
+            seen["timeout"] = timeout
+            seen["autonomous"] = autonomous
+            yield ("text", "SDD_NONSTREAM_DONE")
+
+        monkeypatch.setattr("routes.opencode_chat_stream", _fake_stream)
+        resp = await _handle_opencode_request(
+            [{"role": "user", "content": "Use SDD to add a docs file"}],
+            client_stream=False,
+            sdd=True,
+        )
+        assert resp.status_code == 200
+        assert "SDD_NONSTREAM_DONE" in resp.body.decode()
+        assert seen.get("system_prompt") == _SDD_AUTONOMOUS_SYSTEM_PROMPT
+        assert seen.get("timeout") == OPENCODE_SDD_TIMEOUT
+        assert seen.get("autonomous") is True
 
     @pytest.mark.asyncio
     async def test_opencode_command_strips_prefix(
@@ -357,12 +594,24 @@ class TestRoutesOpenCode:
 
         captured: list[str] = []
 
-        async def _fake_chat(text: str, *, agent: str = "gentle-orchestrator") -> str:
+        async def _fake_stream(
+            text: str, *, agent: str = "gentle-orchestrator",
+            model_id: Optional[str] = None, provider_id: str = "kinver",
+            session_map: Optional[dict[str, str]] = None,
+            session_key: Optional[str] = None,
+            pending_permissions: Optional[dict[str, tuple[str, bool]]] = None,
+            just_approved_permission: bool = False,
+            system_prompt: str = "",
+            timeout: float = 600.0,
+            autonomous: bool = False,
+        ) -> AsyncIterator[tuple[str, str]]:
             captured.append(text)
-            return "CMD_DONE"
+            yield ("text", "CMD_DONE")
 
-        monkeypatch.setattr("routes.opencode_chat", _fake_chat)
-        resp = await _handle_opencode_command("/opencode implement the parser")
+        monkeypatch.setattr("routes.opencode_chat_stream", _fake_stream)
+        resp = await _handle_opencode_command(
+            "/opencode implement the parser", _FakeApp(),
+        )
         text = await _drain_stream(resp)
         assert captured == ["implement the parser"]
         assert "CMD_DONE" in text
@@ -870,6 +1119,235 @@ class TestPermissionRelay:
         assert ok is False
 
 
+class TestPermissionRelayPolicy:
+    """REQ-1/REQ-2: write/edit gates (opencode 1.18.15 write/edit tools may
+    OMIT the permission.updated SSE event — the relay flows through the
+    polling GET /permission paths too) must be RELAYED in interactive mode
+    and AUTO-ALLOWED (POST "always", no client surface, no pending state)
+    in SDD-autonomous mode."""
+
+    @pytest.mark.asyncio
+    async def test_permission_write_relayed_interactive(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """REQ-1 Scenario-1 + F2: a write-type permission.updated event
+        (perm_type "write", no bash command to inspect) is relayed as a
+        question in interactive mode — never auto-allowed."""
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        client = _FakeClient()
+        client.stream_lines = [
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_user", "role": "user"}),
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_a", "role": "assistant"}),
+            _evt("permission.updated", sessionID="ses_0001",
+                 id="perm_w", type="write",
+                 title="Allow writing to ~/out.txt",
+                 metadata={"filepath": "~/out.txt"}),
+        ]
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        deltas = [d async for d in opencode_chat_stream("task", pending_permissions=PP)]
+
+        assert len(deltas) == 1
+        kind, text = deltas[0]
+        assert kind == "question"
+        assert "outside its workspace" in text
+        assert "Target: ~/out.txt" in text
+        # No auto-allow POST fired; the write awaits the user's answer.
+        assert [u for u, _ in client.post_calls if "/permissions/" in u] == []
+        assert PP.get("ses_0001") == ("perm_w", True)
+
+    @pytest.mark.asyncio
+    async def test_autonomous_auto_allows_write(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """REQ-2 Scenario-1: autonomous mode POSTs "always" for a write
+        permission — no question surfaced, no pending state stored."""
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        async def _noop(*args: Any, **kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        monkeypatch.setattr(opencode_bridge, "_force_recycle_serve", _noop)
+        client = _FakeClient()
+        client.stream_lines = [
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_user", "role": "user"}),
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_a", "role": "assistant"}),
+            _evt("permission.updated", sessionID="ses_0001",
+                 id="perm_w", type="write",
+                 title="Allow writing to ~/out.txt",
+                 metadata={"filepath": "~/out.txt"}),
+        ]
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        deltas = [d async for d in opencode_chat_stream(
+            "task", pending_permissions=PP, autonomous=True,
+        )]
+
+        assert [k for k, _ in deltas if k == "question"] == []
+        perm_posts = [(u, b) for u, b in client.post_calls if "/permissions/" in u]
+        assert any(
+            u.endswith("/permissions/perm_w") and b == {"response": "always"}
+            for u, b in perm_posts
+        )
+        assert PP.get("ses_0001") is None
+
+    @pytest.mark.asyncio
+    async def test_autonomous_auto_allows_git_commit(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """REQ-2 Scenario-2: autonomous mode auto-allows a git commit ask
+        (bash permission type) — the cycle must not stall on the git ask."""
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        async def _noop(*args: Any, **kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        monkeypatch.setattr(opencode_bridge, "_force_recycle_serve", _noop)
+        client = _FakeClient()
+        client.stream_lines = [
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_user", "role": "user"}),
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_a", "role": "assistant"}),
+            _evt("permission.updated", sessionID="ses_0001",
+                 id="perm_g", type="bash",
+                 title="Allow git commit",
+                 metadata={"command": "git commit -m bump"}),
+        ]
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        deltas = [d async for d in opencode_chat_stream(
+            "task", pending_permissions=PP, autonomous=True,
+        )]
+
+        assert [k for k, _ in deltas if k == "question"] == []
+        perm_posts = [(u, b) for u, b in client.post_calls if "/permissions/" in u]
+        assert any(
+            u.endswith("/permissions/perm_g") and b == {"response": "always"}
+            for u, b in perm_posts
+        )
+        assert PP.get("ses_0001") is None
+
+    @pytest.mark.asyncio
+    async def test_interactive_does_not_auto_allow_write(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """REQ-2 Scenario-3 + F2: interactive mode must NOT auto-allow a
+        write gate.  Uses the POLLING path (GET /permission record with
+        ``permission: "write"`` — the 1.18.15 write tools omit the SSE
+        event): the record must surface a question, never a silent
+        auto-allow."""
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        monkeypatch.setattr(opencode_bridge, "_EVENT_QUIET_TIMEOUT", 0.02)
+        monkeypatch.setattr(opencode_bridge, "_TOOL_WEDGE_AFTER_S", 60.0)
+        client = _RunningToolPermissionClient()
+        client.status_type = "idle"  # completion path
+        client.permission_records = [{
+            "id": "perm_w", "sessionID": "ses_0001",
+            "permission": "write",
+            "patterns": ["~/out.txt"],
+            "tool": {"messageID": "msg_a", "callID": "call_w"},
+        }]
+        client.stream_lines = []  # empty event bus → polling fallback
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        deltas = [d async for d in opencode_chat_stream("task", pending_permissions=PP)]
+
+        questions = [(k, t) for k, t in deltas if k == "question"]
+        assert len(questions) == 1
+        _, text = questions[0]
+        assert "Target: ~/out.txt" in text
+        # Interactive: never auto-allowed (no "always" POST to the write id).
+        perm_posts = [(u, b) for u, b in client.post_calls if "/permissions/" in u]
+        assert all("perm_w" not in u for u, _ in perm_posts)
+        assert PP.get("ses_0001") == ("perm_w", True)
+
+    @pytest.mark.asyncio
+    async def test_opencode_command_write_relay(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """REQ-3 Scenario-1 + threat-matrix (routing parity): the /opencode
+        command must flow through ``opencode_chat_stream`` (the relay path),
+        NOT the bare blocking ``opencode_chat`` (the old silent write/edit
+        drop).  A write gate inside a /opencode task surfaces as an SSE
+        content question in interactive mode (no auto-allow), and the SAME
+        stream path auto-allows it in autonomous mode."""
+        from routes import _handle_opencode_command
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+
+        # ---- Interactive leg: write gate surfaces as a question ---------
+        client = _FakeClient()
+        client.stream_lines = [
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_user", "role": "user"}),
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_a", "role": "assistant"}),
+            _evt("permission.updated", sessionID="ses_0001",
+                 id="perm_w", type="write",
+                 title="Allow writing to ~/out.txt",
+                 metadata={"filepath": "~/out.txt"}),
+        ]
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        resp = await _handle_opencode_command(
+            "/opencode write config", _FakeApp(pending=PP),
+        )
+        text = await _drain_stream(resp)
+        # The write question is relayed as visible SSE content — never dropped.
+        assert "Target: ~/out.txt" in text
+        # Interactive: no auto-allow POST fired; the gate awaits the user.
+        assert [u for u, _ in client.post_calls if "/permissions/" in u] == []
+        assert PP.get("ses_0001") == ("perm_w", True)
+        # The stream relay path is used: prompt_async (streaming send) fired
+        # and NO bare blocking /message POST (the old opencode_chat drop path).
+        assert any("prompt_async" in u for u, _ in client.post_calls)
+        assert not any("/message" in u for u, _ in client.post_calls)
+
+        # ---- Autonomous leg: the same stream path auto-allows -----------
+        PP.clear()
+        client2 = _FakeClient()
+        client2.stream_lines = list(client.stream_lines)
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client2)
+        deltas = [d async for d in opencode_chat_stream(
+            "write config", pending_permissions=PP, autonomous=True,
+        )]
+        assert [k for k, _ in deltas if k == "question"] == []
+        perm_posts = [(u, b) for u, b in client2.post_calls if "/permissions/" in u]
+        assert any(
+            u.endswith("/permissions/perm_w") and b == {"response": "always"}
+            for u, b in perm_posts
+        )
+        assert PP.get("ses_0001") is None
+        PP.clear()
+
+
 # ---------------------------------------------------------------------------
 # Pinned sessions + clarifying questions (a701e8d)
 # ---------------------------------------------------------------------------
@@ -1073,6 +1551,7 @@ class TestPinnedSessionAndQuestions:
 # ---------------------------------------------------------------------------
 # Serve health / age-based recycling
 # ---------------------------------------------------------------------------
+@pytest.mark.real_recycle
 class TestServeHealth:
     @pytest.mark.asyncio
     async def test_recycles_old_serve(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1136,7 +1615,7 @@ class TestServeHealth:
                 return ["4242"]
             return real_listdir(path)
 
-        def _fake_open(path: str, *a: Any, **kw: Any):
+        def _fake_open(path: str, *a: Any, **kw: Any) -> Any:
             if str(path) == "/proc/4242/cmdline":
                 return _FakeProc(fake_cmdline)
             return real_open(path, *a, **kw)
@@ -1173,7 +1652,7 @@ class TestServeHealth:
         stat = "0 (serve) S " + " 0 " * 18 + " 1000"  # start_ticks=1000 at index 21
         real_open = open
 
-        def _fake_open(path: str, *a: Any, **kw: Any):
+        def _fake_open(path: str, *a: Any, **kw: Any) -> Any:
             if f"/proc/{fake_pid}/stat" in str(path):
                 return _FakeProc(stat.encode())
             if path == "/proc/uptime":
@@ -1495,6 +1974,15 @@ class TestCompletionResolvesPermissions:
         assert _classify_permission_access(
             "external_directory", tool_name, cmd,
         ) == expected
+
+    @pytest.mark.parametrize("perm_type", ["write", "edit", "patch"])
+    def test_write_edit_perm_type_classifies_write(self, perm_type: str) -> None:
+        """F2: a permission whose TYPE is itself a write tool ("write"/"edit")
+        must classify as WRITE with an EMPTY command.  The old code fell
+        through to the cmd heuristic, read an empty cmd as "read", and
+        auto-allowed the write even in interactive mode."""
+        from opencode_bridge import _classify_permission_access
+        assert _classify_permission_access(perm_type, "", "") == "write"
 
     @pytest.mark.asyncio
     async def test_completion_does_not_fire_with_running_tool(

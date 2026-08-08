@@ -23,8 +23,11 @@ SESSION_KEY_PREFIX = "sdd-autonomous-cycle"
 
 #: After the bridge stream ends (the orchestrator keeps working in
 #: sub-agent sessions, so the stream can end before the cycle does), wait
-#: up to this long for the change's OpenSpec artifacts to appear.
-ARTIFACT_WAIT_S: float = 900.0
+#: up to this long for the change's OpenSpec artifacts to appear.  A full
+#: cycle takes ~30 min (proposal → archive), so the window must exceed
+#: that; verified 2026-08-08: the change dir appears ~10 min in, the
+#: archive report ~30 min in.
+ARTIFACT_WAIT_S: float = 2400.0
 ARTIFACT_POLL_S: float = 20.0
 
 

@@ -862,20 +862,20 @@ class TestClassifyExternalAccess:
 
     @pytest.mark.parametrize("cmd", [
         "echo x > /etc/foo",
-        "echo x >> ~/log",
+        "echo x >> /home/user/log",
         "mv /etc/foo /etc/bar",
-        "cp /etc/passwd ~/",
-        "rm -rf ~/cache",
-        "touch ~/foo",
-        "mkdir ~/out",
-        "rmdir ~/old",
-        "ln -s /etc/hosts ~/hosts",
-        "chmod 644 ~/file",
-        "chown james ~/file",
+        "cp /etc/passwd /home/user/",
+        "rm -rf /home/user/cache",
+        "touch /home/user/foo",
+        "mkdir /home/user/out",
+        "rmdir /home/user/old",
+        "ln -s /etc/hosts /home/user/hosts",
+        "chmod 644 /home/user/file",
+        "chown james /home/user/file",
         "tee /etc/foo",
         "sed -i s/x/y/ /etc/hosts",
         "install -m 755 app /usr/local/bin/app",
-        "dd if=/dev/zero of=~/big",
+        "dd if=/dev/zero of=/home/user/big",
         "git commit -m bump",
         "git push",
         "git reset --hard HEAD",
@@ -1146,8 +1146,8 @@ class TestPermissionRelayPolicy:
                  info={"id": "msg_a", "role": "assistant"}),
             _evt("permission.updated", sessionID="ses_0001",
                  id="perm_w", type="write",
-                 title="Allow writing to ~/out.txt",
-                 metadata={"filepath": "~/out.txt"}),
+                 title="Allow writing to /home/user/out.txt",
+                 metadata={"filepath": "/home/user/out.txt"}),
         ]
         monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
 
@@ -1157,7 +1157,7 @@ class TestPermissionRelayPolicy:
         kind, text = deltas[0]
         assert kind == "question"
         assert "outside its workspace" in text
-        assert "Target: ~/out.txt" in text
+        assert "Target: /home/user/out.txt" in text
         # No auto-allow POST fired; the write awaits the user's answer.
         assert [u for u, _ in client.post_calls if "/permissions/" in u] == []
         assert PP.get("ses_0001") == ("perm_w", True)
@@ -1186,8 +1186,8 @@ class TestPermissionRelayPolicy:
                  info={"id": "msg_a", "role": "assistant"}),
             _evt("permission.updated", sessionID="ses_0001",
                  id="perm_w", type="write",
-                 title="Allow writing to ~/out.txt",
-                 metadata={"filepath": "~/out.txt"}),
+                 title="Allow writing to /home/user/out.txt",
+                 metadata={"filepath": "/home/user/out.txt"}),
         ]
         monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
 
@@ -1266,7 +1266,7 @@ class TestPermissionRelayPolicy:
         client.permission_records = [{
             "id": "perm_w", "sessionID": "ses_0001",
             "permission": "write",
-            "patterns": ["~/out.txt"],
+            "patterns": ["/home/user/out.txt"],
             "tool": {"messageID": "msg_a", "callID": "call_w"},
         }]
         client.stream_lines = []  # empty event bus → polling fallback
@@ -1277,7 +1277,7 @@ class TestPermissionRelayPolicy:
         questions = [(k, t) for k, t in deltas if k == "question"]
         assert len(questions) == 1
         _, text = questions[0]
-        assert "Target: ~/out.txt" in text
+        assert "Target: /home/user/out.txt" in text
         # Interactive: never auto-allowed (no "always" POST to the write id).
         perm_posts = [(u, b) for u, b in client.post_calls if "/permissions/" in u]
         assert all("perm_w" not in u for u, _ in perm_posts)
@@ -1310,8 +1310,8 @@ class TestPermissionRelayPolicy:
                  info={"id": "msg_a", "role": "assistant"}),
             _evt("permission.updated", sessionID="ses_0001",
                  id="perm_w", type="write",
-                 title="Allow writing to ~/out.txt",
-                 metadata={"filepath": "~/out.txt"}),
+                 title="Allow writing to /home/user/out.txt",
+                 metadata={"filepath": "/home/user/out.txt"}),
         ]
         monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
 
@@ -1320,7 +1320,7 @@ class TestPermissionRelayPolicy:
         )
         text = await _drain_stream(resp)
         # The write question is relayed as visible SSE content — never dropped.
-        assert "Target: ~/out.txt" in text
+        assert "Target: /home/user/out.txt" in text
         # Interactive: no auto-allow POST fired; the gate awaits the user.
         assert [u for u, _ in client.post_calls if "/permissions/" in u] == []
         assert PP.get("ses_0001") == ("perm_w", True)
@@ -1605,7 +1605,7 @@ class TestServeHealth:
         real_open = open
 
         fake_cmdline = (
-            b"~/.opencode/bin/opencode\x00serve\x00"
+            b"/home/user/.opencode/bin/opencode\x00serve\x00"
             b"--port\x0018999\x00--hostname\x00127.0.0.1\x00"
         )
 

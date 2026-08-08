@@ -47,6 +47,8 @@ from constants import (
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
     SENSOR_INTERVAL,
+    _machine,
+    _KINVER_HOME,
     metric_cpu_temp,
     metric_gpu_edge_temp,
     metric_gpu_junc_temp,
@@ -356,7 +358,7 @@ async def calculate_dynamic_ngl(
     - Headless: minimal buffer (256MB) since no additional GPU workload
     - Graphical: larger buffer (1024MB) to handle compositor/user actions
 
-    The result is written to ``~/kinver-hub/.env.ngl``.
+    The result is written to ``<kinver-home>/.env.ngl``.
     """
     from constants import ENV_NGL_FILE
 
@@ -415,7 +417,10 @@ def is_system_headless() -> bool:
 # ---------------------------------------------------------------------------
 
 # Shared environment file written by arm_gpu_for_inference for llama.cpp
-SHARED_ENV_FILE: str = "~/kinver-hub/gpu_state.env"
+SHARED_ENV_FILE: str = _machine(
+    "SHARED_ENV_FILE",
+    os.path.join(_KINVER_HOME, "gpu_state.env"),
+)
 
 
 async def arm_gpu_for_inference(
@@ -632,7 +637,9 @@ async def send_bash_notification(title: str, message: str) -> None:
     Execute the custom ``ar-notify.sh`` bash notification script.
     The script is sourced and the ``notify_phone`` function is called.
     """
-    bash_file = "~/ar-notify.sh"
+    bash_file = _machine(
+        "NOTIFY_SCRIPT", os.path.expanduser("~/ar-notify.sh"),
+    )
     async_function = "notify_phone"
 
     try:

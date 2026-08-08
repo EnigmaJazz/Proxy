@@ -910,7 +910,7 @@ class TestEmbeddedCommandFalsePositive:
                             "function": {"name": "run_shell", "arguments": "{}"},
                         }]},
                         {"role": "tool", "tool_call_id": "call_1",
-                         "content": "~/.opencode/bin/opencode\n~/weight_loss/.git/opencode"},
+                         "content": "/home/user/.opencode/bin/opencode\n/home/user/weight_loss/.git/opencode"},
                         {"role": "user", "content": "thanks"},
                     ],
                     "stream": True,

@@ -760,7 +760,7 @@ async def chat_completions(request: Request) -> Response:
     # context dump carries full conversation history, so matching against
     # it would mis-route whenever history merely MENTIONS a command — e.g.
     # a tool result containing file paths like ``.../.git/opencode`` or
-    # ``~/.opencode/bin/opencode`` matched the unanchored
+    # ``<home>/.opencode/bin/opencode`` matched the unanchored
     # /opencode regex and routed every follow-up to the opencode bridge.
     last_user = _last_user_text(processed_messages)
     pause_match = _PAUSE_RE.search(last_user) if last_user else None

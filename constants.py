@@ -77,6 +77,32 @@ def get_logger(name: str = "proxy") -> logging.Logger:
 # ---------------------------------------------------------------------------
 
 from dotenv import load_dotenv as _load_dotenv
+
+# ---------------------------------------------------------------------------
+# Machine-specific configuration (GIT-IGNORED).  ``local_config.py`` holds
+# real absolute paths for THIS machine; when absent, safe generic defaults
+# (user home, repo root) keep a fresh clone working.  Never hardcode
+# private paths below.
+# ---------------------------------------------------------------------------
+try:
+    import local_config as _local_config
+except ImportError:  # pragma: no cover - fresh clone without local_config.py
+    _local_config = None  # type: ignore[assignment]
+
+
+def _machine(attr: str, default: str) -> str:
+    """Resolve a machine-specific value: local_config wins, else default."""
+    if _local_config is not None:
+        value = getattr(_local_config, attr, None)
+        if value:
+            return value
+    return default
+
+
+_KINVER_HOME: str = _machine(
+    "KINVER_HOME", os.path.expanduser("~/kinver-hub"),
+)
+_REPO_ROOT: str = os.path.dirname(os.path.abspath(__file__))
 _load_dotenv(PROJECT_ROOT / ".env")
 
 # ---------------------------------------------------------------------------
@@ -159,18 +185,22 @@ OPENCODE_SERVE_URL: str = "http://127.0.0.1:18900"
 # the proxy repo: bridge sessions (gentle-orchestrator/build agents) write
 # files there, and running them in the repo polluted the proxy git tree
 # (stray artifacts + corrupt index objects).
-OPENCODE_WORKSPACE_DIR: str = "~/opencode-workspace"
+OPENCODE_WORKSPACE_DIR: str = _machine(
+    "OPENCODE_WORKSPACE_DIR", os.path.expanduser("~/opencode-workspace"),
+)
 
 # Directory the opencode bridge creates sessions in.  The serve defaults to
 # its own cwd (OPENCODE_WORKSPACE_DIR); passing an explicit directory lets
 # bridge sessions operate on a real project (e.g. the proxy repo, which
 # hosts the OpenSpec SDD store) instead of the scratch workspace.
-OPENCODE_BRIDGE_DIRECTORY: str = "<REPO_ROOT>"
+OPENCODE_BRIDGE_DIRECTORY: str = _machine("OPENCODE_BRIDGE_DIRECTORY", _REPO_ROOT)
 
 # Absolute path to the opencode binary.  systemd services run with a
 # minimal PATH that does not include ~/.opencode/bin, so the bridge spawn
 # must not rely on PATH resolution.
-OPENCODE_BIN: str = "~/.opencode/bin/opencode"
+OPENCODE_BIN: str = _machine(
+    "OPENCODE_BIN", os.path.expanduser("~/.opencode/bin/opencode"),
+)
 
 # Agent used by the bridge for coding tasks.  The Gentle AI SDD
 # orchestrator coordinates the full SDD cycle (and handles direct tasks)
@@ -194,15 +224,17 @@ OPENCODE_SERVE_PURE: bool = False
 # (opencode-serve-config.opencode.jsonc) so ONLY the rate-limit-fallback
 # plugin loads.  Never points at ~/.config/opencode — the user's TUI
 # config stays untouched.
-OPENCODE_SERVE_CONFIG_DIR: str = (
-    "~/opencode-workspace/serve-config"
+OPENCODE_SERVE_CONFIG_DIR: str = _machine(
+    "OPENCODE_SERVE_CONFIG_DIR",
+    os.path.join(OPENCODE_WORKSPACE_DIR, "serve-config"),
 )
 
 # Path whose mtime drives config-drift detection (REQ-5): the committed
 # serve template.  Hot-editing it while a serve runs recycles the serve
 # before the next request so the new config actually loads.
-OPCODE_CONFIG_PATH: str = (
-    "<REPO_ROOT>/opencode-serve-config.opencode.jsonc"
+OPCODE_CONFIG_PATH: str = _machine(
+    "OPCODE_CONFIG_PATH",
+    os.path.join(_REPO_ROOT, "opencode-serve-config.opencode.jsonc"),
 )
 
 # Bridge model keys exposed to clients, validated alongside ALL_MODEL_KEYS.
@@ -333,10 +365,18 @@ MIGRATIONS: list[str] = [
 ]
 
 # Legacy paths (kept for transition / backward compat)
-MODELS_DIR: str = "~/kinver-hub/models/"
-PROMPTS_DIR: str = "~/kinver-hub/prompts/"
-ENV_NGL_FILE: str = "~/kinver-hub/.env.ngl"
-CACHE_DIR: str = "~/kinver-hub/cache/"
+MODELS_DIR: str = _machine(
+    "MODELS_DIR", os.path.join(_KINVER_HOME, "models/"),
+)
+PROMPTS_DIR: str = _machine(
+    "PROMPTS_DIR", os.path.join(_KINVER_HOME, "prompts/"),
+)
+ENV_NGL_FILE: str = _machine(
+    "ENV_NGL_FILE", os.path.join(_KINVER_HOME, ".env.ngl"),
+)
+CACHE_DIR: str = _machine(
+    "CACHE_DIR", os.path.join(_KINVER_HOME, "cache/"),
+)
 RECOVERY_FILE: str = str(PROJECT_ROOT / "recovery_state.json")
 PERSISTENT_QUEUE_FILE: str = str(PROJECT_ROOT / "background_queue.json")
 

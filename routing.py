@@ -49,6 +49,7 @@ from constants import (
     IDE_PASSTHROUGH_HEADER,
     LOOP_LIMITS,
     ROUTE_MAP,
+    _machine,
     _DREAM_FALLBACK_PHRASES,
     _DREAM_SNIP_PHRASES,
     get_logger,
@@ -110,10 +111,12 @@ def _get_dream_phrases() -> list[str]:
         Falls back to _DREAM_FALLBACK_PHRASES if the template is
         inaccessible.
     """
-    # Glob with wildcard Python version — survives uv updates
-    pattern = (
-        "~/.local/share/uv/tools/nanobot-ai/lib/python*/"
-        "site-packages/nanobot/templates/agent/dream_phase1.md"
+    # Glob with wildcard Python version — survives uv updates.  The nanobot
+    # install lives under the user's uv tool dir; the pattern is
+    # machine-specific (local_config.UV_NANOBOT_PATTERN).
+    pattern = _machine(
+        "UV_NANOBOT_PATTERN",
+        os.path.expanduser("~/.local/share/uv/tools/nanobot-ai/lib/python*/") + "site-packages/nanobot/templates/agent/dream_phase1.md",
     )
     paths = sorted(glob.glob(pattern))
     if not paths:
@@ -303,7 +306,7 @@ def _front_desk_prompt() -> str:
     """Load the frontdesk prompt from disk (cached after first load).
 
     Uses ``load_role_prompt("frontdesk")`` which reads from
-    ``~/kinver-hub/prompts/frontdesk.txt``.  Cached since the
+    ``<kinver-home>/prompts/frontdesk.txt``.  Cached since the
     prompt doesn't change at runtime.
     """
     from llm import load_role_prompt

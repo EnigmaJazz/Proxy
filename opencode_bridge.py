@@ -42,6 +42,7 @@ from constants import (
     OPENCODE_SERVE_PURE,
     OPENCODE_WORKSPACE_DIR,
     OPCODE_CONFIG_PATH,
+    _machine,
     get_logger,
 )
 
@@ -471,10 +472,10 @@ async def _spawn_serve(mtime: Optional[float]) -> bool:
         # user paths so the fallback plugin's gentle-ai binary resolves.
         serve_env = dict(os.environ)
         serve_env["PATH"] = (
-            "/home/linuxbrew/.linuxbrew/bin:"
-            "~/.local/bin:"
-            "~/.opencode/bin:"
-            "/usr/local/bin:/usr/bin:/bin"
+            _machine("LINUXBREW_PREFIX", os.path.expanduser("~/.linuxbrew")) + "/bin:"
+            + _machine("LOCAL_BIN_DIR", os.path.expanduser("~/.local/bin")) + ":"
+            + _machine("OPENCODE_BIN_DIR", os.path.expanduser("~/.opencode/bin")) + ":"
+            + "/usr/local/bin:/usr/bin:/bin"
         )
         # Candidate B: serve-scoped config dir (never ~/.config/opencode).
         serve_env["XDG_CONFIG_HOME"] = OPENCODE_SERVE_CONFIG_DIR

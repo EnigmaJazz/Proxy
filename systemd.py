@@ -38,6 +38,8 @@ import aiofiles.os as aio_os
 from constants import (
     SYSTEMD_DIR,
     SERVICE_PATTERN,
+    PROFESSIONAL_RESIDENT_ENABLED,
+    GPU_BUSY_VRAM_GB,
     get_logger,
 )
 
@@ -316,6 +318,43 @@ class SystemdController:
         logger.info("Professional service started on port %d", professional_port)
 
     # ------------------------------------------------------------------
+    # Professional residency (keep-warm)
+    # ------------------------------------------------------------------
+
+    async def ensure_professional_resident(self, gpu_vram_used_gb: float) -> None:
+        """
+        Keep the professional model loaded whenever the GPU is free.
+
+        Called periodically by the thermal monitor.  No-op unless the feature
+        is enabled, no other heavy model is active, and the GPU is not busy
+        with non-model work (gaming/rendering — inferred from VRAM usage at or
+        above ``GPU_BUSY_VRAM_GB``).  Never raises: systemctl failures are
+        logged as warnings and left for the next check.
+
+        Parameters
+        ----------
+        gpu_vram_used_gb : float
+            Current GPU VRAM usage in GiB (from the thermal monitor state).
+        """
+        if not PROFESSIONAL_RESIDENT_ENABLED:
+            return
+        if self._active_heavy_model is not None:
+            return  # a heavy model is active — routing hot-swap owns it
+        if gpu_vram_used_gb >= GPU_BUSY_VRAM_GB:
+            return  # GPU busy with other work (gaming/rendering) — don't fight it
+
+        try:
+            if await self.is_active("professional"):
+                return  # already loaded
+            await self.start_service("professional")
+        except (OSError, RuntimeError) as exc:
+            logger.warning("Failed to keep professional resident: %s", exc)
+            return
+
+        self._active_heavy_model = "professional"
+        logger.info("Professional model loaded resident (GPU free)")
+
+    # ------------------------------------------------------------------
     # Model discovery
     # ------------------------------------------------------------------
 
@@ -378,11 +417,14 @@ class SystemdController:
 
     def is_gpu_occupied(self) -> bool:
         """
-        Return True if a heavy GPU model is currently active.
+        Return True if a heavy GPU model is currently loaded.
 
         Heavy models are: professional, coder, creative, scholar, architect.
         Lightweight models (chatter, frontdesk)
         are NOT considered "heavy" and can coexist or be quickly swapped.
+        Note: professional may be loaded but resident-IDLE (kept warm by
+        ``ensure_professional_resident`` when the GPU is free) — this flag
+        reports the loaded state, not the busy state.
         """
         heavy_models = {"professional", "coder", "creative", "scholar", "architect"}
         return (

@@ -747,6 +747,18 @@ REQUEST_TIMEOUT: float = 300.0  # 5 minutes for long generations
 # Thermal monitor polling interval (seconds)
 SENSOR_INTERVAL: float = 3.0
 
+# ---------------------------------------------------------------------------
+# Professional model residency (keep-warm)
+#
+# The proxy keeps the professional model (35B MoE, ~20GB VRAM) LOADED on the
+# GPU whenever the GPU is not serving another heavy model and not busy with
+# other heavy work (e.g. gaming/rendering), eliminating cold-start latency for
+# the most common route.  The thermal monitor drives the check cadence.
+# ---------------------------------------------------------------------------
+PROFESSIONAL_RESIDENT_ENABLED: bool = True     # kill toggle for residency
+PROFESSIONAL_RESIDENT_CHECK_S: float = 60.0    # how often the monitor checks
+GPU_BUSY_VRAM_GB: float = 22.0                 # vram_used_gb >= this → GPU busy with OTHER work
+
 # TCP health-check timeout (seconds)
 TCP_TIMEOUT: float = 5.0
 

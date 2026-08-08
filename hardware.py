@@ -47,6 +47,7 @@ from constants import (
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
     SENSOR_INTERVAL,
+    PROFESSIONAL_RESIDENT_CHECK_S,
     _machine,
     _KINVER_HOME,
     metric_cpu_temp,
@@ -678,6 +679,7 @@ def _build_thermal_temps(cpu: float, gpu: dict[str, float]) -> dict[str, float]:
 async def thermal_monitor_task(
     state: ThermalState,
     interval: float = SENSOR_INTERVAL,
+    systemd: Optional[SystemdController] = None,
 ) -> None:
     """
     Async background loop that:
@@ -687,6 +689,9 @@ async def thermal_monitor_task(
     3. Updates Prometheus metrics.
     4. Triggers emergency system shutdown if any zone exceeds its
        critical limit.
+    5. Keeps the professional model resident on the GPU when it is free
+       (see ``systemd.ensure_professional_resident`` — checked every
+       ``PROFESSIONAL_RESIDENT_CHECK_S`` seconds).
 
     Runs forever until cancelled.  Designed to be spawned as an
     ``asyncio.Task`` during proxy startup.
@@ -697,8 +702,12 @@ async def thermal_monitor_task(
         Shared thermal state — mutated in-place each iteration.
     interval : float
         Seconds between sensor polls (default from constants.SENSOR_INTERVAL).
+    systemd : Optional[SystemdController]
+        Model service manager used for professional residency; ``None``
+        disables residency (tests, headless runs without systemd).
     """
     cooldown_until: dict[str, float] = {}  # per-zone cooldown after crit warning
+    last_resident_check: float = 0.0  # monotonic — last residency attempt
 
     logger.info(
         "Thermal monitor started (interval=%.1fs, limits=%s)",
@@ -728,6 +737,21 @@ async def thermal_monitor_task(
             metric_gpu_vram_temp.set(gpu["vram"])
             metric_gpu_used_vram_gb.set(gpu["vram_used_gb"])
             metric_ram_used_pct.set(ram)
+
+            # ---- Professional residency (keep-warm) -------------------------
+            # ensure_professional_resident never raises (systemctl failures are
+            # logged inside), so this cannot break the monitor loop.
+            now = time.monotonic()
+            if (
+                systemd is not None
+                and now - last_resident_check >= PROFESSIONAL_RESIDENT_CHECK_S
+            ):
+                last_resident_check = now
+                logger.debug(
+                    "Professional residency check (gpu_vram_used_gb=%.1f)",
+                    state.gpu_vram_used_gb,
+                )
+                await systemd.ensure_professional_resident(state.gpu_vram_used_gb)
 
             # ---- Thermal threshold enforcement -------------------------------
             # Only real temperature sensors belong in the zone map. RAM usage

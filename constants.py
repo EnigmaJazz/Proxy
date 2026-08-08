@@ -180,29 +180,21 @@ OPENCODE_AGENT: str = "gentle-orchestrator"
 # How long to wait for the opencode agent to finish a task.
 OPENCODE_SERVE_TIMEOUT: float = 600.0
 
-# Serve stability mode (REQ-4): candidate B (serve-scoped config dir via
-# XDG_CONFIG_HOME, default) vs candidate A (`--pure` arg).  When True the
-# serve spawns with `--pure`, disabling ALL external plugin auto-load
-# incl. the rate-limit-fallback plugin — kept as a documented fallback
-# only; the reduced-config path is the default.  Subprocess-scoped toggle,
-# never touches the user's TUI config.
+# Serve stability mode (REQ-4): the serve spawns with the USER'S GLOBAL
+# config (~/.config/opencode — same as the TUI) and the light plugin
+# stack it declares.  ``OPENCODE_SERVE_PURE`` toggles candidate A
+# (``--pure``, no plugins) as a documented fallback.  Subprocess-scoped
+# toggle, never touches the user's TUI config.
 OPENCODE_SERVE_PURE: bool = False
 
-# Scratch config dir the proxy OWNS for the headless serve (candidate B).
-# The serve spawns with XDG_CONFIG_HOME pointing here, and the proxy
-# syncs a REDUCED opencode.jsonc template into its ``opencode/`` subdir
-# (opencode-serve-config.opencode.jsonc) so ONLY the rate-limit-fallback
-# plugin loads.  Never points at ~/.config/opencode — the user's TUI
-# config stays untouched.
-OPENCODE_SERVE_CONFIG_DIR: str = (
-    "~/opencode-workspace/serve-config"
-)
-
-# Path whose mtime drives config-drift detection (REQ-5): the committed
-# serve template.  Hot-editing it while a serve runs recycles the serve
-# before the next request so the new config actually loads.
-OPCODE_CONFIG_PATH: str = (
-    "<REPO_ROOT>/opencode-serve-config.opencode.jsonc"
+# Path whose mtime drives config-drift detection (REQ-5): the user's
+# GLOBAL opencode config.  Editing it while a serve runs recycles the
+# serve before the next request so the new config actually loads — the
+# serve reads the same config the TUI uses (maintainer decision
+# 2026-08-08: the serve must NOT use a reduced serve-scoped config; the
+# global config with its full provider set is authoritative).
+OPCODE_CONFIG_PATH: str = os.path.expanduser(
+    "~/.config/opencode/opencode.json"
 )
 
 # Bridge model keys exposed to clients, validated alongside ALL_MODEL_KEYS.

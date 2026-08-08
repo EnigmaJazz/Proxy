@@ -1715,13 +1715,12 @@ class TestServeStability:
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Candidate B is the default: spawn carries NO ``--pure`` and the
-        serve env gets XDG_CONFIG_HOME=serve-config; ``OPENCODE_SERVE_PURE``
+        serve env has NO XDG redirect (global config); ``OPENCODE_SERVE_PURE``
         toggles candidate A (``--pure`` appended)."""
         calls: list[list[str]] = []
         envs: list[dict[str, str]] = []
         monkeypatch.setattr(opencode_bridge, "is_opencode_serve_running",
                             _scripted_running([False]))
-        monkeypatch.setattr(opencode_bridge, "_sync_serve_config", lambda: None)
         monkeypatch.setattr(opencode_bridge, "_open_serve_log", lambda: None)
 
         async def _exec(*args: Any, **kwargs: Any) -> Any:
@@ -1737,7 +1736,7 @@ class TestServeStability:
         assert calls[0][0] == opencode_bridge.OPENCODE_BIN
         assert "serve" in calls[0]
         assert "--pure" not in calls[0]
-        assert envs[0]["XDG_CONFIG_HOME"] == opencode_bridge.OPENCODE_SERVE_CONFIG_DIR
+        assert "XDG_CONFIG_HOME" not in envs[0]
         # Cache updated after the successful spawn (drift gate baseline).
         assert opencode_bridge._serve_config_mtime == \
             opencode_bridge.os.path.getmtime(opencode_bridge.OPCODE_CONFIG_PATH)
@@ -1766,7 +1765,6 @@ class TestServeStability:
         monkeypatch.setattr(opencode_bridge, "_find_serve_pid", lambda port: 12345)
         monkeypatch.setattr(opencode_bridge.os, "kill",
                             lambda pid, sig: killed.append(pid))
-        monkeypatch.setattr(opencode_bridge, "_sync_serve_config", lambda: None)
         monkeypatch.setattr(opencode_bridge, "_open_serve_log", lambda: None)
 
         async def _exec(*args: Any, **kwargs: Any) -> Any:
@@ -1842,7 +1840,6 @@ class TestServeStability:
         monkeypatch.setattr(opencode_bridge, "_find_serve_pid", lambda port: 12345)
         monkeypatch.setattr(opencode_bridge.os, "kill",
                             lambda pid, sig: killed.append(pid))
-        monkeypatch.setattr(opencode_bridge, "_sync_serve_config", lambda: None)
         monkeypatch.setattr(opencode_bridge, "_open_serve_log", lambda: None)
 
         async def _exec(*args: Any, **kwargs: Any) -> Any:

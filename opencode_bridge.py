@@ -38,7 +38,6 @@ from constants import (
     OPENCODE_SERVE_TIMEOUT,
     OPENCODE_SERVE_URL,
     OPENCODE_BRIDGE_DIRECTORY,
-    OPENCODE_SERVE_CONFIG_DIR,
     OPENCODE_SERVE_PURE,
     OPENCODE_WORKSPACE_DIR,
     OPCODE_CONFIG_PATH,
@@ -451,21 +450,18 @@ async def ensure_opencode_serve() -> bool:
 
 
 async def _spawn_serve(mtime: Optional[float]) -> bool:
-    """Spawn the opencode serve with the serve-scoped config (candidate B).
+    """Spawn the opencode serve with the user's GLOBAL config.
 
-    Syncs the reduced template into ``OPENCODE_SERVE_CONFIG_DIR`` and
-    spawns with ``XDG_CONFIG_HOME`` pointing there, so ONLY the referenced
-    plugins load (the rate-limit-fallback plugin; the wedge-prone
-    skill-registry / review-result-artifacts / model-variants .ts plugins
-    never auto-load — the serve-config dir holds no .ts files).
-    ``OPENCODE_SERVE_PURE`` toggles candidate A (``--pure``, no plugins).
-    Records ``_serve_config_mtime`` on success so the drift gate can
-    compare.  Never raises.
+    The serve reads ~/.config/opencode (same as the TUI — maintainer
+    decision 2026-08-08: no reduced serve-scoped config; the global
+    config with its full provider/plugin set is authoritative), so no
+    config sync is needed.  ``OPENCODE_SERVE_PURE`` toggles candidate A
+    (``--pure``, no plugins).  Records ``_serve_config_mtime`` on
+    success so the drift gate can compare.  Never raises.
     """
     global _serve_config_mtime
     try:
         port = OPENCODE_SERVE_URL.rsplit(":", 1)[-1]
-        await asyncio.to_thread(_sync_serve_config)
         serve_log = await asyncio.to_thread(_open_serve_log)
         # The serve inherits a minimal systemd PATH; give it the usual
         # user paths so the fallback plugin's gentle-ai binary resolves.
@@ -476,8 +472,6 @@ async def _spawn_serve(mtime: Optional[float]) -> bool:
             "~/.opencode/bin:"
             "/usr/local/bin:/usr/bin:/bin"
         )
-        # Candidate B: serve-scoped config dir (never ~/.config/opencode).
-        serve_env["XDG_CONFIG_HOME"] = OPENCODE_SERVE_CONFIG_DIR
         args = [
             OPENCODE_BIN, "serve", "--port", port, "--hostname", "127.0.0.1",
         ]
@@ -1408,51 +1402,6 @@ def _config_mtime() -> Optional[float]:
         return os.path.getmtime(OPCODE_CONFIG_PATH)
     except OSError:
         return None
-
-
-def _sync_serve_config() -> None:
-    """Idempotently copy the serve template + fallback-plugin config into the
-    serve-config dir.
-
-    opencode is an XDG app: with XDG_CONFIG_HOME=OPENCODE_SERVE_CONFIG_DIR it
-    reads <dir>/opencode/opencode.jsonc — so the template lands in the
-    ``opencode/`` subdir (empirically verified 2026-08-08: the file at the
-    XDG base root is NOT read).  The reduced file there (file:// plugin ref
-    for the fallback plugin ONLY, no .ts plugin files) is the serve's whole
-    config.  The fallback plugin resolves its OWN config
-    (rate-limit-fallback.json) via $XDG_CONFIG_HOME/opencode/ too — without
-    a copy there it initializes with its defaults (logging OFF, which
-    would blind the REQ-4 fallback-log evidence), so the proxy syncs the
-    user's plugin config alongside the template.  Copies are skipped when
-    the destination already matches, so repeated spawns do not churn the
-    dir."""
-    dst_dir = os.path.join(OPENCODE_SERVE_CONFIG_DIR, "opencode")
-    os.makedirs(dst_dir, exist_ok=True)
-    _copy_if_changed(
-        OPCODE_CONFIG_PATH, os.path.join(dst_dir, "opencode.jsonc"),
-    )
-    plugin_cfg = os.path.expanduser(
-        "~/.config/opencode/rate-limit-fallback.json"
-    )
-    if os.path.exists(plugin_cfg):
-        _copy_if_changed(
-            plugin_cfg, os.path.join(dst_dir, "rate-limit-fallback.json"),
-        )
-
-
-def _copy_if_changed(src: str, dst: str) -> None:
-    """Copy ``src`` to ``dst`` when the contents differ (idempotent)."""
-    with open(src, encoding="utf-8") as fh:
-        data = fh.read()
-    try:
-        with open(dst, encoding="utf-8") as fh:
-            if fh.read() == data:
-                return
-    except OSError:
-        pass
-    with open(dst, "w", encoding="utf-8") as fh:
-        fh.write(data)
-    logger.info("Synced opencode serve config template -> %s", dst)
 
 
 def _serve_health(port: str) -> tuple[bool, Optional[float]]:

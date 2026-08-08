@@ -618,6 +618,7 @@ FACTUAL_KEYWORDS: frozenset[str] = frozenset({
 #   CHAT      → professional (35B MoE)
 #   TOOL      → professional (35B MoE, handles tool_calls natively)
 #   CODE      → professional (35B MoE, heavy coding model)
+#   IMAGE     → professional (35B MoE, vision-capable; image profile)
 #   SCHOLAR   → scholar  (deep research)
 #   PROFESSIONAL → professional (professional writing / 35B MoE)
 #   CREATIVE  → creative (long-form creative writing)
@@ -630,6 +631,7 @@ ROUTE_MAP: dict[str, str] = {
     "CHAT":         "professional",
     "TOOL":         "professional",
     "CODE":         "professional",  # 35B MoE
+    "IMAGE":        "professional",  # vision model (35B MoE, image profile)
     "SCHOLAR":      "scholar",
     "PROFESSIONAL": "professional",
     "CREATIVE":     "creative",

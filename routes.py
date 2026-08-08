@@ -420,6 +420,36 @@ def _first_user_message_content(messages: list[dict[str, Any]]) -> str:
     return ""
 
 
+def _request_has_image(messages: list[dict[str, Any]]) -> bool:
+    """True when the conversation carries an image part the model must see.
+
+    Detects typed image parts (OpenAI ``{"type": "image_url"}`` and
+    Anthropic ``{"type": "image"}``) and inline base64
+    (``data:image/...``) in any user/tool content.  The frontdesk
+    classifier only sees flattened text, so image requests must be
+    classified HERE (as IMAGE → professional) before it can misroute
+    them (e.g. to CODE) from the text alone.
+    """
+    for msg in messages:
+        if msg.get("role") not in ("user", "tool"):
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            if "data:image/" in content:
+                return True
+            continue
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                ptype = str(part.get("type") or "")
+                if ptype in ("image_url", "image"):
+                    return True
+                if ptype == "text" and "data:image/" in str(part.get("text") or ""):
+                    return True
+    return False
+
+
 def _resolve_session_id(messages: list[dict[str, Any]], app: FastAPI) -> str:
     """Return a session ID for a request, identifying the conversation.
 
@@ -982,6 +1012,16 @@ async def chat_completions(request: Request) -> Response:
             sum(1 for m in processed_messages
                 if m.get("role") in ("assistant", "tool")
                 and ("tool_calls" in m or m.get("role") == "tool")),
+        )
+    elif _request_has_image(processed_messages):
+        # Image requests: the frontdesk classifier cannot see images and
+        # misroutes them (e.g. to CODE) from the text alone.  Force the
+        # IMAGE intent — always professional, with the image profile's
+        # sampling parameters (R17 lookup via the "image" bucket).
+        classification["intent"] = "IMAGE"
+        classification["priority"] = 2
+        logger.info(
+            "Image request detected — frontdesk bypassed, intent forced to IMAGE",
         )
     elif not lane_b and caller_type != "IDE":
         # Resolve the frontdesk port live from the systemd unit file so

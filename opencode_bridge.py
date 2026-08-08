@@ -38,7 +38,9 @@ from constants import (
     OPENCODE_SERVE_TIMEOUT,
     OPENCODE_SERVE_URL,
     OPENCODE_BRIDGE_DIRECTORY,
+    OPENCODE_SERVE_PURE,
     OPENCODE_WORKSPACE_DIR,
+    OPCODE_CONFIG_PATH,
     get_logger,
 )
 
@@ -184,8 +186,14 @@ def _permission_target(perm: dict[str, Any]) -> str:
 
 # Permission types the bridge relays to the user.  external_directory is
 # the write-outside-workspace gate; bash is the command-pattern gate (the
-# git ask-rules in opencode.json permission.bash).
-_RELAYED_PERMISSION_TYPES: tuple[str, ...] = ("external_directory", "bash")
+# git ask-rules in opencode.json permission.bash).  write/edit are the
+# 1.18.15 write/edit TOOL gates (REQ-1): they may omit the SSE
+# permission.updated event entirely (F2), so they also flow through the
+# POLLING paths — GET /permission records carry ``permission: "write"`` /
+# ``"edit"`` as the value, which this set matches (task 1.9).
+_RELAYED_PERMISSION_TYPES: tuple[str, ...] = (
+    "external_directory", "bash", "write", "edit",
+)
 
 
 def _classify_external_access(cmd: str) -> str:
@@ -213,13 +221,19 @@ _WRITE_TOOL_TYPES: frozenset[str] = frozenset({
 def _classify_permission_access(perm_type: str, tool_name: str, cmd: str) -> str:
     """Classify a permissioned external access as "read"/"write".
 
-    Tool-type aware: a ``write``/``edit``/``patch`` tool is a WRITE by
-    definition (it has no bash command for the operator heuristic).  Bash
+    Type-aware first (F2): a permission whose TYPE is itself a write tool
+    ("write"/"edit"/"patch"/...) is a WRITE by definition — the cmd
+    heuristic must NOT run on it, because write/edit permission records
+    carry no bash command and an empty cmd would read as "read"
+    (auto-allowing the write even in interactive mode).  A ``write``/
+    ``edit`` TOOL on an external_directory gate is likewise WRITE.  Bash
     commands fall back to ``_classify_external_access`` (redirects / known
     mutating tokens ⇒ write; cat/ls/head ⇒ read).  Used by both the event-
     bus permission handler and the polling resolver so a ``write`` tool to
     an external dir surfaces a question instead of being auto-allowed.
     """
+    if perm_type in _WRITE_TOOL_TYPES:
+        return "write"
     if perm_type == "external_directory" and tool_name in _WRITE_TOOL_TYPES:
         return "write"
     return _classify_external_access(cmd)
@@ -272,60 +286,45 @@ async def _post_permission_response(
         return False
 
 
-async def _resolve_pending_permission(
+async def _handle_permission_event(
     client: httpx.AsyncClient,
     session_id: str,
+    perm: dict[str, Any],
     pending_permissions: dict[str, tuple[str, bool]],
+    *,
+    autonomous: bool,
 ) -> Optional[str]:
-    """Answer any pending relayed permission for a session before the
-    bridge returns.
+    """Handle one permission request from the opencode serve.
 
-    Root-cause fix (2026-08-07): the bridge used to ``pop`` pending
-    permissions on every return path without answering them.  The serve
-    parks the tool forever (no one ever POSTs a response), the session
-    looks busy, and the next follow-up's wedge detector finds the stale
-    part and kills the session.  This helper answers the pending request:
+    THE single permission handler, shared by all four relay paths (the
+    polling-wedge check, the event-bus-timeout check, the ``permission.updated``
+    SSE event, and the completion resolver) so the read→auto-allow /
+    write→relay / autonomous→auto-allow policy lives in ONE place.
 
-    - READ external_directory commands -> auto-allow (POST "always") so the
-      tool proceeds.
-    - WRITE / git commands -> store the pending id and return a question
-      string for the pinned continuation to answer on the next request.
-
-    Returns None when there is no pending permission (or it was resolved
-    silently); returns a question string when the USER must decide.  Never
-    raises.
+    ``perm`` is either an SSE event ``properties`` dict (keys: id, type,
+    title, metadata, tool) or a GET /permission record (keys: id,
+    permission, patterns, tool).  Returns None when the request was
+    HANDLED silently (read auto-allowed, or an autonomous-mode auto-allow
+    with no client surface and no pending state); returns a question
+    string when the USER must decide (interactive-mode write/git ask).
+    Never raises.
     """
-    pending = await _detect_pending_permission(client, session_id)
-    if not pending:
+    pid = str(perm.get("id") or "")
+    perm_type = str(perm.get("permission") or perm.get("type") or "")
+    if not pid or not perm_type:
         return None
-    pid = str(pending.get("id") or "")
-    perm_type = str(pending.get("permission") or "")
-    if not pid:
-        return None
-    # Pull the command for read/write classification where possible.
-    cmd = str((pending.get("patterns") or [""])[0])
-    try:
-        tool_info = pending.get("tool") or {}
-        mid = tool_info.get("messageID")
-        call_id = tool_info.get("callID")
-        if mid:
-            msg_resp = await client.get(
-                f"{OPENCODE_SERVE_URL}/session/{session_id}/message/{mid}",
-                timeout=10.0,
-            )
-            if msg_resp.status_code == 200:
-                for part in (msg_resp.json().get("parts") or []):
-                    if part.get("callID") == call_id or part.get("id") == call_id:
-                        cmd = str(((part.get("state") or {}).get("input") or {}).get("command") or cmd)
-                        break
-    except (httpx.HTTPError, OSError, ValueError):
-        pass
-    # Resolve the tool type from the message part when available so a
-    # ``write`` tool to an external dir surfaces a question rather than
-    # being auto-allowed as a "read" (no bash command to inspect).
+    # Pull the command for read/write classification: SSE events carry it
+    # in metadata.command/title; GET /permission records carry patterns and
+    # the tool part's state.input.command.
+    cmd = ""
+    meta = perm.get("metadata") or {}
+    if isinstance(meta, dict):
+        cmd = str(meta.get("command") or "")
+    cmd = cmd or str(perm.get("title") or "")
+    cmd = cmd or str((perm.get("patterns") or [""])[0])
     tool_name = ""
     try:
-        tool_info = pending.get("tool") or {}
+        tool_info = perm.get("tool") or {}
         mid = tool_info.get("messageID")
         call_id = tool_info.get("callID")
         if mid:
@@ -337,16 +336,25 @@ async def _resolve_pending_permission(
                 for part in (msg_resp.json().get("parts") or []):
                     if part.get("callID") == call_id or part.get("id") == call_id:
                         tool_name = str(part.get("tool") or "")
+                        cmd = str(((part.get("state") or {}).get("input") or {}).get("command") or cmd)
                         break
     except (httpx.HTTPError, OSError, ValueError):
         pass
-    if (_classify_permission_access(perm_type, tool_name, cmd) == "read"):
+    if autonomous:
+        # SDD-autonomous mode: the user pre-approved the whole cycle, so
+        # every relayed ask (write/edit/bash/git) is auto-allowed — POST
+        # "always" with NO client surface and NO pending state.  Bounded by
+        # _post_permission_response (10s timeout, never raises).
+        await _post_permission_response(session_id, pid, "always")
+        return None
+    if _classify_permission_access(perm_type, tool_name, cmd) == "read":
         await _post_permission_response(session_id, pid, "always")
         return None
     pending_permissions[session_id] = (pid, True)
     template = (_GIT_PERMISSION_QUESTION_TEMPLATE
-                if perm_type == "bash" else _PERMISSION_QUESTION_TEMPLATE)
-    return template.format(target=_permission_target(pending), cmd=cmd[:300])
+                if perm_type == "bash"
+                else _PERMISSION_QUESTION_TEMPLATE)
+    return template.format(target=_permission_target(perm), cmd=cmd[:300])
 
 
 async def _detect_pending_permission(
@@ -364,6 +372,13 @@ async def _detect_pending_permission(
 
     Returns the permission record dict (with id/sessionID/patterns/tool) or
     None.  Never raises.
+
+    F2 (opencode 1.18.15): write/edit TOOL gates may omit the
+    ``permission.updated`` SSE event entirely — the GET /permission record
+    carries ``permission: "write"`` / ``"edit"`` as its value, which
+    ``_RELAYED_PERMISSION_TYPES`` now matches (task 1.9), so write/edit
+    asks are caught here and relayed/auto-allowed exactly like the
+    event-bus path.
     """
     try:
         resp = await client.get(f"{OPENCODE_SERVE_URL}/permission", timeout=10.0)
@@ -402,14 +417,54 @@ async def ensure_opencode_serve() -> bool:
     Returns True when the backend is answering.  Spawns ``opencode serve``
     as a detached child process bound to ``OPENCODE_SERVE_URL`` — the
     proxy owns its lifecycle so no systemd unit is required.  Never raises.
+
+    Config-drift gate (REQ-5): when a serve IS running and the serve
+    template (OPCODE_CONFIG_PATH) is newer than the mtime cached at the
+    last successful spawn, the serve is recycled via ``_force_recycle_serve``
+    and respawned so the edited config actually loads.  An unreadable
+    template is treated as no-drift.
     """
+    global _serve_config_mtime
+    mtime = await asyncio.to_thread(_config_mtime)
     if await is_opencode_serve_running():
-        return True
+        if mtime is None:
+            return True  # template unreadable — treat as no-drift
+        if _serve_config_mtime is not None and mtime > _serve_config_mtime:
+            logger.warning(
+                "opencode serve config drifted (mtime %.3f > cached %.3f) — "
+                "recycling serve", mtime, _serve_config_mtime,
+            )
+            await _force_recycle_serve()
+            # Drain the old listener so the respawn can bind the port.
+            for _ in range(4):
+                if not await is_opencode_serve_running():
+                    break
+                await asyncio.sleep(0.25)
+        else:
+            if _serve_config_mtime is None:
+                # Proxy restarted while the serve survived: adopt the
+                # current template as the baseline, no recycle.
+                _serve_config_mtime = mtime
+            return True
+    return await _spawn_serve(mtime)
+
+
+async def _spawn_serve(mtime: Optional[float]) -> bool:
+    """Spawn the opencode serve with the user's GLOBAL config.
+
+    The serve reads ~/.config/opencode (same as the TUI — maintainer
+    decision 2026-08-08: no reduced serve-scoped config; the global
+    config with its full provider/plugin set is authoritative), so no
+    config sync is needed.  ``OPENCODE_SERVE_PURE`` toggles candidate A
+    (``--pure``, no plugins).  Records ``_serve_config_mtime`` on
+    success so the drift gate can compare.  Never raises.
+    """
+    global _serve_config_mtime
     try:
         port = OPENCODE_SERVE_URL.rsplit(":", 1)[-1]
         serve_log = await asyncio.to_thread(_open_serve_log)
         # The serve inherits a minimal systemd PATH; give it the usual
-        # user paths so plugins (e.g. skill-registry → gentle-ai) resolve.
+        # user paths so the fallback plugin's gentle-ai binary resolves.
         serve_env = dict(os.environ)
         serve_env["PATH"] = (
             "/home/linuxbrew/.linuxbrew/bin:"
@@ -417,22 +472,27 @@ async def ensure_opencode_serve() -> bool:
             "~/.opencode/bin:"
             "/usr/local/bin:/usr/bin:/bin"
         )
+        args = [
+            OPENCODE_BIN, "serve", "--port", port, "--hostname", "127.0.0.1",
+        ]
+        if OPENCODE_SERVE_PURE:
+            args.append("--pure")  # candidate A fallback: no plugins at all
         proc = await asyncio.create_subprocess_exec(
-            OPENCODE_BIN,
-            "serve",
-            "--port", port,
-            "--hostname", "127.0.0.1",
+            *args,
             stdout=serve_log,
             stderr=serve_log,
             start_new_session=True,
             cwd=OPENCODE_WORKSPACE_DIR,
             env=serve_env,
         )
-        logger.info("Opened opencode serve (pid=%s) on %s", proc.pid, OPENCODE_SERVE_URL)
+        logger.info(
+            "Opened opencode serve (pid=%s) on %s", proc.pid, OPENCODE_SERVE_URL,
+        )
         # Wait briefly for the listener to come up.
         for _ in range(10):
             await asyncio.sleep(0.5)
             if await is_opencode_serve_running():
+                _serve_config_mtime = mtime
                 return True
     except asyncio.CancelledError:
         # Cancellation must propagate (never swallow it).
@@ -519,6 +579,7 @@ async def opencode_chat_stream(
     just_approved_permission: bool = False,
     system_prompt: str = _BRIDGE_SYSTEM_PROMPT,
     timeout: float = OPENCODE_SERVE_TIMEOUT,
+    autonomous: bool = False,
 ) -> AsyncIterator[tuple[str, str]]:
     """Stream a task through headless opencode, yielding assistant content live.
 
@@ -536,9 +597,10 @@ async def opencode_chat_stream(
     "question" → the agent is waiting for user input (stop streaming).
     On failure yields a status tuple (never raises).
     """
-    # SDD-autonomous mode passes a long timeout: force a fresh serve BEFORE
-    # spawning so the cycle never runs on a progressively-wedged tool runner.
-    if timeout > OPENCODE_SERVE_TIMEOUT:  # SDD mode (1h budget)
+    # SDD-autonomous mode (model "opencode-sdd", explicit flag — not the
+    # old timeout inference): force a fresh serve BEFORE spawning so the
+    # cycle never runs on a progressively-wedged tool runner.
+    if autonomous:
         await _force_recycle_serve()
     if not await ensure_opencode_serve():
         yield ("status", "[OpenCode Bridge Failed: opencode serve not reachable.]")
@@ -784,10 +846,15 @@ async def opencode_chat_stream(
                                     # returning: READ -> auto-allow (tool
                                     # proceeds), WRITE -> surface a question
                                     # so the next request answers it.
-                                    question = await _resolve_pending_permission(client, session_id, pending_permissions)
-                                    if question:
-                                        yield ("question", question)
-                                        return
+                                    pending_perm = await _detect_pending_permission(client, session_id)
+                                    if pending_perm:
+                                        question = await _handle_permission_event(
+                                            client, session_id, pending_perm,
+                                            pending_permissions, autonomous=autonomous,
+                                        )
+                                        if question:
+                                            yield ("question", question)
+                                            return
                                     return
                             else:
                                 finish_quiet_cycles = 0
@@ -799,10 +866,15 @@ async def opencode_chat_stream(
                             except (httpx.HTTPError, ValueError):
                                 st = None
                             if st == "idle":
-                                question = await _resolve_pending_permission(client, session_id, pending_permissions)
-                                if question:
-                                    yield ("question", question)
-                                    return
+                                pending_perm = await _detect_pending_permission(client, session_id)
+                                if pending_perm:
+                                    question = await _handle_permission_event(
+                                        client, session_id, pending_perm,
+                                        pending_permissions, autonomous=autonomous,
+                                    )
+                                    if question:
+                                        yield ("question", question)
+                                        return
                                 return
                             # Real agent work with no new parts (long bash
                             # run, model generation) must not read as a
@@ -828,62 +900,14 @@ async def opencode_chat_stream(
                                 last_wedge_check = time.monotonic()
                                 pending_perm = await _detect_pending_permission(client, session_id)
                                 if pending_perm:
-                                    pid = str(pending_perm.get("id") or "")
-                                    perm_type = str(pending_perm.get("permission") or "")
-                                    tool_info = pending_perm.get("tool") or {}
-                                    # Pull the command from the tool part for
-                                    # classification (read → auto-allow).
-                                    cmd = ""
-                                    try:
-                                        msg_resp = await client.get(
-                                            f"{OPENCODE_SERVE_URL}/session/{session_id}/message"
-                                            + (
-                                                f"/{tool_info.get('messageID')}"
-                                                if tool_info.get("messageID") else ""
-                                            ),
-                                            timeout=10.0,
-                                        )
-                                        if msg_resp.status_code == 200:
-                                            parts = msg_resp.json().get("parts") if isinstance(msg_resp.json(), dict) else msg_resp.json()
-                                            for part in (parts or []):
-                                                if (part.get("callID") == tool_info.get("callID")
-                                                        or part.get("id") == tool_info.get("callID")):
-                                                    cmd = str(((part.get("state") or {}).get("input") or {}).get("command") or "")
-                                                    break
-                                    except (httpx.HTTPError, OSError, ValueError):
-                                        pass
-                                    cmd = cmd or str((pending_perm.get("patterns") or [""])[0])
-                                    # Resolve the tool type so a write/edit/
-                                    # patch tool is classified as a WRITE even
-                                    # though it has no bash command to inspect
-                                    # (the bash-only heuristic would read a
-                                    # path pattern and auto-allow the write).
-                                    tool_name = ""
-                                    try:
-                                        tool_info2 = pending_perm.get("tool") or {}
-                                        mid2 = tool_info2.get("messageID")
-                                        call_id2 = tool_info2.get("callID")
-                                        if mid2:
-                                            m_resp2 = await client.get(
-                                                f"{OPENCODE_SERVE_URL}/session/{session_id}/message/{mid2}",
-                                                timeout=10.0,
-                                            )
-                                            if m_resp2.status_code == 200:
-                                                for part2 in (m_resp2.json().get("parts") or []):
-                                                    if part2.get("callID") == call_id2 or part2.get("id") == call_id2:
-                                                        tool_name = str(part2.get("tool") or "")
-                                                        break
-                                    except (httpx.HTTPError, OSError, ValueError):
-                                        pass
-                                    if (_classify_permission_access(perm_type, tool_name, cmd) == "read"):
-                                        await _post_permission_response(session_id, pid, "always")
-                                        continue
-                                    pending_permissions[session_id] = (pid, True)
-                                    template = (_GIT_PERMISSION_QUESTION_TEMPLATE
-                                                if perm_type == "bash"
-                                                else _PERMISSION_QUESTION_TEMPLATE)
-                                    yield ("question", template.format(target=_permission_target(pending_perm), cmd=cmd[:300]))
-                                    return
+                                    question = await _handle_permission_event(
+                                        client, session_id, pending_perm,
+                                        pending_permissions, autonomous=autonomous,
+                                    )
+                                    if question:
+                                        yield ("question", question)
+                                        return
+                                    continue
                                 if await _detect_wedged_tool(client, session_id):
                                     try:
                                         await client.post(
@@ -918,55 +942,14 @@ async def opencode_chat_stream(
                             bus_last_wedge_check = time.monotonic()
                             pending_perm = await _detect_pending_permission(client, session_id)
                             if pending_perm:
-                                pid = str(pending_perm.get("id") or "")
-                                perm_type = str(pending_perm.get("permission") or "")
-                                tool_info = pending_perm.get("tool") or {}
-                                cmd = ""
-                                try:
-                                    msg_resp = await client.get(
-                                        f"{OPENCODE_SERVE_URL}/session/{session_id}/message"
-                                        + (
-                                            f"/{tool_info.get('messageID')}"
-                                            if tool_info.get("messageID") else ""
-                                        ),
-                                        timeout=10.0,
-                                    )
-                                    if msg_resp.status_code == 200:
-                                        parts = msg_resp.json().get("parts") if isinstance(msg_resp.json(), dict) else msg_resp.json()
-                                        for part in (parts or []):
-                                            if (part.get("callID") == tool_info.get("callID")
-                                                    or part.get("id") == tool_info.get("callID")):
-                                                cmd = str(((part.get("state") or {}).get("input") or {}).get("command") or "")
-                                                break
-                                except (httpx.HTTPError, OSError, ValueError):
-                                    pass
-                                cmd = cmd or str((pending_perm.get("patterns") or [""])[0])
-                                tool_name = ""
-                                try:
-                                    tool_info2 = pending_perm.get("tool") or {}
-                                    mid = tool_info2.get("messageID")
-                                    call_id = tool_info2.get("callID")
-                                    if mid:
-                                        m_resp = await client.get(
-                                            f"{OPENCODE_SERVE_URL}/session/{session_id}/message/{mid}",
-                                            timeout=10.0,
-                                        )
-                                        if m_resp.status_code == 200:
-                                            for part in (m_resp.json().get("parts") or []):
-                                                if part.get("callID") == call_id or part.get("id") == call_id:
-                                                    tool_name = str(part.get("tool") or "")
-                                                    break
-                                except (httpx.HTTPError, OSError, ValueError):
-                                    pass
-                                if (_classify_permission_access(perm_type, tool_name, cmd) == "read"):
-                                    await _post_permission_response(session_id, pid, "always")
-                                    continue
-                                pending_permissions[session_id] = (pid, True)
-                                template = (_GIT_PERMISSION_QUESTION_TEMPLATE
-                                            if perm_type == "bash"
-                                            else _PERMISSION_QUESTION_TEMPLATE)
-                                yield ("question", template.format(target=_permission_target(pending_perm), cmd=cmd[:300]))
-                                return
+                                question = await _handle_permission_event(
+                                    client, session_id, pending_perm,
+                                    pending_permissions, autonomous=autonomous,
+                                )
+                                if question:
+                                    yield ("question", question)
+                                    return
+                                continue
                             if await _detect_wedged_tool(client, session_id):
                                 try:
                                     await client.post(
@@ -1010,50 +993,17 @@ async def opencode_chat_stream(
                         # bridge wedges).  Auto-allow READ external-dir
                         # commands; WRITE and git commands yield a question
                         # and stop so the USER decides on the next request
-                        # (the session stays pinned).
+                        # (the session stays pinned).  Autonomous mode
+                        # auto-allows everything (REQ-2).
                         if props.get("type") in _RELAYED_PERMISSION_TYPES:
-                            pid = str(props.get("id") or "")
-                            meta = props.get("metadata") or {}
-                            title = str(props.get("title") or "")
-                            cmd = str(meta.get("command") or "") if isinstance(meta, dict) else ""
-                            cmd = cmd or title
-                            tool_name = ""
-                            try:
-                                tool_info = props.get("tool") or {}
-                                mid = tool_info.get("messageID")
-                                call_id = tool_info.get("callID")
-                                if mid:
-                                    m_resp = await client.get(
-                                        f"{OPENCODE_SERVE_URL}/session/{session_id}/message/{mid}",
-                                        timeout=10.0,
-                                    )
-                                    if m_resp.status_code == 200:
-                                        for part in (m_resp.json().get("parts") or []):
-                                            if part.get("callID") == call_id or part.get("id") == call_id:
-                                                tool_name = str(part.get("tool") or "")
-                                                break
-                            except (httpx.HTTPError, OSError, ValueError):
-                                pass
-                            if (_classify_permission_access(
-                                    props.get("type"), tool_name, cmd) == "read"):
-                                try:
-                                    await client.post(
-                                        f"{OPENCODE_SERVE_URL}/session/{session_id}/permissions/{pid}",
-                                        json={"response": "always"},
-                                        timeout=10.0,
-                                    )
-                                except (httpx.HTTPError, OSError):
-                                    pass
-                                continue
-                            pending_permissions[session_id] = (pid, True)
-                            template = (_GIT_PERMISSION_QUESTION_TEMPLATE
-                                        if props.get("type") == "bash"
-                                        else _PERMISSION_QUESTION_TEMPLATE)
-                            yield (
-                                "question",
-                                template.format(target=_permission_target(props), cmd=cmd[:300]),
+                            question = await _handle_permission_event(
+                                client, session_id, props, pending_permissions,
+                                autonomous=autonomous,
                             )
-                            return
+                            if question:
+                                yield ("question", question)
+                                return
+                            continue
                         # Other permission types: no existing branch matches,
                         # so fall through to the rest of the loop body.
                     if etype == "session.status":
@@ -1413,25 +1363,45 @@ async def _recycle_serve_if_low_memory() -> None:
         return
 
 
-async def _force_recycle_serve() -> None:
+async def _force_recycle_serve(reason: str = "long-lived call") -> None:
     """Kill the opencode serve unconditionally so the next
     ``ensure_opencode_serve`` respawns a fresh one.
 
-    Used by long-lived calls (SDD-autonomous mode): the serve's tool runner
-    progressively wedges (bash hangs on trivial commands), and an SDD cycle
-    can burn a full hour on a wedged runner.  A fresh serve at cycle start
-    removes that risk.  Never raises.
+    Used by long-lived calls (SDD-autonomous mode) and the config-drift
+    gate (REQ-5): the serve's tool runner progressively wedges (bash hangs
+    on trivial commands), and an SDD cycle can burn a full hour on a
+    wedged runner.  A fresh serve at cycle start removes that risk.  The
+    drift gate recycles when the serve template changes under a running
+    serve.  Never raises.
     """
     try:
         port = OPENCODE_SERVE_URL.rsplit(":", 1)[-1]
         pid = await asyncio.to_thread(_find_serve_pid, port)
         if pid:
-            logger.warning("Forcing opencode serve recycle (long-lived call)")
+            logger.warning("Forcing opencode serve recycle (%s)", reason)
             os.kill(pid, 15)
     except (OSError, ProcessLookupError):
         pass
     except (OSError, ValueError):
         return
+
+
+# F5 (tasks 4.4): the config-mtime cache lives module-level, NOT on
+# proxy.app.state — the spawn gate (ensure_opencode_serve) is a
+# bridge-internal function with no request/app handle (pending_permissions
+# is threaded IN from routes as a plain dict; this cache is owned by the
+# spawn gate itself, so there is no clean app.state channel).  Design.md
+# chose module-level; review-accepted via F5.  Set after every successful
+# spawn; drives the REQ-5 drift recycle.
+_serve_config_mtime: Optional[float] = None
+
+
+def _config_mtime() -> Optional[float]:
+    """mtime of OPCODE_CONFIG_PATH, or None when unreadable (no drift)."""
+    try:
+        return os.path.getmtime(OPCODE_CONFIG_PATH)
+    except OSError:
+        return None
 
 
 def _serve_health(port: str) -> tuple[bool, Optional[float]]:

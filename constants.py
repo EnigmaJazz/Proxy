@@ -180,6 +180,23 @@ OPENCODE_AGENT: str = "gentle-orchestrator"
 # How long to wait for the opencode agent to finish a task.
 OPENCODE_SERVE_TIMEOUT: float = 600.0
 
+# Serve stability mode (REQ-4): the serve spawns with the USER'S GLOBAL
+# config (~/.config/opencode — same as the TUI) and the light plugin
+# stack it declares.  ``OPENCODE_SERVE_PURE`` toggles candidate A
+# (``--pure``, no plugins) as a documented fallback.  Subprocess-scoped
+# toggle, never touches the user's TUI config.
+OPENCODE_SERVE_PURE: bool = False
+
+# Path whose mtime drives config-drift detection (REQ-5): the user's
+# GLOBAL opencode config.  Editing it while a serve runs recycles the
+# serve before the next request so the new config actually loads — the
+# serve reads the same config the TUI uses (maintainer decision
+# 2026-08-08: the serve must NOT use a reduced serve-scoped config; the
+# global config with its full provider set is authoritative).
+OPCODE_CONFIG_PATH: str = os.path.expanduser(
+    "~/.config/opencode/opencode.json"
+)
+
 # Bridge model keys exposed to clients, validated alongside ALL_MODEL_KEYS.
 # "opencode" routes to the opencode serve bridge instead of llama.cpp.
 BRIDGE_MODEL_KEYS: frozenset[str] = frozenset({"opencode", "opencode-sdd"})

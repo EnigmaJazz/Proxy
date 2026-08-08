@@ -779,7 +779,7 @@ async def chat_completions(request: Request) -> Response:
     # /opencode — direct the request to the opencode agent instead of a
     # local model (the programmatic escape hatch for coding tasks).
     if last_user and _OPENCODE_RE.search(last_user.lower()):
-        return await _handle_opencode_command(last_user)
+        return await _handle_opencode_command(last_user, request.app)
 
     # model: "opencode" / "opencode-sdd" — client picked the opencode
     # bridge model.  This bypasses llama routing entirely: the task goes to
@@ -2200,10 +2200,11 @@ async def _opencode_task_response(
     client_stream: bool,
     session_map: Optional[dict[str, str]] = None,
     session_key: Optional[str] = None,
-    pending_permissions: Optional[dict[str, str]] = None,
+    pending_permissions: Optional[dict[str, tuple[str, bool]]] = None,
     just_approved_permission: bool = False,
     system_prompt: str = _BRIDGE_SYSTEM_PROMPT,
     timeout: float = OPENCODE_SERVE_TIMEOUT,
+    autonomous: bool = False,
 ) -> Response:
     """Run a task through the opencode bridge and return the response.
 
@@ -2215,6 +2216,9 @@ async def _opencode_task_response(
     When ``session_map``/``session_key`` are given the opencode agent session
     is pinned per conversation so follow-ups resume the same agent (it keeps
     its state and can answer clarifying questions).
+
+    ``autonomous`` marks SDD-autonomous mode (model "opencode-sdd"): the
+    bridge auto-allows every permission ask instead of relaying it (REQ-2).
     """
     if not task_text:
         return JSONResponse(
@@ -2236,6 +2240,7 @@ async def _opencode_task_response(
             just_approved_permission=just_approved_permission,
             system_prompt=system_prompt,
             timeout=timeout,
+            autonomous=autonomous,
         ):
             stop_after = False
             if not text_delta:
@@ -2290,6 +2295,9 @@ async def _opencode_task_response(
         session_key=session_key,
         pending_permissions=pending_permissions,
         just_approved_permission=just_approved_permission,
+        system_prompt=system_prompt,
+        timeout=timeout,
+        autonomous=autonomous,
     ):
         if kind == "text" and text_delta:
             resp_parts.append(text_delta)
@@ -2313,7 +2321,7 @@ async def _handle_opencode_request(
     client_stream: bool,
     session_map: Optional[dict[str, str]] = None,
     session_key: Optional[str] = None,
-    pending_permissions: Optional[dict[str, str]] = None,
+    pending_permissions: Optional[dict[str, tuple[str, bool]]] = None,
     sdd: bool = False,
 ) -> Response:
     """Handle ``model: "opencode"`` — direct the task to the opencode agent.
@@ -2338,6 +2346,7 @@ async def _handle_opencode_request(
             _SDD_AUTONOMOUS_SYSTEM_PROMPT if sdd else _BRIDGE_SYSTEM_PROMPT
         ),
         timeout=OPENCODE_SDD_TIMEOUT if sdd else OPENCODE_SERVE_TIMEOUT,
+        autonomous=sdd,
     )
     return resp
 
@@ -2498,11 +2507,17 @@ async def _apply_coding_decision_gate(
     return None
 
 
-async def _handle_opencode_command(user_text: str) -> StreamingResponse:
+async def _handle_opencode_command(user_text: str, app: FastAPI) -> Response:
     """Handle the /opencode command embedded in a user prompt.
 
-    Directs the remaining text to the opencode agent (gentle-orchestrator), mirroring
-    the /cloud command flow.
+    Routes the remaining text through the opencode bridge STREAM path
+    (``_opencode_task_response``), giving /opencode the SAME relay/
+    auto-allow policy as ``model: "opencode"`` (REQ-3): write/edit
+    permission gates surface as questions instead of being silently
+    dropped by the old bare ``opencode_chat`` blocking call.  ``app`` is
+    required to resolve the pending-permission map on ``app.state`` (Rule
+    6 — mirrors ``_apply_coding_decision_gate``); the call site passes
+    ``request.app``.
     """
     logger.info(
         "opencode /opencode command: task=%r source_len=%d",
@@ -2512,28 +2527,12 @@ async def _handle_opencode_command(user_text: str) -> StreamingResponse:
     if not task_text:
         task_text = user_text.strip()
 
-    async def _stream() -> AsyncIterator[str]:
-        status_msg = (
-            f"_⏳ [Proxy: Routing concurrently to OpenCode ({OPENCODE_AGENT} agent)...]_\n\n"
-        )
-        yield f"data: {json.dumps(_make_system_chunk(status_msg))}\n\n"
-
-        resp_text = await opencode_chat(task_text, agent=OPENCODE_AGENT)
-        chunk = {
-            "id": f"chatcmpl-{int(time.time())}",
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": "opencode",
-            "choices": [{
-                "index": 0,
-                "delta": {"content": resp_text},
-                "finish_reason": None,
-            }],
-        }
-        yield f"data: {json.dumps(chunk)}\n\n"
-        yield "data: [DONE]\n\n"
-
-    return StreamingResponse(_stream(), media_type="text/event-stream")
+    return await _opencode_task_response(
+        task_text,
+        client_stream=True,
+        pending_permissions=_pending_permissions_state(app),
+        autonomous=False,
+    )
 
 
 # ---------------------------------------------------------------------------

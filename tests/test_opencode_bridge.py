@@ -281,12 +281,13 @@ class TestHermeticServe:
         _assert_serve_untouched(None, [1, 2, 3], opencode_bridge.os.kill)
 
     @pytest.mark.asyncio
-    async def test_recorder_captures_wedge_kill(
+    async def test_wedge_path_never_kills_serve(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The direct wedge-recycle ``os.kill`` (opencode_bridge.py:876/918)
-        is NOT routed through the nooped primitives — the recorder must
-        capture it so a future serve-pid kill trips the teardown guard."""
+        """The wedge path must NEVER signal the serve: the serve hosts
+        other concurrent sessions, and a serve kill for one wedged tool
+        destroys them all (2026-08-08 — the kill was removed).  This test
+        pins that: no pid is ever recorded by the hermetic guard."""
         from opencode_bridge import opencode_chat_stream
 
         async def _running(*args: Any, **kwargs: Any) -> bool:
@@ -303,12 +304,8 @@ class TestHermeticServe:
             opencode_bridge, "_recycle_serve_if_low_memory", _noop,
         )
         monkeypatch.setattr(opencode_bridge, "_detect_wedged_tool", _always_wedged)
-        # Fake, non-matching pid — never a real process.  Stub the captured
-        # real os.kill so the recorder's pass-through cannot signal anything.
+        # Even with a MATCHING serve pid, the wedge path must not signal it.
         monkeypatch.setattr(opencode_bridge, "_find_serve_pid", lambda port: 424242)
-        monkeypatch.setattr(
-            sys.modules[__name__], "_HERMETIC_REAL_KILL", lambda *a, **k: None,
-        )
         monkeypatch.setattr(opencode_bridge, "_EVENT_QUIET_TIMEOUT", 0.05)
         monkeypatch.setattr(opencode_bridge, "_WEDGE_CHECK_INTERVAL_S", 0.05)
 
@@ -325,8 +322,10 @@ class TestHermeticServe:
 
         wedged = [t for k, t in deltas if k == "status" and "wedged" in t]
         assert len(wedged) == 1
-        # The wedge-kill os.kill was recorded → the guard can detect it.
-        assert 424242 in HERMETIC_KILLED_PIDS
+        assert "recycled" not in wedged[0]
+        # The wedge path recorded NO kill — the serve survives.
+        assert 424242 not in HERMETIC_KILLED_PIDS
+        assert HERMETIC_KILLED_PIDS == []
 
 
 TRIAGE_TEXT = "\u200b🔍 Proxy triage: classified as CODE (priority 1). Routing to Professional (35B MoE) on port 13109.DONE"
@@ -2042,10 +2041,11 @@ class TestDetectWedgedTool:
 
 class TestWedgedToolStream:
     @pytest.mark.asyncio
-    async def test_wedged_tool_aborts_drops_pin_and_recycles(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A wedged tool part terminates the stream with a clear error:
-        the session is aborted, the pin dropped, and the serve recycled
-        (never streaming keepalives indefinitely)."""
+    async def test_wedged_tool_aborts_and_drops_pin(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A wedged tool part terminates the stream with a clear error: the
+        session is aborted and the pin dropped.  The SERVE IS NEVER KILLED
+        — it hosts other concurrent sessions, and recycling it for one
+        wedged tool destroys them all (2026-08-08)."""
         from opencode_bridge import opencode_chat_stream
 
         async def _running(*args: Any, **kwargs: Any) -> bool:
@@ -2080,7 +2080,8 @@ class TestWedgedToolStream:
 
         wedged = [t for k, t in deltas if k == "status" and "wedged" in t]
         assert len(wedged) == 1
-        assert "session aborted, serve recycled" in wedged[0]
+        assert "session aborted" in wedged[0]
+        assert "recycled" not in wedged[0]
         # Pin dropped and the session aborted.
         assert "conv-1" not in smap
         aborts = [

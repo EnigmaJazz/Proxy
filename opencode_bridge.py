@@ -925,13 +925,16 @@ async def opencode_chat_stream(
                                     if session_map is not None and session_key:
                                         session_map.pop(session_key, None)
                                     pending_permissions.pop(session_id, None)
-                                    try:
-                                        pid = await asyncio.to_thread(_find_serve_pid, OPENCODE_SERVE_URL.rsplit(":", 1)[-1])
-                                        if pid:
-                                            os.kill(pid, 15)
-                                    except (OSError, ProcessLookupError):
-                                        pass
-                                    yield ("status", "[OpenCode Bridge Error: agent tool runner wedged — session aborted, serve recycled. Please retry.]")
+                                    # NOTE: never kill the serve here.  The
+                                    # serve hosts OTHER sessions (concurrent
+                                    # cycles); recycling it for one wedged
+                                    # tool destroys every live session (seen
+                                    # 2026-08-08: a wedged bash in one cycle
+                                    # SIGTERMed the serve mid-other-cycle).
+                                    # The session abort frees the tool runner;
+                                    # the autonomous force-recycle handles
+                                    # serve health at the next long call.
+                                    yield ("status", "[OpenCode Bridge Error: agent tool runner wedged — session aborted. Please retry.]")
                                     return
                             await asyncio.sleep(1.0)
                     except asyncio.TimeoutError:
@@ -967,13 +970,11 @@ async def opencode_chat_stream(
                                 if session_map is not None and session_key:
                                     session_map.pop(session_key, None)
                                 pending_permissions.pop(session_id, None)
-                                try:
-                                    pid = await asyncio.to_thread(_find_serve_pid, OPENCODE_SERVE_URL.rsplit(":", 1)[-1])
-                                    if pid:
-                                        os.kill(pid, 15)
-                                except (OSError, ProcessLookupError):
-                                    pass
-                                yield ("status", "[OpenCode Bridge Error: agent tool runner wedged — session aborted, serve recycled. Please retry.]")
+                                # NOTE: never kill the serve here — see the
+                                # polling-wedge path above (2026-08-08: the
+                                # serve hosts concurrent sessions; killing it
+                                # destroys them all).
+                                yield ("status", "[OpenCode Bridge Error: agent tool runner wedged — session aborted. Please retry.]")
                                 return
                         # Keep the client connection alive during long tool
                         # phases (and show the agent is still working).

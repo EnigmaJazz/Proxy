@@ -1945,22 +1945,54 @@ class TestZombieSweep:
 # ---------------------------------------------------------------------------
 class TestDetectWedgedTool:
     @pytest.mark.asyncio
-    async def test_old_running_bash_part_without_output_is_wedged(self) -> None:
+    async def test_old_running_bash_part_without_output_is_wedged(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """A bash part running with no output for past the wedge threshold
-        is detected as wedged."""
+        is detected as wedged (started AFTER the current serve)."""
         from opencode_bridge import _detect_wedged_tool
 
+        part_start = int(time.time() * 1000) - 180_000
+        monkeypatch.setattr(
+            opencode_bridge, "_serve_start_epoch_ms", lambda: part_start - 60_000,
+        )
         client = _PollClient()
         client.poll_messages = [_assistant_msg([{
             "id": "prt_bash", "messageID": "msg_a", "type": "tool",
             "tool": "bash",
             "state": {
                 "status": "running",
-                "time": {"start": int(time.time() * 1000) - 180_000},
+                "time": {"start": part_start},
             },
         }])]
 
         assert await _detect_wedged_tool(client, client.session_id) is True
+
+    @pytest.mark.asyncio
+    async def test_stale_part_from_dead_serve_not_wedged(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A running part started BEFORE the current serve process is
+        debris from a dead serve — the resumed pinned session must NOT be
+        aborted for it (2026-08-08: stale 'task' parts killed healthy
+        resumed cycles)."""
+        from opencode_bridge import _detect_wedged_tool
+
+        part_start = int(time.time() * 1000) - 180_000
+        monkeypatch.setattr(
+            opencode_bridge, "_serve_start_epoch_ms", lambda: part_start + 60_000,
+        )
+        client = _PollClient()
+        client.poll_messages = [_assistant_msg([{
+            "id": "prt_bash", "messageID": "msg_a", "type": "tool",
+            "tool": "bash",
+            "state": {
+                "status": "running",
+                "time": {"start": part_start},
+            },
+        }])]
+
+        assert await _detect_wedged_tool(client, client.session_id) is False
 
     @pytest.mark.asyncio
     async def test_recent_start_not_wedged(self) -> None:

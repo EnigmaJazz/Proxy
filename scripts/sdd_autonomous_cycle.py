@@ -190,7 +190,7 @@ async def main(change: str, code_writer: str = "local") -> None:
                         session_map=session_map,
                         session_key=session_key,
                         system_prompt=opencode_bridge._SDD_AUTONOMOUS_SYSTEM_PROMPT,
-                        timeout=3600.0,  # matches OPENCODE_SDD_TIMEOUT
+                        timeout=7200.0,  # apply phases run past 60 min; the 3600s cap aborted them
                         autonomous=True,  # PR-1: force-recycle + auto-allow
                     )
                 ):

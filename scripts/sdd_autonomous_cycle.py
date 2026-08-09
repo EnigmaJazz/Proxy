@@ -77,9 +77,14 @@ SUB-AGENT FALLBACK RULE (MANDATORY): delegate each SDD phase to its
 phase sub-agent (sdd-explore/sdd-propose/sdd-spec/sdd-design/sdd-tasks/
 sdd-apply/sdd-verify/sdd-archive) ONCE.  If a sub-agent's result does
 not arrive (the task tool hangs or errors), DO NOT retry the sub-agent:
-perform that phase INLINE yourself — write the phase artifact directly
-with your own tools (read/write/edit/bash) and continue to the next
-phase.  Inline phase work is always acceptable and often faster."""
+perform that phase INLINE yourself with your own tools
+(read/write/edit/bash).  A phase is COMPLETE ONLY when its artifact
+file exists — proposal.md, specs/<change>/spec.md, design.md,
+tasks.md, the applied code + tests, verify-report.md, and finally
+archive-report.md.  Never skip a phase's artifact: write it yourself
+and CONTINUE the pipeline in SDD order (proposal -> spec -> design ->
+tasks -> apply -> verify -> archive).  Inline phase work is always
+acceptable and often faster."""
 
 
 def build_parser() -> argparse.ArgumentParser:

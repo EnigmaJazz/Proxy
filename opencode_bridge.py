@@ -110,6 +110,13 @@ _EVENT_FINAL_TIMEOUT: float = 3.0
 # the serve's tool runner marked the tool started but never executed it,
 # so the session stays "busy" forever while the client sees keepalives.
 _TOOL_WEDGE_AFTER_S: float = 120.0
+
+#: A ``task`` tool part waits on a sub-agent session, which legitimately
+#: runs for many minutes (the TUI's SDD cycles routinely take 5-20 min
+#: per sub-agent phase).  The 120s tool threshold would abort healthy
+#: phases at the first sub-agent lull, so task parts get their own,
+#: much longer window (2026-08-09).
+_TASK_WEDGE_AFTER_S: float = 600.0
 # How often the stream checks the session for a wedged tool part.
 _WEDGE_CHECK_INTERVAL_S: float = 10.0
 
@@ -1323,7 +1330,11 @@ async def _detect_wedged_tool(client: httpx.AsyncClient, session_id: str) -> boo
                     # Stale part from a previous serve — not a live wedge.
                     continue
                 elapsed_s = (now_ms - start_ms) / 1000
-                if now_ms - start_ms > _TOOL_WEDGE_AFTER_S * 1000:
+                threshold_s = (
+                    _TASK_WEDGE_AFTER_S if p.get("tool") == "task"
+                    else _TOOL_WEDGE_AFTER_S
+                )
+                if now_ms - start_ms > threshold_s * 1000:
                     logger.warning(
                         "wedged tool part %r running without output for %.0fs — session %s",
                         p.get("tool"), elapsed_s, str(session_id)[:16],

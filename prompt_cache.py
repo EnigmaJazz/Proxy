@@ -70,6 +70,36 @@ def registered_prompts() -> dict[str, str]:
     return dict(_PROMPTS)
 
 
+def seek_nanobot_prompt(workspace_dir: Optional[str] = None) -> str:
+    """Actively seek the nanobot's system prompt from its workspace.
+
+    The nanobot assembles its system message from the workspace files
+    (SOUL.md — the personality/identity — plus AGENTS.md — the behavior
+    rules).  This reads them at launch (and re-reads on change, e.g.
+    after a dream pass updates the memory files) and registers the
+    assembled prompt so priming warms it into the KV-cache.
+
+    Returns the assembled prompt (also registered as "nanobot").
+    """
+    import os
+    base = workspace_dir or os.path.expanduser("~/.nanobot/workspace")
+    parts: list[str] = []
+    for fname in ("SOUL.md", "AGENTS.md"):
+        try:
+            path = os.path.join(base, fname)
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read().strip()
+            if text:
+                parts.append(text)
+        except OSError:
+            continue
+    assembled = "\n\n".join(parts)
+    if assembled:
+        register_prompt("nanobot", assembled)
+        _LAST_PRIMED.pop("nanobot", None)  # a change forces a re-prime
+    return assembled
+
+
 async def prime(port: int = 0) -> dict[str, bool]:
     """Prime every registered system prompt on the professional model.
 

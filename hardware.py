@@ -758,9 +758,14 @@ async def thermal_monitor_task(
                 # prompts through the model once so the KV-cache holds the
                 # processed prefixes — the next request with the same system
                 # message starts streaming almost immediately (no prefill).
+                # The nanobot prompt is ACTIVELY SEEKED from its workspace
+                # (SOUL.md + AGENTS.md) on every window — a dream pass that
+                # updates the memory files changes the mtime, which forces a
+                # re-prime of the refreshed prompt.
                 if state.gpu_vram_used_gb < GPU_BUSY_VRAM_GB:
                     try:
-                        from prompt_cache import prime
+                        from prompt_cache import prime, seek_nanobot_prompt
+                        seek_nanobot_prompt()
                         port = await systemd.get_port("professional")
                         await prime(port=port)
                     except (OSError, ValueError, AttributeError):

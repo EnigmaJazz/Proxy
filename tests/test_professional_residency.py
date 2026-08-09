@@ -180,6 +180,24 @@ class TestPromptPriming:
         pc.register_observed_system_prompt("openwebui", "New prompt.")
         assert pc.registered_prompts()["observed:openwebui"] == "New prompt."
 
+    def test_seek_nanobot_prompt_registers_and_refreshes(
+        self, tmp_path: Any,
+    ) -> None:
+        import prompt_cache as pc
+        pc._PROMPTS.clear()
+        pc._LAST_PRIMED.clear()
+        (tmp_path / "SOUL.md").write_text("I am nanobot. Soul text.", encoding="utf-8")
+        (tmp_path / "AGENTS.md").write_text("Be concise.", encoding="utf-8")
+        assembled = pc.seek_nanobot_prompt(str(tmp_path))
+        assert "I am nanobot. Soul text." in assembled
+        assert "Be concise." in assembled
+        assert pc.registered_prompts().get("nanobot") == assembled
+        # a change (e.g. after a dream) refreshes the registration
+        (tmp_path / "SOUL.md").write_text("I am nanobot v2. Updated by dream.", encoding="utf-8")
+        assembled2 = pc.seek_nanobot_prompt(str(tmp_path))
+        assert "Updated by dream" in assembled2
+        assert pc.registered_prompts().get("nanobot") == assembled2
+
     def test_prime_runs_registered_prompts(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import prompt_cache as pc
         pc._PROMPTS.clear()

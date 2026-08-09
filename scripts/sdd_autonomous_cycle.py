@@ -103,6 +103,12 @@ SDD SESSION PREFLIGHT (user-supplied, do NOT ask):
 
 Run the complete SDD cycle end-to-end now.
 
+LOCAL-MODEL DELEGATION RULE (MANDATORY): when delegating code work to
+the LOCAL model (apply's local writer), delegate ONE FILE at a time —
+one task per file — for big tasks.  Never bundle multiple files into a
+single local-model task: the local context window is limited, and a
+per-file task keeps each delegation within budget.
+
 TOOL RETRY RULE (MANDATORY): when a tool call fails with a transient
 error (e.g. "Tool execution aborted", connection resets), retry the
 tool ONCE immediately before giving up.  The serve's tool runner

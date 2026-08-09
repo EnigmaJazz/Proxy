@@ -86,6 +86,10 @@ _SDD_AUTONOMOUS_SYSTEM_PROMPT = (
     "progress (e.g. 'SDD: exploring', 'SDD: proposing', ...).\n"
     "- Apply the Gatekeeper between phases; on failure fix once or abort "
     "with a clear error - never loop.\n"
+    "- LOCAL-MODEL DELEGATION (MANDATORY): when delegating code work to "
+    "the LOCAL model (apply's local writer), delegate ONE FILE at a time "
+    "— one task per file — for big tasks; never bundle multiple files "
+    "into one local-model task (the local context window is limited).\n"
     "- TOOL RETRY (MANDATORY): when a tool call fails with a transient "
     "error (e.g. \"Tool execution aborted\", connection reset), retry the "
     "tool ONCE immediately before giving up - the serve's tool runner "
@@ -825,6 +829,10 @@ async def opencode_chat_stream(
                         pending_permissions=pending_permissions,
                     )
                     session_id = None
+            # True when the session_id came from the session map (a pin),
+            # NOT from a fresh POST /session below — only resumed sessions
+            # seed the poll-state with pre-existing history.
+            resumed = session_id is not None
             if not session_id:
                 resp = await client.post(
                     f"{OPENCODE_SERVE_URL}/session",
@@ -858,6 +866,15 @@ async def opencode_chat_stream(
             tool_state: dict[str, str] = {}
             pending_done = False
             session_busy = True  # assume working until a status event says idle
+            seen_question_pids: set[str] = set()
+            if resumed:
+                # Seed part state for the resumed conversation so the
+                # polling fallback never replays history or re-surfaces a
+                # stale question that kills the stream.  Best-effort.
+                await _seed_resumed_session_state(
+                    client, session_id, user_mids, text_lens,
+                    tool_state, seen_question_pids,
+                )
             # Open the event bus BEFORE sending the message: the bus is
             # fire-and-forget (no replay), so connecting after prompt_async
             # misses the early events (user message, assistant start, first
@@ -956,6 +973,7 @@ async def opencode_chat_stream(
                             cycle_content = False
                             async for delta in _poll_session_deltas(
                                 client, session_id, user_mids, text_lens, tool_state,
+                                seen_question_pids,
                             ):
                                 if delta[0] == "question":
                                     yield delta
@@ -1201,6 +1219,7 @@ async def opencode_chat_stream(
                             continue
                         async for delta in _yield_part_deltas(
                             part, text_lens, tool_state, session_id, client,
+                            seen_question_pids,
                         ):
                             if delta[0] == "_step_finish":
                                 pending_done = True
@@ -1247,6 +1266,7 @@ async def _yield_part_deltas(
     tool_state: dict[str, str],
     session_id: str,
     client: httpx.AsyncClient,
+    seen_question_pids: Optional[set[str]] = None,
 ) -> AsyncIterator[tuple[str, str]]:
     """Yield stream deltas for one opencode part (shared by the event bus
     and the polling fallback).
@@ -1283,6 +1303,12 @@ async def _yield_part_deltas(
     if ptype == "tool":
         name = str(part.get("tool") or "")
         if name == "question":
+            # Seeded history — suppress the stale question BEFORE the
+            # fetch-retry loop: the part existed before this request, so
+            # re-yielding it would stop the stream with the user's old
+            # question instead of streaming the new turn.
+            if seen_question_pids and pid in seen_question_pids:
+                return
             # The agent is asking the user.  The event part often omits the
             # input; fetch the persisted part to read state.input.questions[].
             # A single question OR a MULTI-GROUP preflight (SDD Session
@@ -1538,12 +1564,65 @@ async def _session_busy_on_current_serve(
     return False
 
 
+async def _seed_resumed_session_state(
+    client: httpx.AsyncClient,
+    session_id: str,
+    user_mids: set[str],
+    text_lens: dict[str, int],
+    tool_state: dict[str, str],
+    seen_question_pids: set[str],
+) -> None:
+    """Best-effort seed of per-call part state for a RESUMED pinned session.
+
+    The per-call text_lens/tool_state/user_mids are normally fed only by
+    live events; when the /event bus closes, the polling fallback re-scans
+    the FULL message list and re-yields history (old text, thinking, tool
+    chunks, and a stale question that stops the stream).  Seeding the
+    existing part state (text lengths, tool states, assistant message ids,
+    question part ids) once before the prompt lets the polling deltas
+    suppress everything that existed BEFORE this request.  Never raises:
+    a failed seed degrades to the current replay behavior.
+    """
+    try:
+        resp = await client.get(
+            f"{OPENCODE_SERVE_URL}/session/{session_id}/message", timeout=10.0,
+        )
+        if resp.status_code != 200:
+            return
+        body = resp.json()
+        if not isinstance(body, list):
+            # Malformed/dict bodies (e.g. an error object) must not raise.
+            return
+        for m in body:
+            role = (m.get("info") or {}).get("role")
+            if role == "assistant":
+                mid = m.get("id")
+                if mid:
+                    user_mids.add(mid)
+                for p in m.get("parts") or []:
+                    pid = str(p.get("id") or "")
+                    ptype = p.get("type")
+                    if ptype in ("text", "reasoning"):
+                        text = str(p.get("text") or "")
+                        if text:
+                            text_lens[pid] = len(text)
+                    elif ptype == "tool":
+                        status = str((p.get("state") or {}).get("status") or "")
+                        if status:
+                            tool_state[pid] = status
+                        if p.get("tool") == "question" and pid:
+                            seen_question_pids.add(pid)
+    except (httpx.HTTPError, OSError, ValueError):
+        return
+
+
 async def _poll_session_deltas(
     client: httpx.AsyncClient,
     session_id: str,
     user_mids: set[str],
     text_lens: dict[str, int],
     tool_state: dict[str, str],
+    seen_question_pids: Optional[set[str]] = None,
 ) -> AsyncIterator[tuple[str, str]]:
     """Poll a session's message list for new parts (used when the /event SSE
     bus closes but the session is still busy).  Yields deltas; the CALLER
@@ -1562,6 +1641,7 @@ async def _poll_session_deltas(
                     continue
                 async for delta in _yield_part_deltas(
                     p, text_lens, tool_state, session_id, client,
+                    seen_question_pids,
                 ):
                     if delta[0] == "question":
                         yield delta
@@ -1572,6 +1652,24 @@ async def _poll_session_deltas(
 
 
 
+
+
+_DRAIN_PROBES = 4
+_DRAIN_PROBE_S = 0.25
+
+
+async def _drain_serve_shutdown() -> None:
+    """Boundedly wait for the killed serve listener to stop.
+
+    is_opencode_serve_running() answers True mid-SIGTERM, so
+    ensure_opencode_serve would otherwise skip the respawn and the stream
+    POSTs into a dying listener.  Poll a few times and return — never
+    raises, never exceeds the budget.
+    """
+    for _ in range(_DRAIN_PROBES):
+        if not await is_opencode_serve_running():
+            return
+        await asyncio.sleep(_DRAIN_PROBE_S)
 
 
 async def _recycle_serve_if_low_memory() -> None:
@@ -1601,6 +1699,7 @@ async def _recycle_serve_if_low_memory() -> None:
                 os.kill(pid, 15)
             except (OSError, ProcessLookupError):
                 pass
+            await _drain_serve_shutdown()
     except (OSError, ValueError):
         return
 
@@ -1622,6 +1721,7 @@ async def _force_recycle_serve(reason: str = "long-lived call") -> None:
         if pid:
             logger.warning("Forcing opencode serve recycle (%s)", reason)
             os.kill(pid, 15)
+            await _drain_serve_shutdown()
     except (OSError, ProcessLookupError):
         pass
     except (OSError, ValueError):
@@ -1757,10 +1857,22 @@ def _find_serve_pid(port: str) -> Optional[int]:
                 # spaces — the old space-form match NEVER matched any
                 # process, so serve recycling (age, low-memory, wedge
                 # recovery) silently did nothing and a wedged tool runner
-                # lived forever.  Normalize NULs to spaces before matching.
-                cmd = cmd.replace("\x00", " ")
-                if "opencode" in cmd and "serve" in cmd and f"--port {port}" in cmd:
+                # lived forever.  Normalize NULs to spaces and tokenize
+                # before matching.  PORT MATCHING IS EXACT ONLY: neither a
+                # longer advertised value (--port 189990 vs search "18999")
+                # nor a shorter search (--port 18999 vs search "1899") may
+                # match (prefix-false-positive bug, cycle 9).
+                tokens = cmd.replace("\x00", " ").split()
+                if not any("opencode" in tok for tok in tokens) or "serve" not in tokens:
+                    continue
+                if f"--port={port}" in tokens:
                     return int(entry)
+                for i, tok in enumerate(tokens):
+                    if (
+                        tok == "--port" and i + 1 < len(tokens)
+                        and tokens[i + 1] == port
+                    ):
+                        return int(entry)
             except (OSError, ValueError):
                 continue
     except OSError:

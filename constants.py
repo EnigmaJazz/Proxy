@@ -34,7 +34,7 @@ PROJECT_ROOT: Path = Path(__file__).resolve().parent
 RUNTIME_CONTEXT_WINDOWS: dict[str, int] = {
     "frontdesk": 12_288,
     "chatter": 32_768,
-    "professional": 65_536,
+    "professional": 131_072,
     "scholar": 32_768,
     "creative": 32_768,
     "architect": 32_768,

@@ -2582,8 +2582,8 @@ async def _apply_coding_decision_gate(
             question = (
                 f"{_CODING_QUESTION_PREFIX} Coding task detected — route to OpenCode, "
                 f"the local code pathway (Professional), or a full SDD cycle "
-                f"(spec → design → tasks → apply → verify)? Reply `opencode`, "
-                f"`local`, or `sdd`."
+                f"(proposal → spec → design → tasks → apply → verify → archive)? "
+                f"Reply `opencode`, `local`, or `sdd`."
             )
             # Advisory local-model difficulty assessment shown in the question.
             # Best-effort: any failure here must never block the gate, so the
@@ -2613,7 +2613,7 @@ async def _apply_coding_decision_gate(
                     question = (
                         f"{_CODING_QUESTION_PREFIX} Coding task detected — route to OpenCode, "
                         f"the local code pathway (Professional), or a full SDD cycle "
-                        f"(spec → design → tasks → apply → verify)?\n\n"
+                        f"(proposal → spec → design → tasks → apply → verify → archive)?\n\n"
                         f"🔍 Local model assessment: {difficulty} difficulty — "
                         f"recommends `{recommendation}`{reason_suffix}\n\n"
                         f"Reply `opencode`, `local`, or `sdd`."

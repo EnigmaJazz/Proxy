@@ -25,6 +25,8 @@ import re
 import sqlite3
 import subprocess
 import time
+from datetime import datetime
+import time
 import uuid
 from pathlib import Path
 import httpx
@@ -593,6 +595,32 @@ async def list_models(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
+def _inject_current_datetime(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Prepend the current date + time to the OUTBOUND copy's system
+    message.
+
+    Frontends (nanobot, OpenWebUI) never send the date, so the models
+    they drive run date-blind; the opencode app's own sessions do get a
+    date-only stamp.  This mirrors that on the proxy path with the full
+    date AND time.  R1 carve-out: only the outbound model-copy is
+    touched; the client's stored conversation and the DB audit copy are
+    never mutated.  Opt out per request with ``X-Proxy-Date-Time: off``.
+    """
+    now = datetime.now()
+    stamp = (
+        f"Today's date: {now.strftime('%A, %B %d, %Y')}. "
+        f"Current time: {now.strftime('%H:%M')}."
+    )
+    # Copy the list, never mutate: the client's stored conversation is
+    # preserved verbatim (the outbound copy gets the stamp).
+    messages = list(messages)
+    for i, m in enumerate(messages):
+        if m.get("role") == "system" and isinstance(m.get("content"), str):
+            messages[i] = {**m, "content": stamp + "\n\n" + m["content"]}
+            return messages
+    return [{"role": "system", "content": stamp}] + messages
+
+
 async def _govern_messages(
     request: Request,
     messages: list[dict[str, Any]],
@@ -613,6 +641,11 @@ async def _govern_messages(
     # Always strip proxy-owned status content (sentinel-prefixed) so the
     # model never sees its own triage/loading/tool-status echoed back.
     messages = strip_proxy_status(messages)
+    # Current date + time injection (R1 carve-out): frontends never send
+    # the date, so the models run date-blind; stamp the OUTBOUND system
+    # message.  Opt out per request with ``X-Proxy-Date-Time: off``.
+    if request.headers.get("x-proxy-date-time", "").strip().lower() != "off":
+        messages = _inject_current_datetime(messages)
     # Search-result enrichment (explicit user-approved R1 carve-out
     # extension): frontends execute search_web themselves and often return
     # thin SEO snippets; when that happens, append the proxy's own rich

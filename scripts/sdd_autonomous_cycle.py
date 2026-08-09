@@ -103,6 +103,12 @@ SDD SESSION PREFLIGHT (user-supplied, do NOT ask):
 
 Run the complete SDD cycle end-to-end now.
 
+TOOL RETRY RULE (MANDATORY): when a tool call fails with a transient
+error (e.g. "Tool execution aborted", connection resets), retry the
+tool ONCE immediately before giving up.  The serve's tool runner
+intermittently aborts in-flight tool executions (writes included);
+the retry normally succeeds.
+
 SUB-AGENT FALLBACK RULE (MANDATORY): delegate each SDD phase to its
 phase sub-agent (sdd-explore/sdd-propose/sdd-spec/sdd-design/sdd-tasks/
 sdd-apply/sdd-verify/sdd-archive) ONCE.  If a sub-agent's result does

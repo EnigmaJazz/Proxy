@@ -2333,8 +2333,17 @@ async def _opencode_task_response(
         )
 
     async def _stream() -> AsyncIterator[str]:
+        # The status line carries the TASK's identity so the stream can be
+        # discriminated from any other task asked in the meantime: the SDD
+        # change name (when the task text declares one) plus the task's
+        # first line.
+        _task_first = (task_text.strip().splitlines() or [""])[0]
+        _task_label = _task_first[:90] if _task_first else ""
+        _chg = re.search(r"CHANGE NAME:\s*([^\s]+)", task_text)
+        _chg_label = f" for {_chg.group(1)}" if _chg else ""
         status_msg = (
-            f"_⏳ [Proxy: Directing to OpenCode ({OPENCODE_AGENT} agent)...]_\n\n"
+            f"_⏳ [Proxy: Directing to OpenCode ({OPENCODE_AGENT} agent)"
+            f"{_chg_label}: {_task_label}]_\n\n"
         )
         yield f"data: {json.dumps(_make_system_chunk(status_msg))}\n\n"
         async for kind, text_delta in opencode_chat_stream(

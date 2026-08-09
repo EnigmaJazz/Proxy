@@ -42,6 +42,15 @@ def _artifacts_for(change: str) -> list[str]:
     return sorted(glob.glob(f"openspec/changes/{change}/*.md"))
 
 
+def _cycle_complete(change: str) -> bool:
+    """True when the change dir carries the archive-report.md marker --
+    the archive phase's report is the LAST artifact a full SDD cycle
+    writes (proposal.md alone only proves the cycle started)."""
+    return os.path.exists(
+        f"openspec/changes/{change}/archive-report.md",
+    )
+
+
 def build_task(change: str, code_writer: str = "local") -> str:
     """Compose the SDD task prompt for a change name.
 
@@ -141,7 +150,7 @@ async def main(change: str, code_writer: str = "local") -> None:
                 # Force-recycle + resume on the next attempt.
                 await opencode_bridge._force_recycle_serve("SDD cycle stalled")
                 continue
-            if _artifacts_for(change):
+            if _cycle_complete(change):
                 break
             print(f"[stream {attempt + 1} ended; cycle still working — waiting]",
                   flush=True)
@@ -150,7 +159,7 @@ async def main(change: str, code_writer: str = "local") -> None:
             # next attempt force-recycles + respawns + resumes the pin.
             dead_polls = 0
             for _ in range(int(ARTIFACT_WAIT_S / ARTIFACT_POLL_S)):
-                if _artifacts_for(change):
+                if _cycle_complete(change):
                     break
                 serve_up = await opencode_bridge.is_opencode_serve_running()
                 dead_polls = 0 if serve_up else dead_polls + 1
@@ -158,7 +167,7 @@ async def main(change: str, code_writer: str = "local") -> None:
                     print("[serve down; resuming pinned session]", flush=True)
                     break
                 await asyncio.sleep(ARTIFACT_POLL_S)
-            if _artifacts_for(change):
+            if _cycle_complete(change):
                 break
     except SystemExit:
         raise

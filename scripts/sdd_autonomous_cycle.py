@@ -71,7 +71,15 @@ SDD SESSION PREFLIGHT (user-supplied, do NOT ask):
 - Review budget: 400 lines
 - Code writer: {writer_label}
 
-Run the complete SDD cycle end-to-end now."""
+Run the complete SDD cycle end-to-end now.
+
+SUB-AGENT FALLBACK RULE (MANDATORY): delegate each SDD phase to its
+phase sub-agent (sdd-explore/sdd-propose/sdd-spec/sdd-design/sdd-tasks/
+sdd-apply/sdd-verify/sdd-archive) ONCE.  If a sub-agent's result does
+not arrive (the task tool hangs or errors), DO NOT retry the sub-agent:
+perform that phase INLINE yourself — write the phase artifact directly
+with your own tools (read/write/edit/bash) and continue to the next
+phase.  Inline phase work is always acceptable and often faster."""
 
 
 def build_parser() -> argparse.ArgumentParser:

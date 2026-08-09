@@ -66,6 +66,8 @@ class _FakeClient:
         self.message_parts: list[dict[str, Any]] = []
         self.get_status = 200
         self.raise_on = ""
+        self.raise_timeout_on = ""
+        self.get_timeouts: list[Any] = []
         self.stream_lines: list[str] = []
         self.message_get_parts: list[dict[str, Any]] = []
 
@@ -77,8 +79,11 @@ class _FakeClient:
 
     async def get(self, url: str, **kwargs: Any) -> _FakeResp:
         self.calls.append(("get", url))
+        self.get_timeouts.append(kwargs.get("timeout"))
         if self.raise_on == "get":
             raise httpx.ConnectError("conn refused")
+        if self.raise_timeout_on == "get":
+            raise httpx.ReadTimeout("read timed out")
         if "/message/" in url:
             # Persisted-message GET used by the question retry-race fetch.
             return _FakeResp(200, {"info": {}, "parts": self.message_get_parts})
@@ -400,6 +405,105 @@ class TestIsRunning:
     async def test_not_running_on_error(self, fake_client: _FakeClient) -> None:
         fake_client.raise_on = "get"
         assert await is_opencode_serve_running() is False
+
+    @pytest.mark.parametrize("status", [200, 302, 404, 500])
+    @pytest.mark.asyncio
+    async def test_alive_for_any_status(
+        self, fake_client: _FakeClient, status: int,
+    ) -> None:
+        """REQ-1 Scenario-1: ANY received HTTP response — 2xx, 3xx, 4xx,
+        5xx — proves the serve transport is alive (the port is held)."""
+        fake_client.get_status = status
+        assert await is_opencode_serve_running() is True
+
+    @pytest.mark.asyncio
+    async def test_not_running_on_read_timeout(
+        self, fake_client: _FakeClient,
+    ) -> None:
+        """REQ-2 Scenario-1: a connection established but no complete
+        response within the window (ReadTimeout) means down — no explicit
+        body read ever runs."""
+        fake_client.raise_timeout_on = "get"
+        assert await is_opencode_serve_running() is False
+
+    @pytest.mark.asyncio
+    async def test_probe_uses_three_second_timeout(
+        self, fake_client: _FakeClient,
+    ) -> None:
+        """REQ-2: the probe uses a 3.0s client timeout (was 5.0s)."""
+        await is_opencode_serve_running()
+        assert fake_client.get_timeouts == [3.0]
+
+    @pytest.mark.parametrize("status", [404, 500])
+    @pytest.mark.asyncio
+    async def test_no_spawn_when_404_500_alive(
+        self, monkeypatch: pytest.MonkeyPatch,
+        fake_client: _FakeClient, status: int,
+    ) -> None:
+        """REQ-3 Scenario-1: a live responder answering 404 or 5xx holds
+        the port — ensure_opencode_serve() must NOT spawn a duplicate or
+        replacement process."""
+        from opencode_bridge import ensure_opencode_serve
+
+        spawn_calls: list[Optional[float]] = []
+
+        async def _spawn_recorder(mtime: Optional[float]) -> bool:
+            spawn_calls.append(mtime)
+            return True
+
+        fake_client.get_status = status
+        monkeypatch.setattr(opencode_bridge, "_config_mtime", lambda: None)
+        monkeypatch.setattr(opencode_bridge, "_spawn_serve", _spawn_recorder)
+
+        ok = await ensure_opencode_serve()
+        assert ok is True
+        assert spawn_calls == []
+
+    @pytest.mark.asyncio
+    async def test_drain_bounded_to_four_probes(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """REQ-3 Scenario-2: the config-drift drain is capped — at most
+        four drain probes and exactly four 0.25s sleeps (≈4 × (3.0s + 0.25s)
+        ≈ 13s worst case), then exactly one respawn."""
+        from opencode_bridge import ensure_opencode_serve
+
+        probe_calls: list[bool] = []
+
+        async def _always_running() -> bool:
+            probe_calls.append(True)
+            return True
+
+        sleeps: list[float] = []
+
+        async def _sleep_recorder(delay: float) -> None:
+            sleeps.append(delay)
+
+        async def _noop() -> None:
+            return None
+
+        spawn_calls: list[Optional[float]] = []
+
+        async def _spawn_recorder(mtime: Optional[float]) -> bool:
+            spawn_calls.append(mtime)
+            return True
+
+        monkeypatch.setattr(opencode_bridge, "_serve_config_mtime", 1000.0)
+        monkeypatch.setattr(opencode_bridge, "_config_mtime", lambda: 2000.0)
+        monkeypatch.setattr(
+            opencode_bridge, "is_opencode_serve_running", _always_running,
+        )
+        monkeypatch.setattr(opencode_bridge.asyncio, "sleep", _sleep_recorder)
+        monkeypatch.setattr(opencode_bridge, "_force_recycle_serve", _noop)
+        monkeypatch.setattr(opencode_bridge, "_spawn_serve", _spawn_recorder)
+
+        ok = await ensure_opencode_serve()
+        assert ok is True
+        # 1 initial spawn-gate probe + at most 4 drain probes.
+        assert len(probe_calls) - 1 <= 4
+        # Exactly four 0.25s drain sleeps, never more.
+        assert sleeps == [0.25, 0.25, 0.25, 0.25]
+        assert len(spawn_calls) == 1
 
 
 class TestEscalation:

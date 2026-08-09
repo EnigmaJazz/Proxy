@@ -404,11 +404,21 @@ def _strip_proxy_status_text(text: str) -> str:
 
 
 async def is_opencode_serve_running() -> bool:
-    """True when the headless opencode serve backend answers."""
+    """True when a complete HTTP response arrives from the serve transport.
+
+    Transport-liveness semantics: ANY received HTTP response — 2xx, 3xx,
+    4xx, or 5xx — proves a process holds the configured port, so a
+    non-2xx responder (version-specific, missing, or degraded /config)
+    still blocks a duplicate spawn.  Only an ``httpx.HTTPError``
+    (ConnectError / ConnectTimeout / ReadTimeout) or ``OSError`` means
+    down.  The buffered ``.get()`` completion is the received-response
+    boundary; the body is never explicitly read and the status is never
+    interpreted.
+    """
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.get(f"{OPENCODE_SERVE_URL}/config", timeout=5.0)
-            return resp.status_code == 200
+            await client.get(f"{OPENCODE_SERVE_URL}/config", timeout=3.0)
+            return True
     except (httpx.HTTPError, OSError):
         return False
 

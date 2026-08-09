@@ -633,8 +633,8 @@ async def reclassify_with_professional(
             f"REQUEST CONTEXT:\n{user_text[:4000]}"
         )
         port = model_port or 13109  # professional default port
-        text = await asyncio.to_thread(
-            call_model, port, prompt, max_tokens=256,
+        text = await asyncio.wait_for(
+            call_model(port, prompt, max_tokens=256), timeout=15.0,
         )
         payload = _safe_json_parse(text)
         if not isinstance(payload, dict):

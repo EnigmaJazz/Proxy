@@ -794,8 +794,14 @@ async def _opencode_chat_attempt(
             or "[OpenCode Bridge Error: empty response.]",
             False,
         )
-    except (httpx.HTTPError, OSError, ValueError) as exc:
+    except (httpx.ConnectError, httpx.ConnectTimeout,
+            httpx.RemoteProtocolError, OSError) as exc:
         return f"[OpenCode Bridge Network Error: {str(exc)}]", True
+    except (httpx.HTTPError, ValueError) as exc:
+        # ReadTimeout / malformed body: the serve may be healthy and the
+        # agent still working.  NEVER recycle on these — the respawn would
+        # SIGTERM the serve and destroy every concurrent session.
+        return f"[OpenCode Bridge Error: {str(exc)}]", False
 
 
 async def opencode_chat_stream(

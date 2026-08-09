@@ -215,14 +215,24 @@ async def main(change: str, code_writer: str = "local") -> None:
             # next attempt force-recycles + respawns + resumes the pin.
             dead_polls = 0
             wait_budget = int(ARTIFACT_WAIT_S / ARTIFACT_POLL_S)
+            busy_resets = 0
             while wait_budget > 0:
                 if _cycle_complete(change):
                     break
                 if await _serve_sessions_active():
                     # Sessions are busy doing real work (the parts lag) —
                     # reset the budget and keep waiting, never resume
-                    # against a working phase.
-                    wait_budget = int(ARTIFACT_WAIT_S / ARTIFACT_POLL_S)
+                    # against a working phase.  BOUNDED: a session stuck
+                    # 'busy' forever (the serve reports prompt_async
+                    # sessions busy even after completion) must not keep
+                    # the driver waiting indefinitely — after
+                    # MAX_BUSY_RESETS the budget drains and the resume/
+                    # recycle recovery fires.
+                    busy_resets += 1
+                    if busy_resets <= 6:
+                        wait_budget = int(ARTIFACT_WAIT_S / ARTIFACT_POLL_S)
+                else:
+                    busy_resets = 0
                 serve_up = await opencode_bridge.is_opencode_serve_running()
                 dead_polls = 0 if serve_up else dead_polls + 1
                 if dead_polls >= 3:  # ~60s with a dead serve → resume now

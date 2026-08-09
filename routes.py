@@ -2610,13 +2610,19 @@ async def _apply_coding_decision_gate(
         decisions[session_id] = decision
         logger.info("Coding decision for session %s: %s", session_id, decision)
         task_messages = messages[:question_idx]  # task = convo up to the question
-        if decision == "opencode":
+        if decision in ("opencode", "sdd"):
+            is_sdd = decision == "sdd"
             resp = await _opencode_task_response(
                 _last_user_text(task_messages),
                 client_stream,
                 session_map=_opencode_session_state(app),
                 session_key=session_id,
                 pending_permissions=_pending_permissions_state(app),
+                system_prompt=(
+                    _SDD_AUTONOMOUS_SYSTEM_PROMPT if is_sdd else _BRIDGE_SYSTEM_PROMPT
+                ),
+                timeout=OPENCODE_SDD_TIMEOUT if is_sdd else OPENCODE_SERVE_TIMEOUT,
+                autonomous=is_sdd,
             )
             await _persist_opencode_sessions(app)
             return resp

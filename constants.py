@@ -245,7 +245,7 @@ BRIDGE_MODEL_KEYS: frozenset[str] = frozenset({"opencode", "opencode-sdd"})
 # agentic task; the SDD-autonomous mode runs the FULL cycle (proposal →
 # spec → design → tasks → apply → verify → archive) in one long-lived
 # turn, so it gets a much larger budget.
-OPENCODE_SDD_TIMEOUT: float = 3600.0
+OPENCODE_SDD_TIMEOUT: float = 7200.0
 
 # Queue-worker escalation backend after local tiers are exhausted:
 # "opencode" → headless opencode serve (build agent);

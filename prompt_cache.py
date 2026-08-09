@@ -94,7 +94,7 @@ def seek_nanobot_prompt(workspace_dir: Optional[str] = None) -> str:
         except OSError:
             continue
     assembled = "\n\n".join(parts)
-    if assembled:
+    if assembled and _PROMPTS.get("nanobot") != assembled:
         register_prompt("nanobot", assembled)
         _LAST_PRIMED.pop("nanobot", None)  # a change forces a re-prime
     return assembled
@@ -115,11 +115,13 @@ async def prime(port: int = 0) -> dict[str, bool]:
             results[name] = True  # already primed recently — skip
             continue
         try:
-            await asyncio.to_thread(
-                call_model,
-                port or 13109,
-                f"{prompt}\n\nSay OK.",
-                max_tokens=4,
+            await asyncio.wait_for(
+                call_model(
+                    port or 13109,
+                    f"{prompt}\n\nSay OK.",
+                    max_tokens=4,
+                ),
+                timeout=30.0,
             )
             _LAST_PRIMED[name] = now
             results[name] = True

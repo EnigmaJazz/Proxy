@@ -205,7 +205,7 @@ class TestPromptPriming:
         pc.register_prompt("nanobot", "You are nanobot.")
         calls: list[tuple[int, str]] = []
 
-        def fake_call(port: int, prompt: str, max_tokens: int = 2048) -> str:
+        async def fake_call(port: int, prompt: str, max_tokens: int = 2048) -> str:
             calls.append((port, prompt))
             return "OK"
 

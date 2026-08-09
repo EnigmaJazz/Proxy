@@ -759,6 +759,16 @@ async def chat_completions(request: Request) -> Response:
             if isinstance(m.get("content"), str)
         ).lower()
         is_dream = await is_dream_process(raw_text)
+        # LOCAL-APPLY BYPASS: the opencode serve's kinver calls for the
+        # sdd-apply-local agent (the task text always starts 'You are the
+        # apply executor for SDD change') must NEVER be triaged or sent
+        # through the coding gate — the user explicitly chose the LOCAL
+        # model for the apply, so the request goes straight to the
+        # professional service (mirrors the dream-request bypass).
+        is_apply_local = (
+            "you are the apply executor for sdd change" in raw_text
+            or "you are the apply executor for sd" in raw_text
+        )
 
         effective_domain = model_domain if model_domain in (
             "coder", "architect", "professional", "creative", "scholar",
@@ -1226,6 +1236,24 @@ async def chat_completions(request: Request) -> Response:
             project_id="general",
             is_factual=False,
             is_lane_b=True,
+            bypass_frontdesk=True,
+        )
+    elif is_apply_local:
+        # LOCAL-APPLY BYPASS (2026-08-09): the request is the opencode
+        # serve's sdd-apply-local delegation — the user explicitly chose
+        # the local model.  Pin professional directly, no frontdesk
+        # triage, no coding gate.
+        port = await systemd.get_port("professional")
+        route = RouteDecision(
+            model_key="professional",
+            port=port,
+            is_cpu_fallback=False,
+            hardware_path="gpu",
+            priority=1,
+            intent="CODE",
+            project_id="general",
+            is_factual=False,
+            is_lane_b=False,
             bypass_frontdesk=True,
         )
     else:
@@ -2493,8 +2521,8 @@ async def _apply_coding_decision_gate(
     opencode routing, or the professional decision turn), or ``None`` to
     continue the normal flow.
     """
-    if route.is_lane_b:
-        return None  # opencode caller → local model directly, never prompt
+    if route.is_lane_b or route.bypass_frontdesk:
+        return None  # opencode caller / pinned local apply → direct, never prompt
 
     decisions = _coding_decision_state(app)
 

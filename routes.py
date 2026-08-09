@@ -732,6 +732,20 @@ async def chat_completions(request: Request) -> Response:
     lane_b = is_lane_b(headers)
     is_dream = False
 
+    # ---- Prompt-priming observation (best-effort): register the caller's
+    # system message so the residency loop can prime it into the
+    # professional's KV-cache (faster time-to-first-token for the
+    # frontend's large fixed system prompt).  Never blocks, never raises.
+    try:
+        from prompt_cache import register_observed_system_prompt
+        _sys_msg = next(
+            (m.get("content") for m in messages if m.get("role") == "system"),
+            None,
+        )
+        register_observed_system_prompt(caller_type or "unknown", _sys_msg)
+    except (OSError, ValueError, StopIteration):
+        pass
+
     # ---- Prepare messages (Glass Pipe Rule: NO text alteration) ------------
     processed_messages: list[dict[str, Any]] = list(messages)  # Shallow copy
 

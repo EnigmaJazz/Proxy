@@ -165,6 +165,44 @@ class TestEnsureProfessionalResident:
         assert ctrl.active_heavy_model is None
 
 
+class TestPromptPriming:
+    """The prompt registry + priming keep the professional's KV-cache warm."""
+
+    def test_register_and_observed(self) -> None:
+        import prompt_cache as pc
+        pc._PROMPTS.clear()
+        pc.register_prompt("nanobot", "You are nanobot. Be helpful.")
+        pc.register_observed_system_prompt("openwebui", "You are OpenWebUI.")
+        reg = pc.registered_prompts()
+        assert reg["nanobot"] == "You are nanobot. Be helpful."
+        assert reg["observed:openwebui"] == "You are OpenWebUI."
+        # refresh on change
+        pc.register_observed_system_prompt("openwebui", "New prompt.")
+        assert pc.registered_prompts()["observed:openwebui"] == "New prompt."
+
+    def test_prime_runs_registered_prompts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import prompt_cache as pc
+        pc._PROMPTS.clear()
+        pc._LAST_PRIMED.clear()
+        pc.register_prompt("nanobot", "You are nanobot.")
+        calls: list[tuple[int, str]] = []
+
+        def fake_call(port: int, prompt: str, max_tokens: int = 2048) -> str:
+            calls.append((port, prompt))
+            return "OK"
+
+        monkeypatch.setattr("prompt_cache.call_model", fake_call)
+        import asyncio
+        results = asyncio.run(pc.prime(port=13109))
+        assert results == {"nanobot": True}
+        assert len(calls) == 1
+        assert calls[0][0] == 13109
+        assert "Say OK" in calls[0][1]
+        # re-prime within the interval is skipped
+        results2 = asyncio.run(pc.prime(port=13109))
+        assert len(calls) == 1
+
+
 class TestThermalMonitorWiring:
     @pytest.mark.asyncio
     async def test_monitor_calls_residency_check_with_vram(

@@ -48,6 +48,7 @@ from constants import (
     TELEGRAM_CHAT_ID,
     SENSOR_INTERVAL,
     PROFESSIONAL_RESIDENT_CHECK_S,
+    GPU_BUSY_VRAM_GB,
     _machine,
     _KINVER_HOME,
     metric_cpu_temp,
@@ -752,6 +753,18 @@ async def thermal_monitor_task(
                     state.gpu_vram_used_gb,
                 )
                 await systemd.ensure_professional_resident(state.gpu_vram_used_gb)
+                # Prompt priming (2026-08-09): when professional is resident
+                # and the GPU is idle, run the registered frontend system
+                # prompts through the model once so the KV-cache holds the
+                # processed prefixes — the next request with the same system
+                # message starts streaming almost immediately (no prefill).
+                if state.gpu_vram_used_gb < GPU_BUSY_VRAM_GB:
+                    try:
+                        from prompt_cache import prime
+                        port = await systemd.get_port("professional")
+                        await prime(port=port)
+                    except (OSError, ValueError, AttributeError):
+                        pass
 
             # ---- Thermal threshold enforcement -------------------------------
             # Only real temperature sensors belong in the zone map. RAM usage

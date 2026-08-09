@@ -12,6 +12,7 @@ import glob
 import os
 import sys
 import time
+import httpx
 
 sys.path.insert(0, ".")
 
@@ -41,6 +42,35 @@ MAX_STREAM_ATTEMPTS: int = 12
 def _artifacts_for(change: str) -> list[str]:
     """Sorted *.md artifacts for a change dir (or [])."""
     return sorted(glob.glob(f"openspec/changes/{change}/*.md"))
+
+
+async def _serve_sessions_active() -> bool:
+    """True when ANY session on the serve has a running tool part (the
+    session is busy generating/executing, not stalled).
+
+    The session parts' timestamps LAG (the serve's storage writes parts
+    late), so a quiet-looking phase is often still working — the model
+    calls keep flowing through the go-proxy.  The driver must not resume
+    against busy sessions; only a serve with NO working session is a
+    genuine stall candidate (2026-08-09).
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"{OPENCODE_SERVE_URL}/session/status", timeout=10.0,
+            )
+            if resp.status_code != 200:
+                return False
+            status_map = resp.json()
+            if not isinstance(status_map, dict):
+                return False
+            return any(
+                (s.get("type") == "busy" or bool(s.get("running")))
+                for s in status_map.values()
+                if isinstance(s, dict)
+            )
+    except (httpx.HTTPError, ValueError, OSError):
+        return False
 
 
 def _cycle_complete(change: str) -> bool:
@@ -172,15 +202,22 @@ async def main(change: str, code_writer: str = "local") -> None:
             # Resume EARLY when the serve dies (its sessions stall): the
             # next attempt force-recycles + respawns + resumes the pin.
             dead_polls = 0
-            for _ in range(int(ARTIFACT_WAIT_S / ARTIFACT_POLL_S)):
+            wait_budget = int(ARTIFACT_WAIT_S / ARTIFACT_POLL_S)
+            while wait_budget > 0:
                 if _cycle_complete(change):
                     break
+                if await _serve_sessions_active():
+                    # Sessions are busy doing real work (the parts lag) —
+                    # reset the budget and keep waiting, never resume
+                    # against a working phase.
+                    wait_budget = int(ARTIFACT_WAIT_S / ARTIFACT_POLL_S)
                 serve_up = await opencode_bridge.is_opencode_serve_running()
                 dead_polls = 0 if serve_up else dead_polls + 1
                 if dead_polls >= 3:  # ~60s with a dead serve → resume now
                     print("[serve down; resuming pinned session]", flush=True)
                     break
                 await asyncio.sleep(ARTIFACT_POLL_S)
+                wait_budget -= 1
             if _cycle_complete(change):
                 break
     except SystemExit:

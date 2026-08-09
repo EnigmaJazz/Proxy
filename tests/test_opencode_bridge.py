@@ -84,6 +84,11 @@ class _FakeClient:
         self.raise_on_stream: bool = False
         self.fail_get_after: Optional[int] = None
         self._get_count: int = 0
+        # Serve-lifecycle scripting (bridge-cycle-4): a scripted
+        # /session/status map (REQ-2 stale-pin tests) and a scripted
+        # N-message-POST transport failure (REQ-4 blocking respawn tests).
+        self.status_map: Optional[dict[str, Any]] = None
+        self.fail_post_times: int = 0
 
     async def __aenter__(self) -> "_FakeClient":
         return self
@@ -106,6 +111,11 @@ class _FakeClient:
             return _FakeResp(200, {"info": {}, "parts": self.message_get_parts})
         if "/session/status" in url:
             # Event-stream end → polling fallback → session is idle (done).
+            # REQ-2 (bridge-cycle-4): a scripted status_map overrides the
+            # default so tests can assert stale-pin drop (map without the
+            # pinned id) and pin retention on a failed fetch.
+            if self.status_map is not None:
+                return _FakeResp(200, self.status_map)
             return _FakeResp(200, {self.session_id: {"type": "idle"}})
         if url.endswith("/permission"):
             # Blocking-path permission poll (opencode_chat hardening).
@@ -122,6 +132,12 @@ class _FakeClient:
             # pinned to "/message" URLs so the session-create POST still
             # succeeds and the abort path can be asserted.
             raise httpx.ReadTimeout("read timed out")
+        if self.fail_post_times and "/message" in url:
+            # REQ-4 (bridge-cycle-4): scripted transport failure on the
+            # blocking message POST — decrements per call so the bounded
+            # respawn retry can be exercised deterministically.
+            self.fail_post_times -= 1
+            raise httpx.ConnectError("conn refused")
         if self.message_hang_s and "/message" in url:
             await asyncio.sleep(self.message_hang_s)
         if url.endswith("/session"):
@@ -1162,6 +1178,35 @@ class _PollClient(_FakeClient):
         return await super().get(url, **kwargs)
 
 
+class _SeedPollClient(_PollClient):
+    """_PollClient variant whose FIRST /session/{id}/message list GET serves
+    the scripted seed history (the resumed-session pre-prompt seed read);
+    every later list GET delegates to ``_PollClient.get`` (poll_messages).
+
+    Faithful to reality: at seed time the new turn has not been POSTed yet,
+    so seed content is history-only.  ``seed_status``/``raise_on_seed``
+    script seed failures; existing ``_PollClient`` tests never set
+    ``seed_messages``, so this subclass never changes their behavior."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.seed_messages: list[dict[str, Any]] = []
+        self.seed_status: int = 200
+        self.raise_on_seed: bool = False
+        self._seed_served: bool = False
+
+    async def get(self, url: str, **kwargs: Any) -> _FakeResp:
+        if (
+            not self._seed_served
+            and url.endswith(f"/session/{self.session_id}/message")
+        ):
+            self._seed_served = True
+            if self.raise_on_seed:
+                raise httpx.ConnectError("conn refused")
+            return _FakeResp(self.seed_status, self.seed_messages)
+        return await super().get(url, **kwargs)
+
+
 def _assistant_msg(parts: list[dict[str, Any]]) -> dict[str, Any]:
     return {"info": {"role": "assistant"}, "parts": parts}
 
@@ -1253,6 +1298,242 @@ class TestToolStatePartKeyed:
             )
         ]
         assert deltas == [("status", "⚠️ bash failed\n")]
+
+
+class TestSeedResumedSessionState:
+    """_seed_resumed_session_state must seed text lengths, tool states,
+    assistant message ids, and seen question pids for a RESUMED session —
+    and never raise on failure (bridge-cycle-8 REQ-1)."""
+
+    @pytest.mark.asyncio
+    async def test_seeds_text_lens_tool_state_question_pids(self) -> None:
+        from opencode_bridge import _seed_resumed_session_state
+
+        client = _SeedPollClient()
+        client.seed_messages = [_assistant_msg([
+            {"id": "prt_old_text", "messageID": "msg_old", "type": "text",
+             "text": "old answer text"},
+            {"id": "prt_old_reason", "messageID": "msg_old", "type": "reasoning",
+             "text": "old chain of thought"},
+            {"id": "prt_old_tool", "messageID": "msg_old", "type": "tool",
+             "tool": "bash", "state": {"status": "completed"}},
+            {"id": "prt_q", "messageID": "msg_old", "type": "tool",
+             "tool": "question",
+             "state": {"status": "running", "input": {"question": "old?"}}},
+        ])]
+        client.seed_messages[0]["id"] = "msg_old"
+
+        user_mids: set[str] = set()
+        text_lens: dict[str, int] = {}
+        tool_state: dict[str, str] = {}
+        seen_question_pids: set[str] = set()
+
+        await _seed_resumed_session_state(
+            client, client.session_id, user_mids, text_lens,
+            tool_state, seen_question_pids,
+        )
+
+        assert "msg_old" in user_mids
+        assert text_lens["prt_old_text"] == len("old answer text")
+        assert text_lens["prt_old_reason"] == len("old chain of thought")
+        assert tool_state["prt_old_tool"] == "completed"
+        assert seen_question_pids == {"prt_q"}
+
+    @pytest.mark.asyncio
+    async def test_seed_failure_never_raises(self) -> None:
+        """A failing seed (HTTP 500, a raising GET, or a malformed dict
+        body) must return silently — polling degrades to unseeded."""
+        from opencode_bridge import _seed_resumed_session_state
+
+        class _DictBodyClient(_FakeClient):
+            async def get(self, url: str, **kwargs: Any) -> _FakeResp:
+                if url.endswith(f"/session/{self.session_id}/message"):
+                    return _FakeResp(200, {"error": "boom"})
+                return await super().get(url, **kwargs)
+
+        client500 = _SeedPollClient()
+        client500.seed_status = 500
+        client_raise = _SeedPollClient()
+        client_raise.raise_on_seed = True
+
+        for client in (client500, client_raise, _DictBodyClient()):
+            await _seed_resumed_session_state(
+                client, client.session_id, set(), {}, {}, set(),
+            )
+
+
+class TestResumedSessionPollingReplay:
+    """REQ-1 (bridge-cycle-8): a resumed pinned session seeds its historical
+    part state before the prompt, so the polling fallback never replays
+    history or re-surfaces a stale question; fresh sessions never seed."""
+
+    @pytest.mark.asyncio
+    async def test_resumed_session_never_replays_history(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Scenario-1: seeded history (old text, reasoning, completed tool,
+        resolved question) is NOT replayed after bus closure; only the new
+        turn's deltas stream, and the stream ends normally."""
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+
+        old_msg = _assistant_msg([
+            {"id": "prt_old_text", "messageID": "msg_old", "type": "text",
+             "text": "old answer text"},
+            {"id": "prt_old_reason", "messageID": "msg_old", "type": "reasoning",
+             "text": "old chain of thought"},
+            {"id": "prt_old_tool", "messageID": "msg_old", "type": "tool",
+             "tool": "bash", "state": {"status": "completed"}},
+            {"id": "prt_old_q", "messageID": "msg_old", "type": "tool",
+             "tool": "question",
+             "state": {"status": "running", "input": {"question": "old?"}}},
+        ])
+        old_msg["id"] = "msg_old"
+        new_msg = _assistant_msg([
+            {"id": "prt_new_text", "messageID": "msg_new", "type": "text",
+             "text": "new answer text"},
+        ])
+        new_msg["id"] = "msg_new"
+
+        client = _SeedPollClient()
+        client.seed_messages = [old_msg]
+        client.poll_messages = [old_msg, new_msg]
+        client.stream_lines = []
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        smap: dict[str, str] = {"conv-1": "ses_0001"}
+        deltas = [d async for d in opencode_chat_stream(
+            "answer", session_map=smap, session_key="conv-1",
+        )]
+
+        joined = "".join(t for _, t in deltas)
+        kinds = [k for k, _ in deltas]
+        # Historical content is never replayed.
+        assert "old answer text" not in joined
+        assert "old chain of thought" not in joined
+        assert "🧠 thinking…" not in joined
+        assert "✅" not in joined
+        assert "⚠️" not in joined
+        assert "question" not in kinds
+        # The new turn's delta streams.
+        assert "new answer text" in joined
+        # The stream ends normally — no network-error status.
+        assert "[OpenCode Bridge Network Error" not in joined
+
+    @pytest.mark.asyncio
+    async def test_new_question_part_still_stops_stream(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Scenario-4: a question part that did NOT exist at stream start
+        (fresh pid, post-prompt) must still yield ("question", ...) and
+        stop the stream — only SEEDED (already-resolved) question parts are
+        suppressed."""
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+
+        old_q_msg = _assistant_msg([
+            {"id": "prt_old_q", "messageID": "msg_old", "type": "tool",
+             "tool": "question",
+             "state": {"status": "completed", "input": {"question": "old?"}}},
+        ])
+        old_q_msg["id"] = "msg_old"
+        new_q_msg = _assistant_msg([
+            {"id": "prt_new_q", "messageID": "msg_new", "type": "tool",
+             "tool": "question",
+             "state": {"status": "running", "input": {"questions": [
+                 {"question": "Which source?", "options": [{"label": "Logs"}, {"label": "Git"}]}]}}},
+        ])
+        new_q_msg["id"] = "msg_new"
+
+        client = _SeedPollClient()
+        client.seed_messages = [old_q_msg]  # old resolved question seeded
+        client.poll_messages = [new_q_msg]  # NEW question part (fresh pid)
+        client.stream_lines = []
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        smap: dict[str, str] = {"conv-1": "ses_0001"}
+        deltas = [d async for d in opencode_chat_stream(
+            "answer", session_map=smap, session_key="conv-1",
+        )]
+
+        # The NEW question yields and stops the stream; the old seeded one
+        # never replays.
+        assert deltas == [("question", "Which source? (Options: Logs | Git)")], deltas
+        assert smap == {"conv-1": "ses_0001"}
+
+    @pytest.mark.asyncio
+    async def test_seed_failure_degrades_to_current_behavior(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Scenario-2: a failed seed GET (HTTP 500 or a raising GET) must
+        not raise — the stream completes and polling degrades to the
+        existing unseeded behavior."""
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+
+        for seed_status, raise_on_seed in [(500, False), (200, True)]:
+            client = _SeedPollClient()
+            client.seed_status = seed_status
+            client.raise_on_seed = raise_on_seed
+            client.poll_messages = []
+            client.stream_lines = []
+            monkeypatch.setattr(
+                opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client,
+            )
+
+            smap: dict[str, str] = {"conv-1": "ses_0001"}
+            deltas = [d async for d in opencode_chat_stream(
+                "answer", session_map=smap, session_key="conv-1",
+            )]
+            joined = "".join(t for _, t in deltas)
+            assert "[OpenCode Bridge Network Error" not in joined
+
+    @pytest.mark.asyncio
+    async def test_fresh_session_does_not_seed(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Scenario-3: with no session pin, NO seed GET occurs before the
+        prompt POST — the first message-list GET is the polling read."""
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        client = _FakeClient()
+        client.stream_lines = []
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        smap: dict[str, str] = {}
+        [d async for d in opencode_chat_stream(
+            "task", session_map=smap, session_key="conv-1",
+        )]
+
+        # The prompt POST fired (fresh session created + pinned).
+        prompt_idx = next(
+            i for i, (m, u) in enumerate(client.calls)
+            if m == "post" and "prompt_async" in u
+        )
+        # The first message-list GET (no trailing slash) is a POLLING read:
+        # it must come after the prompt POST — no pre-prompt seed GET.
+        list_get_idxs = [
+            i for i, (m, u) in enumerate(client.calls)
+            if m == "get" and u.endswith(f"/session/{client.session_id}/message")
+        ]
+        assert list_get_idxs, "expected a polling message-list GET"
+        assert list_get_idxs[0] > prompt_idx
 
 
 # ---------------------------------------------------------------------------
@@ -2041,6 +2322,88 @@ class TestServeHealth:
         assert _find_serve_pid("18999") == 4242
         assert _find_serve_pid("18000") is None
 
+
+class _FakeProcFile:
+    """File-like stand-in returning a scripted /proc/<pid>/cmdline blob."""
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    def __enter__(self) -> "_FakeProcFile":
+        return self
+
+    def __exit__(self, *a: Any) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self._data
+
+
+def _patch_proc_cmdline(
+    monkeypatch: pytest.MonkeyPatch, cmdline: bytes,
+) -> None:
+    """Point the /proc scan at a single fake entry (pid 4242) whose cmdline
+    is ``cmdline`` (replicates the TestServeHealth._fake_listdir/_fake_open
+    pattern)."""
+    real_listdir = opencode_bridge.os.listdir
+    real_open = open
+
+    def _fake_listdir(path: str) -> list[str]:
+        if path == "/proc":
+            return ["4242"]
+        return real_listdir(path)
+
+    def _fake_open(path: str, *a: Any, **kw: Any) -> Any:
+        if str(path) == "/proc/4242/cmdline":
+            return _FakeProcFile(cmdline)
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr(opencode_bridge.os, "listdir", _fake_listdir)
+    monkeypatch.setattr("builtins.open", _fake_open)
+
+
+class TestFindServePidExactMatch:
+    """REQ-2 (bridge-cycle-8): serve-PID discovery matches the port by EXACT
+    token equality — equals-form or adjacent ``--port`` pair — never by
+    substring/prefix (the ``--port 189990`` prefix-false-positive and the
+    ``--port=18999`` never-match bugs)."""
+
+    def test_equals_form_port_matches(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from opencode_bridge import _find_serve_pid
+
+        _patch_proc_cmdline(
+            monkeypatch,
+            b"/home/user/.opencode/bin/opencode\x00serve\x00"
+            b"--port=18999\x00--hostname\x00127.0.0.1\x00",
+        )
+        assert _find_serve_pid("18999") == 4242
+
+    def test_longer_advertised_value_rejected(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Advertises ``--port 189990``; searching "18999" must NOT
+        prefix-match the longer advertised value."""
+        from opencode_bridge import _find_serve_pid
+
+        _patch_proc_cmdline(
+            monkeypatch,
+            b"/home/user/.opencode/bin/opencode\x00serve\x00"
+            b"--port\x00189990\x00",
+        )
+        assert _find_serve_pid("18999") is None
+
+    def test_shorter_search_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Advertises ``--port 18999``; searching "1899" must NOT match."""
+        from opencode_bridge import _find_serve_pid
+
+        _patch_proc_cmdline(
+            monkeypatch,
+            b"/home/user/.opencode/bin/opencode\x00serve\x00"
+            b"--port\x0018999\x00",
+        )
+        assert _find_serve_pid("1899") is None
+
+
     def test_serve_health_parses_proc(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """_serve_health reads /proc/<pid>/stat start ticks + uptime."""
         import tempfile
@@ -2082,6 +2445,120 @@ class TestServeHealth:
         assert elapsed is not None
         # start_ticks 1000 @ 100Hz = 10s after boot; uptime 6000 → ~5990s up
         assert 5900 < elapsed < 6000
+
+
+@pytest.mark.real_recycle
+class TestServeDrain:
+    """REQ-3 (bridge-cycle-8): after a verified SIGTERM both recycle helpers
+    boundedly drain the dying listener — break early when it reports down,
+    exhaust the probe budget without raising otherwise.  ``real_recycle``
+    keeps the hermetic fixture from nooping the helper bodies; the fake pid
+    424242 keeps the live serve untouched."""
+
+    def _patch_drain(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> list[int]:
+        killed: list[int] = []
+        monkeypatch.setattr(opencode_bridge, "_find_serve_pid", lambda port: 424242)
+        monkeypatch.setattr(
+            opencode_bridge.os, "kill", lambda pid, sig: killed.append(pid),
+        )
+        monkeypatch.setattr(opencode_bridge, "_DRAIN_PROBES", 4)
+        monkeypatch.setattr(opencode_bridge, "_DRAIN_PROBE_S", 0.01)
+        return killed
+
+    @pytest.mark.asyncio
+    async def test_force_recycle_drain_breaks_early_when_down(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Scenario-1: the listener reports down on probe 3 — 2 "up" probes
+        + 1 "down" check, then an early return (3 running-fn calls)."""
+        from opencode_bridge import _force_recycle_serve
+
+        killed = self._patch_drain(monkeypatch)
+        running_calls: list[bool] = []
+
+        async def _running() -> bool:
+            running_calls.append(True)
+            return len(running_calls) < 3  # True, True, then False
+
+        monkeypatch.setattr(opencode_bridge, "is_opencode_serve_running", _running)
+
+        await _force_recycle_serve()
+
+        assert killed == [424242]
+        assert len(running_calls) == 3
+
+    @pytest.mark.asyncio
+    async def test_force_recycle_drain_exhausts_budget_without_raising(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Scenario-2: the listener stays up through every probe — exactly
+        one running-fn call per probe slot (4), no raise."""
+        from opencode_bridge import _force_recycle_serve
+
+        killed = self._patch_drain(monkeypatch)
+        running_calls = 0
+
+        async def _always_up() -> bool:
+            nonlocal running_calls
+            running_calls += 1
+            return True
+
+        monkeypatch.setattr(opencode_bridge, "is_opencode_serve_running", _always_up)
+
+        await _force_recycle_serve()
+
+        assert killed == [424242]
+        assert running_calls == 4
+
+    @pytest.mark.asyncio
+    async def test_low_memory_recycle_drain_breaks_early_when_down(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Scenario-1 for ``_recycle_serve_if_low_memory``: memory pressure
+        truthy → kill fires, then the drain breaks early on probe 3."""
+        from opencode_bridge import _recycle_serve_if_low_memory
+
+        killed = self._patch_drain(monkeypatch)
+        # _serve_health signature: (port) -> (memory_pressure, elapsed_s).
+        monkeypatch.setattr(opencode_bridge, "_serve_health", lambda port: (True, 0.0))
+        running_calls: list[bool] = []
+
+        async def _running() -> bool:
+            running_calls.append(True)
+            return len(running_calls) < 3  # True, True, then False
+
+        monkeypatch.setattr(opencode_bridge, "is_opencode_serve_running", _running)
+
+        await _recycle_serve_if_low_memory()
+
+        assert killed == [424242]
+        assert len(running_calls) == 3
+
+    @pytest.mark.asyncio
+    async def test_low_memory_recycle_drain_exhausts_budget_without_raising(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Scenario-2 for ``_recycle_serve_if_low_memory``: listener stays up
+        — exactly 4 running-fn calls, no raise."""
+        from opencode_bridge import _recycle_serve_if_low_memory
+
+        killed = self._patch_drain(monkeypatch)
+        monkeypatch.setattr(opencode_bridge, "_serve_health", lambda port: (True, 0.0))
+        running_calls = 0
+
+        async def _always_up() -> bool:
+            nonlocal running_calls
+            running_calls += 1
+            return True
+
+        monkeypatch.setattr(opencode_bridge, "is_opencode_serve_running", _always_up)
+
+        await _recycle_serve_if_low_memory()
+
+        assert killed == [424242]
+        assert running_calls == 4
 
 
 # ---------------------------------------------------------------------------
@@ -2361,7 +2838,7 @@ class TestDetectWedgedTool:
         is detected as wedged (started AFTER the current serve)."""
         from opencode_bridge import _detect_wedged_tool
 
-        part_start = int(time.time() * 1000) - 180_000
+        part_start = int(time.time() * 1000) - 320_000
         monkeypatch.setattr(
             opencode_bridge, "_serve_start_epoch_ms", lambda: part_start - 60_000,
         )

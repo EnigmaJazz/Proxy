@@ -119,7 +119,7 @@ _EVENT_FINAL_TIMEOUT: float = 3.0
 # A tool part stuck in "running" with no output for this long is WEDGED:
 # the serve's tool runner marked the tool started but never executed it,
 # so the session stays "busy" forever while the client sees keepalives.
-_TOOL_WEDGE_AFTER_S: float = 120.0
+_TOOL_WEDGE_AFTER_S: float = 300.0
 
 #: A ``task`` tool part waits on a sub-agent session, which legitimately
 #: runs for many minutes (the TUI's SDD cycles routinely take 5-20 min

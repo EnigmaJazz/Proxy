@@ -344,7 +344,7 @@
       "models": {
         "professional": {
           "limit": {
-            "context": 65536,
+            "context": 131072,
             "output": 8192
           },
           "name": "professional"

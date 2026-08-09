@@ -74,6 +74,16 @@ class _FakeClient:
         # the permission poller gets a chance to run.
         self.permission_records: list[dict[str, Any]] = []
         self.message_hang_s: float = 0.0
+        # Streaming-path scripting (opencode_chat_stream exit hygiene):
+        # scripted prompt_async status, a mid-request /event connection
+        # failure, and an Nth-GET failure switch.  NOTE: every GET inside
+        # opencode_chat_stream is swallow-guarded, so fail_get_after cannot
+        # reach the outer except; it exists for resilience scripting while
+        # raise_on_stream deterministically triggers the outer except.
+        self.prompt_status: int = 204
+        self.raise_on_stream: bool = False
+        self.fail_get_after: Optional[int] = None
+        self._get_count: int = 0
 
     async def __aenter__(self) -> "_FakeClient":
         return self
@@ -87,6 +97,9 @@ class _FakeClient:
         if self.raise_on == "get":
             raise httpx.ConnectError("conn refused")
         if self.raise_timeout_on == "get":
+            raise httpx.ReadTimeout("read timed out")
+        self._get_count += 1
+        if self.fail_get_after is not None and self._get_count > self.fail_get_after:
             raise httpx.ReadTimeout("read timed out")
         if "/message/" in url:
             # Persisted-message GET used by the question retry-race fetch.
@@ -114,10 +127,12 @@ class _FakeClient:
         if url.endswith("/session"):
             return _FakeResp(self.session_status, {"id": self.session_id})
         if "prompt_async" in url:
-            return _FakeResp(204, {})
+            return _FakeResp(self.prompt_status, {})
         return _FakeResp(self.message_status, {"parts": self.message_parts})
 
     def stream(self, *args: Any, **kwargs: Any) -> _FakeStream:
+        if self.raise_on_stream:
+            raise httpx.ConnectError("conn refused")
         return _FakeStream(self.stream_lines)
 
 
@@ -530,6 +545,154 @@ class TestOpenCodeChatHardening:
         assert not any(
             "/permissions/" in url for url, _ in fake_client.post_calls
         )
+
+
+class TestStreamExitHygiene:
+    """Streaming-path error-exit hygiene (bridge-cycle-6): every error
+    exit aborts the session, drops the pin, and pops pending permissions;
+    the serve-recycle check runs before the ensure/respawn.
+
+    Hermetic: scripted _FakeClient + monkeypatched ensure/recycle, no live
+    serve (the autouse hermetic_serve guard never sees a real kill).
+    """
+
+    @staticmethod
+    async def _running(*args: Any, **kwargs: Any) -> bool:
+        return True
+
+    @pytest.mark.asyncio
+    async def test_stream_network_error_aborts_and_drops_pin(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """REQ-4: a mid-request /event connection failure yields the
+        network error AND runs the cleanup trio (abort + pin drop +
+        pending-pop)."""
+        from opencode_bridge import opencode_chat_stream
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", self._running)
+        client = _FakeClient()
+        client.raise_on_stream = True  # /event connection fails mid-request
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        smap: dict[str, str] = {}
+        pending: dict[str, tuple[str, bool]] = {"ses_0001": ("perm_1", True)}
+        deltas = [
+            d async for d in opencode_chat_stream(
+                "task", session_map=smap, session_key="conv",
+                pending_permissions=pending,
+            )
+        ]
+
+        assert len(deltas) == 1
+        kind, text = deltas[0]
+        assert kind == "status"
+        assert text.startswith("[OpenCode Bridge Network Error:")
+        assert any(
+            url.endswith("/abort") for url, _ in client.post_calls
+        )
+        assert smap == {}    # pin dropped
+        assert pending == {}  # pending permission popped
+
+    @pytest.mark.asyncio
+    async def test_message_updated_error_aborts_and_drops_pin(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """REQ-3: a message.updated event carrying info.error yields the
+        error AND runs the cleanup trio."""
+        from opencode_bridge import opencode_chat_stream
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", self._running)
+        client = _FakeClient()
+        client.stream_lines = [
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_a", "role": "assistant", "error": "boom"}),
+        ]
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        smap: dict[str, str] = {}
+        pending: dict[str, tuple[str, bool]] = {"ses_0001": ("perm_1", True)}
+        deltas = [
+            d async for d in opencode_chat_stream(
+                "task", session_map=smap, session_key="conv",
+                pending_permissions=pending,
+            )
+        ]
+
+        assert deltas == [("status", "[OpenCode Bridge Error: boom]")]
+        assert any(
+            url.endswith("/abort") for url, _ in client.post_calls
+        )
+        assert smap == {}
+        assert pending == {}
+
+    @pytest.mark.asyncio
+    async def test_prompt_non_204_drops_pin(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """REQ-2: prompt_async HTTP != 204 yields the prompt error AND runs
+        the cleanup trio."""
+        from opencode_bridge import opencode_chat_stream
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", self._running)
+        client = _FakeClient()
+        client.prompt_status = 500
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        smap: dict[str, str] = {}
+        pending: dict[str, tuple[str, bool]] = {"ses_0001": ("perm_1", True)}
+        deltas = [
+            d async for d in opencode_chat_stream(
+                "task", session_map=smap, session_key="conv",
+                pending_permissions=pending,
+            )
+        ]
+
+        assert deltas == [("status", "[OpenCode Bridge Error: prompt HTTP 500]")]
+        assert any(
+            url.endswith("/abort") for url, _ in client.post_calls
+        )
+        assert smap == {}
+        assert pending == {}
+
+    @pytest.mark.asyncio
+    async def test_recycle_before_ensure_no_failure(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """REQ-6: the serve-recycle check runs BEFORE ensure/respawn; a
+        stream request completes instead of failing with a spurious
+        network error after the recycle kills the serve."""
+        from opencode_bridge import opencode_chat_stream
+
+        order: list[str] = []
+
+        async def _recycle(*args: Any, **kwargs: Any) -> None:
+            order.append("recycle")
+
+        async def _ensure(*args: Any, **kwargs: Any) -> bool:
+            order.append("ensure")
+            return True
+
+        monkeypatch.setattr(opencode_bridge, "_recycle_serve_if_low_memory", _recycle)
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _ensure)
+        client = _FakeClient()
+        client.stream_lines = _stream_events()
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        smap: dict[str, str] = {}
+        deltas = [
+            d async for d in opencode_chat_stream(
+                "task", session_map=smap, session_key="conv",
+            )
+        ]
+
+        assert order == ["recycle", "ensure"]
+        text = [t for k, t in deltas if k == "text"]
+        assert "Created file." in text
+        assert "Done." in text
+        assert not any(
+            url.endswith("/abort") for url, _ in client.post_calls
+        )
+        assert smap == {"conv": "ses_0001"}  # success path leaves the pin
 
 
 class TestIsRunning:

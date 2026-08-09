@@ -321,6 +321,33 @@ async def _abort_session_best_effort(
         pass
 
 
+async def _abort_stream_session_best_effort(
+    client: httpx.AsyncClient,
+    session_id: str,
+    *,
+    session_map: Optional[dict[str, str]] = None,
+    session_key: Optional[str] = None,
+    pending_permissions: Optional[dict[str, tuple[str, bool]]] = None,
+) -> None:
+    """Streaming-path cleanup trio: best-effort abort + pin drop + pending
+    permission pop.
+
+    Every ``opencode_chat_stream`` error exit runs this so a failed or
+    abandoned request never leaves a busy agent session on the serve with
+    the ``session_map`` pin pointing at it.  Distinct from the blocking-path
+    helper ``_abort_session_best_effort`` (cycle 5) so the two paths stay
+    merge-safe.  Never raises; a falsy ``session_id`` (session create
+    failed) is a no-op.
+    """
+    if not session_id:
+        return
+    await _abort_session_best_effort(client, session_id)
+    if pending_permissions is not None:
+        pending_permissions.pop(session_id, None)
+    if session_map is not None and session_key:
+        session_map.pop(session_key, None)
+
+
 async def _handle_permission_event(
     client: httpx.AsyncClient,
     session_id: str,
@@ -536,6 +563,22 @@ async def _spawn_serve(mtime: Optional[float]) -> bool:
             _tok = (_auth.get("openai") or {}).get("access")
             if _tok:
                 serve_env["OPENAI_API_KEY"] = _tok
+            # The serve's data home is ISOLATED (XDG_DATA_HOME ->
+            # serve-config), so its auth lookup would miss the TUI/CLI's
+            # auth.json (OAuth tokens) and fall back to the env apiKey
+            # (which the API rejects: the ChatGPT-Plus OAuth token lacks
+            # the api.responses.write scope).  Copy the auth file into the
+            # serve's data home so the serve resolves the openai provider
+            # through the SAME chatgpt-headless OAuth route the TUI/CLI
+            # use (2026-08-09).
+            _serve_auth = os.path.join(
+                OPENCODE_SERVE_CONFIG_DIR, "opencode", "auth.json",
+            )
+            _src_auth = os.path.expanduser("~/.local/share/opencode/auth.json")
+            if os.path.exists(_src_auth):
+                os.makedirs(os.path.dirname(_serve_auth), exist_ok=True)
+                with open(_src_auth, "rb") as _sf, open(_serve_auth, "wb") as _df:
+                    _df.write(_sf.read())
         except (OSError, ValueError, TypeError):
             pass
         # Full serve isolation (2026-08-09): the serve must NOT share the
@@ -725,6 +768,11 @@ async def opencode_chat_stream(
     # cycle never runs on a progressively-wedged tool runner.
     if autonomous:
         await _force_recycle_serve()
+    # Recycle BEFORE ensure: the recycle SIGTERMs the serve (low memory or
+    # uptime > _SERVE_RECYCLE_AFTER_S) and never respawns, so running it
+    # after ensure would break the next request with a spurious ConnectError.
+    # The ensure below respawns a fresh serve when a recycle fired.
+    await _recycle_serve_if_low_memory()
     if not await ensure_opencode_serve():
         yield ("status", "[OpenCode Bridge Failed: opencode serve not reachable.]")
         return
@@ -736,7 +784,6 @@ async def opencode_chat_stream(
     )
     async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
         try:
-            await _recycle_serve_if_low_memory()
             protected = set(session_map.values()) if session_map else None
             await _abort_zombie_sessions(client, protected)
             session_id = (
@@ -766,16 +813,11 @@ async def opencode_chat_stream(
                         "pinned session %s is busy (likely stuck) — aborting and starting fresh",
                         session_id[:16],
                     )
-                    try:
-                        await client.post(
-                            f"{OPENCODE_SERVE_URL}/session/{session_id}/abort",
-                            timeout=10.0,
-                        )
-                    except (httpx.HTTPError, OSError):
-                        pass
-                    pending_permissions.pop(session_id, None)
-                    if session_map is not None and session_key:
-                        session_map.pop(session_key, None)
+                    await _abort_stream_session_best_effort(
+                        client, session_id,
+                        session_map=session_map, session_key=session_key,
+                        pending_permissions=pending_permissions,
+                    )
                     session_id = None
             if not session_id:
                 resp = await client.post(
@@ -821,6 +863,13 @@ async def opencode_chat_stream(
                     timeout=30.0,
                 )
                 if async_resp.status_code != 204:
+                    # Session was created and pinned before this POST — do
+                    # not leak it on a failed prompt.
+                    await _abort_stream_session_best_effort(
+                        client, session_id,
+                        session_map=session_map, session_key=session_key,
+                        pending_permissions=pending_permissions,
+                    )
                     yield ("status", f"[OpenCode Bridge Error: prompt HTTP {async_resp.status_code}]")
                     return
 
@@ -847,16 +896,11 @@ async def opencode_chat_stream(
                             "opencode bridge timeout after %.0fs — aborting session %s",
                             OPENCODE_SERVE_TIMEOUT, session_id[:16],
                         )
-                        try:
-                            await client.post(
-                                f"{OPENCODE_SERVE_URL}/session/{session_id}/abort",
-                                timeout=10.0,
-                            )
-                        except (httpx.HTTPError, OSError):
-                            pass
-                        if session_map is not None and session_key:
-                            session_map.pop(session_key, None)
-                        pending_permissions.pop(session_id, None)
+                        await _abort_stream_session_best_effort(
+                            client, session_id,
+                            session_map=session_map, session_key=session_key,
+                            pending_permissions=pending_permissions,
+                        )
                         yield ("status", "[OpenCode Bridge Error: timed out waiting for the agent]",)
                         return
                     try:
@@ -896,16 +940,11 @@ async def opencode_chat_stream(
                                     "opencode bridge timeout during polling — aborting session %s",
                                     session_id[:16],
                                 )
-                                try:
-                                    await client.post(
-                                        f"{OPENCODE_SERVE_URL}/session/{session_id}/abort",
-                                        timeout=10.0,
-                                    )
-                                except (httpx.HTTPError, OSError):
-                                    pass
-                                if session_map is not None and session_key:
-                                    session_map.pop(session_key, None)
-                                pending_permissions.pop(session_id, None)
+                                await _abort_stream_session_best_effort(
+                                    client, session_id,
+                                    session_map=session_map, session_key=session_key,
+                                    pending_permissions=pending_permissions,
+                                )
                                 yield ("status", "[OpenCode Bridge Error: timed out waiting for the agent]")
                                 return
                             cycle_content = False
@@ -1032,16 +1071,11 @@ async def opencode_chat_stream(
                                         return
                                     continue
                                 if await _detect_wedged_tool(client, session_id):
-                                    try:
-                                        await client.post(
-                                            f"{OPENCODE_SERVE_URL}/session/{session_id}/abort",
-                                            timeout=10.0,
-                                        )
-                                    except (httpx.HTTPError, OSError):
-                                        pass
-                                    if session_map is not None and session_key:
-                                        session_map.pop(session_key, None)
-                                    pending_permissions.pop(session_id, None)
+                                    await _abort_stream_session_best_effort(
+                                        client, session_id,
+                                        session_map=session_map, session_key=session_key,
+                                        pending_permissions=pending_permissions,
+                                    )
                                     # NOTE: never kill the serve here.  The
                                     # serve hosts OTHER sessions (concurrent
                                     # cycles); recycling it for one wedged
@@ -1077,16 +1111,11 @@ async def opencode_chat_stream(
                                     return
                                 continue
                             if await _detect_wedged_tool(client, session_id):
-                                try:
-                                    await client.post(
-                                        f"{OPENCODE_SERVE_URL}/session/{session_id}/abort",
-                                        timeout=10.0,
-                                    )
-                                except (httpx.HTTPError, OSError):
-                                    pass
-                                if session_map is not None and session_key:
-                                    session_map.pop(session_key, None)
-                                pending_permissions.pop(session_id, None)
+                                await _abort_stream_session_best_effort(
+                                    client, session_id,
+                                    session_map=session_map, session_key=session_key,
+                                    pending_permissions=pending_permissions,
+                                )
                                 # NOTE: never kill the serve here — see the
                                 # polling-wedge path above (2026-08-08: the
                                 # serve hosts concurrent sessions; killing it
@@ -1148,6 +1177,13 @@ async def opencode_chat_stream(
                         elif role == "assistant" and asst_mid is None:
                             asst_mid = mid
                             if info.get("error"):
+                                # The agent errored out — clean up the
+                                # session instead of leaking it.
+                                await _abort_stream_session_best_effort(
+                                    client, session_id,
+                                    session_map=session_map, session_key=session_key,
+                                    pending_permissions=pending_permissions,
+                                )
                                 yield ("status", f"[OpenCode Bridge Error: {info['error']}]")
                                 return
                     elif etype == "message.part.updated":
@@ -1168,6 +1204,14 @@ async def opencode_chat_stream(
                             else:
                                 yield delta
         except (httpx.HTTPError, OSError, ValueError) as exc:
+            if session_id:
+                # A transient mid-stream failure must not strand the agent
+                # (possibly still running) with the pin pointing at it.
+                await _abort_stream_session_best_effort(
+                    client, session_id,
+                    session_map=session_map, session_key=session_key,
+                    pending_permissions=pending_permissions,
+                )
             yield ("status", f"[OpenCode Bridge Network Error: {str(exc)}]")
 
 

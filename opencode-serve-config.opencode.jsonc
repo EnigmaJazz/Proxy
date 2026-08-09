@@ -372,6 +372,17 @@
         "apiKey": "local-proxy",
         "baseURL": "http://127.0.0.1:8788/v1"
       }
+    },
+    "openai": {
+      "auth": {
+        "method": "chatgpt-headless",
+        "type": "oauth"
+      },
+      "models": {
+        "gpt-5.6-sol": {},
+        "gpt-5.6-terra": {},
+        "gpt-5.6-luna": {}
+      }
     }
   }
 }

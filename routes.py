@@ -83,6 +83,7 @@ from routing import (
     check_semantic_cache,
     extract_project_context,
     is_dream_process,
+    reclassify_with_professional,
 )
 from text_to_structured import ToolCallTextToStructured, _format_status
 
@@ -1046,6 +1047,11 @@ async def chat_completions(request: Request) -> Response:
         "tools_required": False,
     }
 
+    # The professional's reclassification result (populated in the
+    # frontdesk branch below; empty for mid-tool-flow so the parameters
+    # section below never sees an unbound name).
+    reclass: dict[str, Any] = {}
+
     if has_tool_calls:
         # Conversation already has tool calls — preserve the classified
         # route, don't let frontdesk reclassify and switch models
@@ -1097,6 +1103,37 @@ async def chat_completions(request: Request) -> Response:
             classification.get("project_name"),
             classification.get("is_factual"),
         )
+
+        # Professional reclassification (user-approved 2026-08-09): the 2B
+        # frontdesk under-judges complex work.  Ask the professional to
+        # reclassify the request before answering — its KV-cache makes the
+        # reclassification preprocessing reusable by the answering pass
+        # (the context is cached), and the proxy then assigns the correct
+        # intent-based sampling parameters to the actual answering call.
+        # Best-effort: any failure keeps the frontdesk's classification.
+        try:
+            systemd_state = getattr(request.app.state, "systemd", None)
+            reclass_port = 0
+            if systemd_state is not None:
+                reclass_port = await systemd_state.get_port("professional")
+            reclass = await reclassify_with_professional(
+                user_text, model_port=reclass_port,
+            )
+        except (httpx.HTTPError, OSError, ValueError):
+            reclass = {}
+        if reclass.get("intent"):
+            classification["intent"] = reclass["intent"]
+            classification["priority"] = reclass.get(
+                "priority", classification.get("priority", 2),
+            )
+            classification["complexity"] = reclass.get(
+                "complexity", classification.get("complexity", "low"),
+            )
+            logger.info(
+                "Professional reclassified: intent=%s priority=%s complexity=%s",
+                classification["intent"], classification["priority"],
+                classification["complexity"],
+            )
     else:
         classification["intent"] = "CODE"
         classification["priority"] = 1
@@ -1340,8 +1377,15 @@ async def chat_completions(request: Request) -> Response:
     profiles = state.model_profiles
     entry = profiles.resolve(route.intent, route.model_key) if profiles else None
 
+    # The professional's reclassification recommends sampling parameters
+    # (temperature / top_p / thinking_budget_tokens) for the answering
+    # call.  When present they win over the profile defaults — the
+    # reclassification saw the actual request context (KV-cached, so the
+    # answering pass reuses its preprocessing).
+    reclass_params: dict[str, Any] = reclass.get("parameters") or {}
+
     if auto_authority and entry is not None:
-        parameters = {**entry.values}
+        parameters = {**entry.values, **reclass_params}
     else:
         # R1/R7 client-wins: when the client picked the model, the client's
         # sampling parameters are authoritative. We only fill in a

@@ -589,6 +589,13 @@ async def _spawn_serve(mtime: Optional[float]) -> bool:
                 os.makedirs(os.path.dirname(_serve_auth), exist_ok=True)
                 with open(_src_auth, "rb") as _sf, open(_serve_auth, "wb") as _df:
                     _df.write(_sf.read())
+                # The copy holds OAuth tokens: enforce the same 0600 the
+                # source auth.json carries (open('wb') would create it
+                # 0644 under a normal umask — world-readable).
+                try:
+                    os.chmod(_serve_auth, 0o600)
+                except OSError:
+                    pass
         except (OSError, ValueError, TypeError):
             pass
         # Full serve isolation (2026-08-09): the serve must NOT share the
@@ -654,93 +661,141 @@ async def opencode_chat(
     preserves the streaming path's auto-allow-all semantics.  On every
     non-success exit the created session is aborted best-effort so no busy
     zombie is left on the serve.
+
+    A network-class failure after a successful first ensure triggers one
+    bounded respawn: the serve is force-recycled, re-ensured, and the whole
+    call retried exactly once.  HTTP-status errors and permission aborts
+    never retry.
     """
     if not await ensure_opencode_serve():
         return "[OpenCode Bridge Failed: opencode serve not reachable.]"
     async with httpx.AsyncClient() as client:
-        try:
-            # ---- 1. Create a fresh session --------------------------------
-            resp = await client.post(
-                f"{OPENCODE_SERVE_URL}/session",
-                params={"directory": OPENCODE_BRIDGE_DIRECTORY},
-                timeout=30.0,
-            )
-            if resp.status_code != 200:
-                return f"[OpenCode Bridge Error: session HTTP {resp.status_code}]"
-            session_id = resp.json().get("id")
-            if not session_id:
-                return "[OpenCode Bridge Error: no session id returned.]"
+        text, network_failed = await _opencode_chat_attempt(
+            client, user_text, agent=agent, model_id=model_id,
+            provider_id=provider_id, timeout=timeout,
+            system_prompt=system_prompt, autonomous=autonomous,
+        )
+        if not network_failed:
+            return text
+        # The serve died mid-call (network-class failure after a successful
+        # ensure): recycle once, re-ensure, and retry the whole call once.
+        # No loop — a failed re-ensure or failed retry returns its error.
+        await _force_recycle_serve("blocking-path respawn")
+        if not await ensure_opencode_serve():
+            return "[OpenCode Bridge Failed: opencode serve not reachable.]"
+        text, _ = await _opencode_chat_attempt(
+            client, user_text, agent=agent, model_id=model_id,
+            provider_id=provider_id, timeout=timeout,
+            system_prompt=system_prompt, autonomous=autonomous,
+        )
+        return text
 
-            # ---- 2. Post the message, watching for permission gates ------
-            payload: dict[str, Any] = {
-                "agent": agent,
-                "system": system_prompt,
-                "parts": [{"type": "text", "text": user_text}],
+
+async def _opencode_chat_attempt(
+    client: httpx.AsyncClient,
+    user_text: str,
+    *,
+    agent: str,
+    model_id: Optional[str],
+    provider_id: str,
+    timeout: float,
+    system_prompt: str,
+    autonomous: bool,
+) -> tuple[str, bool]:
+    """One blocking attempt: create session, POST with permission polling,
+    extract text.
+
+    Returns ``(result_string, network_failed)``.  ``network_failed`` is True
+    ONLY for the network-class paths (httpx.HTTPError/OSError/ValueError) so
+    the caller can trigger the bounded respawn; HTTP-status errors, missing
+    ids, empty responses, and permission aborts return False.  Never raises.
+    """
+    try:
+        # ---- 1. Create a fresh session --------------------------------
+        resp = await client.post(
+            f"{OPENCODE_SERVE_URL}/session",
+            params={"directory": OPENCODE_BRIDGE_DIRECTORY},
+            timeout=30.0,
+        )
+        if resp.status_code != 200:
+            return f"[OpenCode Bridge Error: session HTTP {resp.status_code}]", False
+        session_id = resp.json().get("id")
+        if not session_id:
+            return "[OpenCode Bridge Error: no session id returned.]", False
+
+        # ---- 2. Post the message, watching for permission gates ------
+        payload: dict[str, Any] = {
+            "agent": agent,
+            "system": system_prompt,
+            "parts": [{"type": "text", "text": user_text}],
+        }
+        if model_id:
+            payload["model"] = {
+                "modelID": model_id,
+                "providerID": provider_id,
+                "variant": "default",
             }
-            if model_id:
-                payload["model"] = {
-                    "modelID": model_id,
-                    "providerID": provider_id,
-                    "variant": "default",
-                }
-            # The POST runs as a task so the poller below can watch GET
-            # /permission concurrently (httpx clients are concurrency-safe).
-            post_task = asyncio.create_task(
-                client.post(
-                    f"{OPENCODE_SERVE_URL}/session/{session_id}/message",
-                    json=payload,
-                    timeout=timeout,
-                )
+        # The POST runs as a task so the poller below can watch GET
+        # /permission concurrently (httpx clients are concurrency-safe).
+        post_task = asyncio.create_task(
+            client.post(
+                f"{OPENCODE_SERVE_URL}/session/{session_id}/message",
+                json=payload,
+                timeout=timeout,
             )
-            try:
-                last_poll = time.monotonic()
-                while True:
-                    if post_task.done():
-                        # Raises httpx/OSError on transport failure.
-                        resp = post_task.result()
-                        break
-                    if time.monotonic() - last_poll >= _BLOCKING_PERMISSION_POLL_S:
-                        last_poll = time.monotonic()
-                        perm = await _detect_pending_permission(client, session_id)
-                        if perm is not None:
-                            question = await _handle_permission_event(
-                                client, session_id, perm, {},
-                                autonomous=autonomous,
+        )
+        try:
+            last_poll = time.monotonic()
+            while True:
+                if post_task.done():
+                    # Raises httpx/OSError on transport failure.
+                    resp = post_task.result()
+                    break
+                if time.monotonic() - last_poll >= _BLOCKING_PERMISSION_POLL_S:
+                    last_poll = time.monotonic()
+                    perm = await _detect_pending_permission(client, session_id)
+                    if perm is not None:
+                        question = await _handle_permission_event(
+                            client, session_id, perm, {},
+                            autonomous=autonomous,
+                        )
+                        if question:
+                            # Interactive-mode WRITE/git ask on a headless
+                            # blocking call: no user can answer, and the
+                            # queue-worker path must never grant writes
+                            # unprompted — abort and surface a clear error
+                            # instead of streaming keepalives or granting.
+                            await _abort_session_best_effort(client, session_id)
+                            return (
+                                "[OpenCode Bridge Error: agent requested write "
+                                "permission — headless escalation cannot relay "
+                                "questions; session aborted.]",
+                                False,
                             )
-                            if question:
-                                # Interactive-mode WRITE/git ask on a headless
-                                # blocking call: no user can answer, and the
-                                # queue-worker path must never grant writes
-                                # unprompted — abort and surface a clear error
-                                # instead of streaming keepalives or granting.
-                                await _abort_session_best_effort(client, session_id)
-                                return (
-                                    "[OpenCode Bridge Error: agent requested write "
-                                    "permission — headless escalation cannot relay "
-                                    "questions; session aborted.]"
-                                )
-                    await asyncio.sleep(min(0.25, _BLOCKING_PERMISSION_POLL_S))
-            except (httpx.HTTPError, OSError) as exc:
-                await _abort_session_best_effort(client, session_id)
-                return f"[OpenCode Bridge Network Error: {str(exc)}]"
-            finally:
-                if not post_task.done():
-                    post_task.cancel()
-            if resp.status_code != 200:
-                await _abort_session_best_effort(client, session_id)
-                return f"[OpenCode Bridge Error: message HTTP {resp.status_code}]"
-            data = resp.json()
-            parts = data.get("parts", [])
-            chunks = [
-                str(p.get("text") or "")
-                for p in parts
-                if p.get("type") == "text" and p.get("text")
-            ]
-            return _strip_proxy_status_text("".join(chunks)).strip() or (
-                "[OpenCode Bridge Error: empty response.]"
-            )
-        except (httpx.HTTPError, OSError, ValueError) as exc:
-            return f"[OpenCode Bridge Network Error: {str(exc)}]"
+                await asyncio.sleep(min(0.25, _BLOCKING_PERMISSION_POLL_S))
+        except (httpx.HTTPError, OSError) as exc:
+            await _abort_session_best_effort(client, session_id)
+            return f"[OpenCode Bridge Network Error: {str(exc)}]", True
+        finally:
+            if not post_task.done():
+                post_task.cancel()
+        if resp.status_code != 200:
+            await _abort_session_best_effort(client, session_id)
+            return f"[OpenCode Bridge Error: message HTTP {resp.status_code}]", False
+        data = resp.json()
+        parts = data.get("parts", [])
+        chunks = [
+            str(p.get("text") or "")
+            for p in parts
+            if p.get("type") == "text" and p.get("text")
+        ]
+        return (
+            _strip_proxy_status_text("".join(chunks)).strip()
+            or "[OpenCode Bridge Error: empty response.]",
+            False,
+        )
+    except (httpx.HTTPError, OSError, ValueError) as exc:
+        return f"[OpenCode Bridge Network Error: {str(exc)}]", True
 
 
 async def opencode_chat_stream(
@@ -806,15 +861,34 @@ async def opencode_chat_stream(
                 # session that is STILL BUSY (a previously hung agent tool)
                 # can never accept new work — abort it, drop the pin, and
                 # start fresh instead of queueing behind a zombie.
+                # A session the serve no longer LISTS is stale: the serve was
+                # recycled (or the session was dropped), so posting to the
+                # pinned id would fail every retry — drop the pin and start
+                # fresh.  Only a SUCCESSFUL status fetch may trigger the
+                # drop; a transport-error fetch keeps the pin conservatively.
+                fetch_ok = False
                 try:
                     st_resp = await client.get(
                         f"{OPENCODE_SERVE_URL}/session/status", timeout=10.0,
                     )
                     st_map = st_resp.json()
+                    fetch_ok = True
                     st = (st_map.get(session_id) or {}).get("type")
                 except (httpx.HTTPError, ValueError):
                     st = None
-                if st == "busy" and not just_approved_permission:
+                if fetch_ok and session_id not in st_map:
+                    # Stale pin: a successful status fetch no longer lists
+                    # the pinned id.  The session is gone — no abort POST is
+                    # needed (aborting a nonexistent session adds noise).
+                    logger.info(
+                        "pinned session %s no longer on serve — dropping pin and starting fresh",
+                        session_id[:16],
+                    )
+                    pending_permissions.pop(session_id, None)
+                    if session_map is not None and session_key:
+                        session_map.pop(session_key, None)
+                    session_id = None
+                elif st == "busy" and not just_approved_permission:
                     # A session that just resumed after a permission
                     # approval is legitimately busy executing the approved
                     # tool (or generating its summary) — do NOT abort it.
@@ -1695,6 +1769,15 @@ async def _recycle_serve_if_low_memory() -> None:
         logger.warning("Recycling opencode serve: %s", reason)
         pid = await asyncio.to_thread(_find_serve_pid, port)
         if pid:
+            if not await asyncio.to_thread(_pid_is_serve, pid, port):
+                # Pid-reuse race guard: this pid no longer belongs to the
+                # serve (it died and the OS recycled the pid between the
+                # scan and the kill).  Skip the kill; the serve stays
+                # absent and the next ensure respawns a fresh one.
+                logger.warning(
+                    "skipping recycle: pid %s no longer matches the serve", pid,
+                )
+                return
             try:
                 os.kill(pid, 15)
             except (OSError, ProcessLookupError):
@@ -1719,6 +1802,14 @@ async def _force_recycle_serve(reason: str = "long-lived call") -> None:
         port = OPENCODE_SERVE_URL.rsplit(":", 1)[-1]
         pid = await asyncio.to_thread(_find_serve_pid, port)
         if pid:
+            if not await asyncio.to_thread(_pid_is_serve, pid, port):
+                # Pid-reuse race guard: the found pid no longer belongs to
+                # the serve — never signal a reused pid.  The serve stays
+                # absent and the next ensure respawns a fresh one.
+                logger.warning(
+                    "skipping force-recycle: pid %s no longer matches the serve", pid,
+                )
+                return
             logger.warning("Forcing opencode serve recycle (%s)", reason)
             os.kill(pid, 15)
             await _drain_serve_shutdown()
@@ -1844,6 +1935,45 @@ def _memory_pressure() -> bool:
     return False
 
 
+def _cmdline_matches_serve(cmd: str, port: str) -> bool:
+    """True when a normalized /proc cmdline belongs to the opencode serve
+    bound to ``port``.
+
+    /proc/<pid>/cmdline separates argv with NUL bytes, not spaces — the old
+    space-form match NEVER matched any process, so serve recycling (age,
+    low-memory, wedge recovery) silently did nothing and a wedged tool
+    runner lived forever.  NULs are normalized to spaces and the argv is
+    tokenized before matching.  PORT MATCHING IS EXACT ONLY: neither a
+    longer advertised value (--port 189990 vs search "18999") nor a shorter
+    search (--port 18999 vs search "1899") may match (prefix-false-positive
+    bug, cycle 9).
+    """
+    tokens = cmd.replace("\x00", " ").split()
+    if not any("opencode" in tok for tok in tokens) or "serve" not in tokens:
+        return False
+    if f"--port={port}" in tokens:
+        return True
+    for i, tok in enumerate(tokens):
+        if tok == "--port" and i + 1 < len(tokens) and tokens[i + 1] == port:
+            return True
+    return False
+
+
+def _pid_is_serve(pid: int, port: str) -> bool:
+    """Re-verify ``pid`` still belongs to the opencode serve before a kill.
+
+    Guards the pid-reuse TOCTOU race: the pid found by ``_find_serve_pid``
+    may have died and been recycled by the OS between the scan and the
+    kill.  Unreadable/missing cmdline counts as mismatch (never raises).
+    """
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            cmd = fh.read().decode("utf-8", "ignore")
+        return _cmdline_matches_serve(cmd, port)
+    except OSError:
+        return False
+
+
 def _find_serve_pid(port: str) -> Optional[int]:
     """Locate the opencode serve process pid by scanning /proc cmdlines."""
     try:
@@ -1853,26 +1983,8 @@ def _find_serve_pid(port: str) -> Optional[int]:
             try:
                 with open(f"/proc/{entry}/cmdline", "rb") as fh:
                     cmd = fh.read().decode("utf-8", "ignore")
-                # /proc/<pid>/cmdline separates argv with NUL bytes, not
-                # spaces — the old space-form match NEVER matched any
-                # process, so serve recycling (age, low-memory, wedge
-                # recovery) silently did nothing and a wedged tool runner
-                # lived forever.  Normalize NULs to spaces and tokenize
-                # before matching.  PORT MATCHING IS EXACT ONLY: neither a
-                # longer advertised value (--port 189990 vs search "18999")
-                # nor a shorter search (--port 18999 vs search "1899") may
-                # match (prefix-false-positive bug, cycle 9).
-                tokens = cmd.replace("\x00", " ").split()
-                if not any("opencode" in tok for tok in tokens) or "serve" not in tokens:
-                    continue
-                if f"--port={port}" in tokens:
+                if _cmdline_matches_serve(cmd, port):
                     return int(entry)
-                for i, tok in enumerate(tokens):
-                    if (
-                        tok == "--port" and i + 1 < len(tokens)
-                        and tokens[i + 1] == port
-                    ):
-                        return int(entry)
             except (OSError, ValueError):
                 continue
     except OSError:

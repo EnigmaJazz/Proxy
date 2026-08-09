@@ -642,15 +642,27 @@ async def reclassify_with_professional(
         result = dict(defaults)
         if isinstance(payload.get("intent"), str):
             result["intent"] = payload["intent"].upper()
-        if isinstance(payload.get("priority"), int):
-            result["priority"] = payload["priority"]
+        # Values are clamped + type-checked: the reclassifier's output is
+        # steerable via prompt injection in user_text, and unclamped values
+        # would flow straight into the generation sampling parameters.
+        prio = payload.get("priority")
+        if isinstance(prio, int) and 1 <= prio <= 3:
+            result["priority"] = prio
         if isinstance(payload.get("complexity"), str):
             result["complexity"] = payload["complexity"].lower()
         if isinstance(payload.get("parameters"), dict):
-            result["parameters"] = {
-                k: v for k, v in payload["parameters"].items()
-                if k in ("temperature", "top_p", "thinking_budget_tokens")
-            }
+            params: dict[str, Any] = {}
+            temp = payload["parameters"].get("temperature")
+            if isinstance(temp, (int, float)) and 0.0 <= float(temp) <= 1.5:
+                params["temperature"] = float(temp)
+            top_p = payload["parameters"].get("top_p")
+            if isinstance(top_p, (int, float)) and 0.0 <= float(top_p) <= 1.0:
+                params["top_p"] = float(top_p)
+            tb = payload["parameters"].get("thinking_budget_tokens")
+            if isinstance(tb, int) and 0 <= tb <= 8192:
+                params["thinking_budget_tokens"] = tb
+            if params:
+                result["parameters"] = params
         return result
     except (httpx.HTTPError, OSError, ValueError, AttributeError):
         return defaults

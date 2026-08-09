@@ -1737,6 +1737,12 @@ class TestServeStability:
         assert "serve" in calls[0]
         assert "--pure" not in calls[0]
         assert envs[0]["XDG_CONFIG_HOME"] == opencode_bridge.OPENCODE_SERVE_CONFIG_DIR
+        # Serve isolation: data + cache are redirected into the serve dir,
+        # never shared with the TUI (2026-08-09).
+        assert envs[0]["XDG_DATA_HOME"] == opencode_bridge.OPENCODE_SERVE_CONFIG_DIR
+        assert envs[0]["XDG_CACHE_HOME"].startswith(
+            opencode_bridge.OPENCODE_SERVE_CONFIG_DIR,
+        )
         # Cache updated after the successful spawn (drift gate baseline).
         assert opencode_bridge._serve_config_mtime == \
             opencode_bridge.os.path.getmtime(opencode_bridge.OPCODE_CONFIG_PATH)

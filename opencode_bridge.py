@@ -479,6 +479,14 @@ async def _spawn_serve(mtime: Optional[float]) -> bool:
         )
         # Candidate B: serve-scoped config dir (never ~/.config/opencode).
         serve_env["XDG_CONFIG_HOME"] = OPENCODE_SERVE_CONFIG_DIR
+        # Full serve isolation (2026-08-09): the serve must NOT share the
+        # TUI's data/cache locations.  The shared session DB + plugin
+        # caches caused cross-process contention (systematic plugin's
+        # models.json cache, session storage churn) and let the serve's
+        # stalls poison the TUI and vice versa.  Data (sessions) and cache
+        # now live under the serve-config dir, unique to the serve.
+        serve_env["XDG_DATA_HOME"] = OPENCODE_SERVE_CONFIG_DIR
+        serve_env["XDG_CACHE_HOME"] = os.path.join(OPENCODE_SERVE_CONFIG_DIR, "cache")
         args = [
             OPENCODE_BIN, "serve", "--port", port, "--hostname", "127.0.0.1",
         ]

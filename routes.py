@@ -268,6 +268,8 @@ def _parse_coding_answer(text: str) -> str:
         return "cancel"
     if any(k in lowered for k in ("opencode", "/opencode")):
         return "opencode"
+    if any(k in lowered for k in ("sdd", "spec-driven", "spec driven", "sd cycle")):
+        return "sdd"
     return "professional"
 
 
@@ -2560,20 +2562,28 @@ async def _apply_coding_decision_gate(
     # ---- Fresh coding request: prompt once, then cache the choice ------
     if route.intent == "CODE" and not has_tool_calls:
         decision = decisions.get(session_id)
-        if decision == "opencode":
+        if decision in ("opencode", "sdd"):
+            is_sdd = decision == "sdd"
             resp = await _opencode_task_response(
                 _last_user_text(messages),
                 client_stream,
                 session_map=_opencode_session_state(app),
                 session_key=session_id,
                 pending_permissions=_pending_permissions_state(app),
+                system_prompt=(
+                    _SDD_AUTONOMOUS_SYSTEM_PROMPT if is_sdd else _BRIDGE_SYSTEM_PROMPT
+                ),
+                timeout=OPENCODE_SDD_TIMEOUT if is_sdd else OPENCODE_SERVE_TIMEOUT,
+                autonomous=is_sdd,
             )
             await _persist_opencode_sessions(app)
             return resp
         if decision is None:
             question = (
-                f"{_CODING_QUESTION_PREFIX} Coding task detected — route to OpenCode "
-                f"or the local code pathway (Professional)? Reply `opencode` or `local`."
+                f"{_CODING_QUESTION_PREFIX} Coding task detected — route to OpenCode, "
+                f"the local code pathway (Professional), or a full SDD cycle "
+                f"(spec → design → tasks → apply → verify)? Reply `opencode`, "
+                f"`local`, or `sdd`."
             )
             # Advisory local-model difficulty assessment shown in the question.
             # Best-effort: any failure here must never block the gate, so the
@@ -2595,12 +2605,18 @@ async def _apply_coding_decision_gate(
                 reason = assessment.get("reason", "")
                 if difficulty and recommendation:
                     reason_suffix = f" ({reason})" if reason else ""
+                    if difficulty == "low":
+                        # Simple coding task — the user asked for no prompt:
+                        # route straight through (the recommendation's route)
+                        # and keep the normal flow.
+                        decisions[session_id] = recommendation
                     question = (
-                        f"{_CODING_QUESTION_PREFIX} Coding task detected — route to OpenCode "
-                        f"or the local code pathway (Professional)?\n\n"
+                        f"{_CODING_QUESTION_PREFIX} Coding task detected — route to OpenCode, "
+                        f"the local code pathway (Professional), or a full SDD cycle "
+                        f"(spec → design → tasks → apply → verify)?\n\n"
                         f"🔍 Local model assessment: {difficulty} difficulty — "
                         f"recommends `{recommendation}`{reason_suffix}\n\n"
-                        f"Reply `opencode` or `local`."
+                        f"Reply `opencode`, `local`, or `sdd`."
                     )
             except (httpx.HTTPError, OSError, AttributeError, ValueError):
                 logger.exception(

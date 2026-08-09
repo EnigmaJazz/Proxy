@@ -120,6 +120,12 @@ _TASK_WEDGE_AFTER_S: float = 600.0
 # How often the stream checks the session for a wedged tool part.
 _WEDGE_CHECK_INTERVAL_S: float = 10.0
 
+#: How often the BLOCKING path (opencode_chat) polls GET /permission while
+#: its message POST is in flight.  The blocking call has no SSE bus, so a
+#: parked permission gate is only visible through polling; 5s matches the
+#: streaming path's permission-check cadence class.
+_BLOCKING_PERMISSION_POLL_S: float = 5.0
+
 # Sentinel-prefixed proxy status the opencode client accumulates into the
 # assistant text (the proxy emits triage as the first SSE chunk).  The
 # triage formats are stable (routes._build_triage_message).  Stripping the
@@ -293,6 +299,26 @@ async def _post_permission_response(
             return resp.status_code == 200
     except (httpx.HTTPError, OSError):
         return False
+
+
+async def _abort_session_best_effort(
+    client: httpx.AsyncClient,
+    session_id: str,
+) -> None:
+    """Best-effort abort of one opencode session (blocking-path cleanup).
+
+    The blocking escalation path has no SSE bus, so it cannot watch for
+    wedged tools; when it gives up on a session (timeout, HTTP error,
+    write-permission abort) it must not leave a busy zombie behind.
+    Never raises.
+    """
+    try:
+        await client.post(
+            f"{OPENCODE_SERVE_URL}/session/{session_id}/abort",
+            timeout=10.0,
+        )
+    except (httpx.HTTPError, OSError):
+        pass
 
 
 async def _handle_permission_event(
@@ -496,6 +522,22 @@ async def _spawn_serve(mtime: Optional[float]) -> bool:
         )
         # Candidate B: serve-scoped config dir (never ~/.config/opencode).
         serve_env["XDG_CONFIG_HOME"] = OPENCODE_SERVE_CONFIG_DIR
+        # The serve's openai provider needs the ChatGPT-Plus OAuth access
+        # token as its API key (the auth.json openai entry is OAuth, and
+        # the SDK's provider refuses to load it without a key).  Pass it
+        # via the env so no token ever lands in a config file; the token
+        # is refreshed from auth.json at every spawn.
+        try:
+            with open(
+                os.path.expanduser("~/.local/share/opencode/auth.json"),
+                encoding="utf-8",
+            ) as _af:
+                _auth = json.load(_af)
+            _tok = (_auth.get("openai") or {}).get("access")
+            if _tok:
+                serve_env["OPENAI_API_KEY"] = _tok
+        except (OSError, ValueError, TypeError):
+            pass
         # Full serve isolation (2026-08-09): the serve must NOT share the
         # TUI's data/cache locations.  The shared session DB + plugin
         # caches caused cross-process contention (systematic plugin's
@@ -542,6 +584,7 @@ async def opencode_chat(
     provider_id: str = "kinver",
     timeout: float = OPENCODE_SERVE_TIMEOUT,
     system_prompt: str = _BRIDGE_SYSTEM_PROMPT,
+    autonomous: bool = False,
 ) -> str:
     """Send a task to headless opencode and return the assistant text.
 
@@ -549,6 +592,15 @@ async def opencode_chat(
     the agent finishes), and concatenates the ``text`` parts.  Proxy-status
     sentinel segments are stripped from the result.  Returns an error
     string on failure (escalation-friendly, never raises).
+
+    While the message POST is in flight the call polls ``GET /permission``
+    (``_BLOCKING_PERMISSION_POLL_S`` cadence): READ asks are auto-allowed,
+    WRITE/git asks are NOT granted (headless callers have no user to relay
+    a question to) — the session is aborted and a clear error is returned
+    instead of burning the full timeout on a parked agent.  ``autonomous``
+    preserves the streaming path's auto-allow-all semantics.  On every
+    non-success exit the created session is aborted best-effort so no busy
+    zombie is left on the serve.
     """
     if not await ensure_opencode_serve():
         return "[OpenCode Bridge Failed: opencode serve not reachable.]"
@@ -566,7 +618,7 @@ async def opencode_chat(
             if not session_id:
                 return "[OpenCode Bridge Error: no session id returned.]"
 
-            # ---- 2. Post the message (blocks until the agent finishes) ----
+            # ---- 2. Post the message, watching for permission gates ------
             payload: dict[str, Any] = {
                 "agent": agent,
                 "system": system_prompt,
@@ -578,12 +630,51 @@ async def opencode_chat(
                     "providerID": provider_id,
                     "variant": "default",
                 }
-            resp = await client.post(
-                f"{OPENCODE_SERVE_URL}/session/{session_id}/message",
-                json=payload,
-                timeout=timeout,
+            # The POST runs as a task so the poller below can watch GET
+            # /permission concurrently (httpx clients are concurrency-safe).
+            post_task = asyncio.create_task(
+                client.post(
+                    f"{OPENCODE_SERVE_URL}/session/{session_id}/message",
+                    json=payload,
+                    timeout=timeout,
+                )
             )
+            try:
+                last_poll = time.monotonic()
+                while True:
+                    if post_task.done():
+                        # Raises httpx/OSError on transport failure.
+                        resp = post_task.result()
+                        break
+                    if time.monotonic() - last_poll >= _BLOCKING_PERMISSION_POLL_S:
+                        last_poll = time.monotonic()
+                        perm = await _detect_pending_permission(client, session_id)
+                        if perm is not None:
+                            question = await _handle_permission_event(
+                                client, session_id, perm, {},
+                                autonomous=autonomous,
+                            )
+                            if question:
+                                # Interactive-mode WRITE/git ask on a headless
+                                # blocking call: no user can answer, and the
+                                # queue-worker path must never grant writes
+                                # unprompted — abort and surface a clear error
+                                # instead of streaming keepalives or granting.
+                                await _abort_session_best_effort(client, session_id)
+                                return (
+                                    "[OpenCode Bridge Error: agent requested write "
+                                    "permission — headless escalation cannot relay "
+                                    "questions; session aborted.]"
+                                )
+                    await asyncio.sleep(min(0.25, _BLOCKING_PERMISSION_POLL_S))
+            except (httpx.HTTPError, OSError) as exc:
+                await _abort_session_best_effort(client, session_id)
+                return f"[OpenCode Bridge Network Error: {str(exc)}]"
+            finally:
+                if not post_task.done():
+                    post_task.cancel()
             if resp.status_code != 200:
+                await _abort_session_best_effort(client, session_id)
                 return f"[OpenCode Bridge Error: message HTTP {resp.status_code}]"
             data = resp.json()
             parts = data.get("parts", [])
@@ -1089,6 +1180,11 @@ async def opencode_escalation(stage: int, prompt: str) -> str:
 
     Directs the user prompt to the opencode gentle-orchestrator agent
     OpenRouter.  ``stage`` is informational (passed through to logging).
+
+    Conservative by design: this headless worker path runs with
+    ``autonomous=False`` — READ permissions are auto-allowed, WRITE/git
+    asks abort the session with a clear error (no user is present to
+    relay a question, and unprompted grants are never issued).
     """
     logger.info("OpenCode escalation (stage=%d): %r", stage, prompt[:200])
     return await opencode_chat(prompt, agent=OPENCODE_AGENT)

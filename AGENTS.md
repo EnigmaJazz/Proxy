@@ -79,6 +79,15 @@ project-specific.
    request, shared state lives on `proxy.app.state.*`. Module-level mutable
    globals are forbidden except cached constants in `constants.py`.
 
+   **Documented carve-out — serve-config mtime cache** (`opencode_bridge.py`
+   `_serve_config_mtime`): a scalar `Optional[float]` cache of the serve
+   config's last-synced mtime, mutated only in `_sync_serve_config` /
+   `_spawn_serve`. The spawn gate has no `app.state` handle (it runs from
+   scripts and tests too), so threading app state through would couple the
+   bridge's core to the FastAPI app. Accepted as a project exception
+   (2026-08-09, F5 note in `opencode_bridge.py`); the cache is a scalar
+   timestamp, never a container.
+
 7. **Tests**: new code paths MUST have a regression test. Use the harness in
    `tests/conftest.py` (stubs FlashRank + heavy deps, lifespan disabled).
    Async tests need `@pytest_asyncio.fixture` (NOT plain `@pytest.fixture`).

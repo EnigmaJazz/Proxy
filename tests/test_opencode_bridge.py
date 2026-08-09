@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sys
 import time
 from types import SimpleNamespace
 from typing import Any, AsyncIterator, Iterator, Optional
@@ -70,6 +69,11 @@ class _FakeClient:
         self.get_timeouts: list[Any] = []
         self.stream_lines: list[str] = []
         self.message_get_parts: list[dict[str, Any]] = []
+        # Blocking-path scripting (opencode_chat hardening): scripted
+        # GET /permission records and a message POST that hangs briefly so
+        # the permission poller gets a chance to run.
+        self.permission_records: list[dict[str, Any]] = []
+        self.message_hang_s: float = 0.0
 
     async def __aenter__(self) -> "_FakeClient":
         return self
@@ -90,6 +94,9 @@ class _FakeClient:
         if "/session/status" in url:
             # Event-stream end → polling fallback → session is idle (done).
             return _FakeResp(200, {self.session_id: {"type": "idle"}})
+        if url.endswith("/permission"):
+            # Blocking-path permission poll (opencode_chat hardening).
+            return _FakeResp(200, self.permission_records)
         return _FakeResp(self.get_status, {})
 
     async def post(self, url: str, **kwargs: Any) -> _FakeResp:
@@ -97,6 +104,13 @@ class _FakeClient:
         self.post_calls.append((url, kwargs.get("json")))
         if self.raise_on == "post":
             raise httpx.ConnectError("conn refused")
+        if self.raise_timeout_on == "post" and "/message" in url:
+            # Blocking-path message-POST timeout (opencode_chat hardening);
+            # pinned to "/message" URLs so the session-create POST still
+            # succeeds and the abort path can be asserted.
+            raise httpx.ReadTimeout("read timed out")
+        if self.message_hang_s and "/message" in url:
+            await asyncio.sleep(self.message_hang_s)
         if url.endswith("/session"):
             return _FakeResp(self.session_status, {"id": self.session_id})
         if "prompt_async" in url:
@@ -159,10 +173,14 @@ PP: dict[str, tuple[str, bool]] = {}
 def _clean_pending_permissions() -> None:
     """PP survives across tests — clear it before AND after each test so a
     stored write permission never leaks into another test (keyed by session
-    id; tests reuse "ses_0001")."""
+    id; tests reuse "ses_0001").  HERMETIC_KILLED_PIDS accumulates across
+    the module and must be reset too: the wedge-path assertion
+    ``HERMETIC_KILLED_PIDS == []`` is otherwise order-dependent."""
     PP.clear()
+    HERMETIC_KILLED_PIDS.clear()
     yield
     PP.clear()
+    HERMETIC_KILLED_PIDS.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -394,6 +412,124 @@ class TestOpenCodeChat:
         fake_client.message_parts = []
         result = await opencode_chat("task")
         assert "[OpenCode Bridge Error: empty response.]" in result
+
+
+class TestOpenCodeChatHardening:
+    """Blocking-path hardening (bridge-cycle-5): permission polling during
+    the message POST + session cleanup on every non-success exit.
+
+    Hermetic: scripted _FakeClient, no live serve.  The poll cadence is
+    monkeypatched to 0.01s and the message POST hangs briefly so the
+    permission poller gets deterministic turns.
+    """
+
+    @pytest.mark.asyncio
+    async def test_timeout_aborts_session(
+        self, fake_client: _FakeClient, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(opencode_bridge, "_BLOCKING_PERMISSION_POLL_S", 0.01)
+        fake_client.raise_timeout_on = "post"
+        result = await opencode_chat("task", timeout=10.0)
+        assert result.startswith("[OpenCode Bridge Network Error:")
+        assert any(
+            url.endswith("/abort") for url, _ in fake_client.post_calls
+        )
+
+    @pytest.mark.asyncio
+    async def test_message_503_aborts_session(
+        self, fake_client: _FakeClient, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(opencode_bridge, "_BLOCKING_PERMISSION_POLL_S", 0.01)
+        fake_client.message_status = 503
+        result = await opencode_chat("task")
+        assert result == "[OpenCode Bridge Error: message HTTP 503]"
+        assert any(
+            url.endswith("/abort") for url, _ in fake_client.post_calls
+        )
+
+    @pytest.mark.asyncio
+    async def test_read_permission_auto_allowed(
+        self, fake_client: _FakeClient, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(opencode_bridge, "_BLOCKING_PERMISSION_POLL_S", 0.01)
+        fake_client.message_hang_s = 0.2
+        fake_client.message_parts = [{"type": "text", "text": "ok"}]
+        fake_client.permission_records = [{
+            "id": "perm_1",
+            "sessionID": "ses_0001",
+            "permission": "external_directory",
+            "patterns": ["cat /etc/os-release"],
+            "tool": {"messageID": "m1", "callID": "c1"},
+        }]
+        result = await opencode_chat("task")
+        assert result == "ok"
+        assert any(
+            url.endswith("/permissions/perm_1") and body == {"response": "always"}
+            for url, body in fake_client.post_calls
+        )
+        assert not any(
+            url.endswith("/abort") for url, _ in fake_client.post_calls
+        )
+
+    @pytest.mark.asyncio
+    async def test_write_permission_aborts(
+        self, fake_client: _FakeClient, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(opencode_bridge, "_BLOCKING_PERMISSION_POLL_S", 0.01)
+        fake_client.message_hang_s = 0.2
+        fake_client.message_parts = [{"type": "text", "text": "ok"}]
+        fake_client.permission_records = [{
+            "id": "perm_2",
+            "sessionID": "ses_0001",
+            "permission": "write",
+            "patterns": ["rm -rf /x"],
+            "tool": {"messageID": "m1", "callID": "c1"},
+        }]
+        result = await opencode_chat("task")
+        assert "[OpenCode Bridge Error:" in result
+        assert "write permission" in result
+        assert any(
+            url.endswith("/abort") for url, _ in fake_client.post_calls
+        )
+
+    @pytest.mark.asyncio
+    async def test_autonomous_write_auto_allowed(
+        self, fake_client: _FakeClient, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(opencode_bridge, "_BLOCKING_PERMISSION_POLL_S", 0.01)
+        fake_client.message_hang_s = 0.2
+        fake_client.message_parts = [{"type": "text", "text": "ok"}]
+        fake_client.permission_records = [{
+            "id": "perm_3",
+            "sessionID": "ses_0001",
+            "permission": "write",
+            "patterns": ["rm -rf /x"],
+            "tool": {"messageID": "m1", "callID": "c1"},
+        }]
+        result = await opencode_chat("task", autonomous=True)
+        assert result == "ok"
+        assert any(
+            url.endswith("/permissions/perm_3") and body == {"response": "always"}
+            for url, body in fake_client.post_calls
+        )
+        assert not any(
+            url.endswith("/abort") for url, _ in fake_client.post_calls
+        )
+
+    @pytest.mark.asyncio
+    async def test_success_no_permissions_unchanged(
+        self, fake_client: _FakeClient, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(opencode_bridge, "_BLOCKING_PERMISSION_POLL_S", 0.01)
+        fake_client.message_parts = [{"type": "text", "text": "plain success"}]
+        result = await opencode_chat("task")
+        assert result == "plain success"
+        assert not any(
+            url.endswith("/abort") for url, _ in fake_client.post_calls
+        )
+        assert not any(
+            "/permissions/" in url for url, _ in fake_client.post_calls
+        )
 
 
 class TestIsRunning:

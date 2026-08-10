@@ -28,6 +28,8 @@ import json
 import os
 import re
 import time
+from datetime import datetime
+from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
 import httpx
@@ -161,6 +163,59 @@ _TOOL_WEDGE_AFTER_S: float = 300.0
 _TASK_WEDGE_AFTER_S: float = 600.0
 # How often the stream checks the session for a wedged tool part.
 _WEDGE_CHECK_INTERVAL_S: float = 10.0
+
+#: Fallback plugin's project-local replay log (the rate-limit-fallback
+#: plugin mirrors its log into the repo's git dir).
+_FALLBACK_REPLAY_LOG = Path(__file__).parent / ".git" / "gentle-ai" / "rate-limit-fallback.log"
+
+#: A replay window stays open for this long after its last event before
+#: the reader treats it as stale.  Replays legitimately run 5-20 min, so
+#: the horizon must exceed that; the bound exists so a phantom window
+#: (start without a terminal event) cannot pause the hold/wedge forever.
+_FALLBACK_REPLAY_STALE_S: float = 1800.0
+
+
+def _replay_in_flight_for_any_session() -> bool:
+    """True when the fallback plugin shows a replay window open for any
+    session: a ``fallback_cycle_started`` event within the staleness
+    horizon with no terminal event after it.  The wedge timer and the
+    cycle driver's hold pause while a replay is in flight; a missing or
+    unreadable log fails closed to False (today's behavior).
+    """
+    try:
+        lines = _FALLBACK_REPLAY_LOG.read_text(
+            encoding="utf-8", errors="replace",
+        ).splitlines()
+    except OSError:
+        return False
+    open_window = False
+    horizon_ms = _FALLBACK_REPLAY_STALE_S * 1000.0
+    now_ms = time.time() * 1000.0
+    for line in lines[-200:]:
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        ts = rec.get("timestamp")
+        if not isinstance(ts, str):
+            continue
+        try:
+            ms = (
+                datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+                * 1000.0
+            )
+        except ValueError:
+            continue
+        if now_ms - ms > horizon_ms:
+            continue
+        event = str(rec.get("event", ""))
+        if event == "fallback_cycle_started":
+            open_window = True
+        elif any(k in event for k in
+                 ("completed", "failed", "cleared", "settled")):
+            open_window = False
+    return open_window
+
 
 #: How often the BLOCKING path (opencode_chat) polls GET /permission while
 #: its message POST is in flight.  The blocking call has no SSE bus, so a
@@ -563,6 +618,49 @@ async def ensure_opencode_serve() -> bool:
     return await _spawn_serve(mtime)
 
 
+
+def _sync_openai_auth_into_serve(serve_env: dict[str, str]) -> None:
+    """Refresh the serve's openai OAuth access token from the TUI/CLI
+    auth.json and copy the auth file into the serve's ISOLATED data
+    home (the chatgpt-headless route the TUI/CLI use — the env apiKey
+    alone is rejected: the ChatGPT-Plus OAuth token lacks the
+    api.responses.write scope).  Sync file I/O: callers run it via
+    asyncio.to_thread.  Never raises.
+    """
+    try:
+        with open(
+            os.path.expanduser("~/.local/share/opencode/auth.json"),
+            encoding="utf-8",
+        ) as _af:
+            _auth = json.load(_af)
+        _tok = (_auth.get("openai") or {}).get("access")
+        if _tok:
+            serve_env["OPENAI_API_KEY"] = _tok
+        # The serve's data home is ISOLATED (XDG_DATA_HOME ->
+        # serve-config), so its auth lookup would miss the TUI/CLI's
+        # auth.json (OAuth tokens) and fall back to the env apiKey
+        # (which the API rejects).  Copy the auth file into the serve's
+        # data home so the serve resolves the openai provider through
+        # the SAME chatgpt-headless OAuth route the TUI/CLI use
+        # (2026-08-09).
+        _serve_auth = os.path.join(
+            OPENCODE_SERVE_CONFIG_DIR, "opencode", "auth.json",
+        )
+        _src_auth = os.path.expanduser("~/.local/share/opencode/auth.json")
+        if os.path.exists(_src_auth):
+            os.makedirs(os.path.dirname(_serve_auth), exist_ok=True)
+            with open(_src_auth, "rb") as _sf, open(_serve_auth, "wb") as _df:
+                _df.write(_sf.read())
+            # The copy holds OAuth tokens: enforce the same 0600 the
+            # source auth.json carries (open('wb') would create it
+            # 0644 under a normal umask — world-readable).
+            try:
+                os.chmod(_serve_auth, 0o600)
+            except OSError:
+                pass
+    except (OSError, ValueError, TypeError):
+        pass
+
 async def _spawn_serve(mtime: Optional[float]) -> bool:
     """Spawn the opencode serve with the serve-scoped config (candidate B).
 
@@ -591,45 +689,9 @@ async def _spawn_serve(mtime: Optional[float]) -> bool:
         )
         # Candidate B: serve-scoped config dir (never ~/.config/opencode).
         serve_env["XDG_CONFIG_HOME"] = OPENCODE_SERVE_CONFIG_DIR
-        # The serve's openai provider needs the ChatGPT-Plus OAuth access
-        # token as its API key (the auth.json openai entry is OAuth, and
-        # the SDK's provider refuses to load it without a key).  Pass it
-        # via the env so no token ever lands in a config file; the token
-        # is refreshed from auth.json at every spawn.
-        try:
-            with open(
-                os.path.expanduser("~/.local/share/opencode/auth.json"),
-                encoding="utf-8",
-            ) as _af:
-                _auth = json.load(_af)
-            _tok = (_auth.get("openai") or {}).get("access")
-            if _tok:
-                serve_env["OPENAI_API_KEY"] = _tok
-            # The serve's data home is ISOLATED (XDG_DATA_HOME ->
-            # serve-config), so its auth lookup would miss the TUI/CLI's
-            # auth.json (OAuth tokens) and fall back to the env apiKey
-            # (which the API rejects: the ChatGPT-Plus OAuth token lacks
-            # the api.responses.write scope).  Copy the auth file into the
-            # serve's data home so the serve resolves the openai provider
-            # through the SAME chatgpt-headless OAuth route the TUI/CLI
-            # use (2026-08-09).
-            _serve_auth = os.path.join(
-                OPENCODE_SERVE_CONFIG_DIR, "opencode", "auth.json",
-            )
-            _src_auth = os.path.expanduser("~/.local/share/opencode/auth.json")
-            if os.path.exists(_src_auth):
-                os.makedirs(os.path.dirname(_serve_auth), exist_ok=True)
-                with open(_src_auth, "rb") as _sf, open(_serve_auth, "wb") as _df:
-                    _df.write(_sf.read())
-                # The copy holds OAuth tokens: enforce the same 0600 the
-                # source auth.json carries (open('wb') would create it
-                # 0644 under a normal umask — world-readable).
-                try:
-                    os.chmod(_serve_auth, 0o600)
-                except OSError:
-                    pass
-        except (OSError, ValueError, TypeError):
-            pass
+        # The auth sync is sync file I/O: keep it off the event loop
+        # (Rule 3 discipline — the config sync and log opens do the same).
+        await asyncio.to_thread(_sync_openai_auth_into_serve, serve_env)
         # Full serve isolation (2026-08-09): the serve must NOT share the
         # TUI's data/cache locations.  The shared session DB + plugin
         # caches caused cross-process contention (systematic plugin's

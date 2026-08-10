@@ -10,15 +10,19 @@ import argparse
 import asyncio
 import glob
 import os
+import subprocess
 import sys
 import time
+
+from typing import Optional
+
 import httpx
 
 sys.path.insert(0, ".")
 
 import opencode_bridge
 
-from scripts.sdd_cycle_common import STALL_S, CycleStalled, guard_stall
+from scripts.sdd_cycle_common import CycleStalled, guard_stall
 
 OPENCODE_SERVE_URL = "http://127.0.0.1:18900"
 SESSION_KEY_PREFIX = "sdd-autonomous-cycle"
@@ -32,6 +36,15 @@ SESSION_KEY_PREFIX = "sdd-autonomous-cycle"
 ARTIFACT_WAIT_S: float = 2400.0
 ARTIFACT_POLL_S: float = 20.0
 
+#: The go-proxy service whose request log is the "working" signal — the
+#: opencode-go proxy (port 8788) serves every model call the opencode
+#: serve makes.  Its journald request lines are the live activity signal
+#: (session parts lag by design; see 2026-08-10).
+_GO_PROXY_SERVICE = "opencode-go-proxy"
+
+#: How far back the go-proxy journal window reaches per hold poll.
+_GO_PROXY_ACTIVITY_WINDOW_S: float = 120.0
+
 #: The opencode serve can die mid-cycle (1.18.15: silent death under
 #: sustained multi-session traffic — 2026-08-08).  The bridge auto-
 #: respawns it on the next call, and the pinned session survives; the
@@ -42,6 +55,57 @@ MAX_STREAM_ATTEMPTS: int = 12
 def _artifacts_for(change: str) -> list[str]:
     """Sorted *.md artifacts for a change dir (or [])."""
     return sorted(glob.glob(f"openspec/changes/{change}/*.md"))
+
+
+def _count_go_proxy_calls(journal_text: str) -> int:
+    """Count model-call request lines in the go-proxy journal text.
+
+    Pure parser so tests can inject a fake journal output; the live
+    journal's request lines carry the stream/request markers.
+    """
+    return sum(
+        1 for ln in journal_text.splitlines()
+        if any(k in ln for k in ("stream", "request"))
+    )
+
+
+def _recent_go_proxy_calls(window_s: float = _GO_PROXY_ACTIVITY_WINDOW_S) -> int:
+    """Model-call activity through the opencode-go proxy in the recent
+    window — the authoritative "working" signal (session-part timestamps
+    lag by design; the go-proxy's request log reflects live model
+    activity).  Unavailable journald fails closed to 0.
+    """
+    try:
+        out = subprocess.run(
+            ["journalctl", "-u", _GO_PROXY_SERVICE, "--since",
+             f"{int(window_s)} sec ago", "--no-pager", "-o", "short-iso"],
+            capture_output=True, text=True, timeout=15.0,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    return _count_go_proxy_calls(out)
+
+
+def hold_decision(*, recent_calls: int, session_busy: bool,
+                  replay_in_flight: bool, budget: int) -> tuple[str, int]:
+    """One poll of the driver's hold state machine.
+
+    Returns (action, new_budget) consumed directly by the wait loop:
+      - ("hold", full_budget)  working activity: reset the budget.
+      - ("hold", budget)       replay in flight: pause the drain.
+      - ("drain", budget - 1)  no working activity: drain one poll.
+      - ("resume", 0)          budget exhausted: resume now.
+    """
+    full_budget = int(ARTIFACT_WAIT_S / ARTIFACT_POLL_S)
+    if replay_in_flight:
+        # The replay window pauses the drain entirely; a phantom replay
+        # window is bounded by its staleness horizon on the bridge side.
+        return "hold", budget
+    if recent_calls > 0 or session_busy:
+        return "hold", full_budget
+    if budget <= 1:
+        return "resume", 0
+    return "drain", budget - 1
 
 
 async def _serve_sessions_active() -> bool:
@@ -205,31 +269,41 @@ async def main(change: str, code_writer: str = "local") -> None:
             # next attempt force-recycles + respawns + resumes the pin.
             dead_polls = 0
             wait_budget = int(ARTIFACT_WAIT_S / ARTIFACT_POLL_S)
-            busy_resets = 0
             while wait_budget > 0:
                 if _cycle_complete(change):
                     break
-                if await _serve_sessions_active():
-                    # Sessions are busy doing real work (the parts lag) —
-                    # reset the budget and keep waiting, never resume
-                    # against a working phase.  BOUNDED: a session stuck
-                    # 'busy' forever (the serve reports prompt_async
-                    # sessions busy even after completion) must not keep
-                    # the driver waiting indefinitely — after
-                    # MAX_BUSY_RESETS the budget drains and the resume/
-                    # recycle recovery fires.
-                    busy_resets += 1
-                    if busy_resets <= 6:
-                        wait_budget = int(ARTIFACT_WAIT_S / ARTIFACT_POLL_S)
-                else:
-                    busy_resets = 0
+                # The go-proxy's model-call flow is the authoritative
+                # "working" signal (part timestamps lag by design); the
+                # serve's busy flag stays as the secondary signal.  A
+                # fallback-model replay pauses the drain entirely.
+                recent_calls = await asyncio.to_thread(
+                    _recent_go_proxy_calls,
+                )
+                replay = await asyncio.to_thread(
+                    opencode_bridge._replay_in_flight_for_any_session,
+                )
+                session_busy = await _serve_sessions_active()
+                action, wait_budget = hold_decision(
+                    recent_calls=recent_calls,
+                    session_busy=session_busy,
+                    replay_in_flight=replay,
+                    budget=wait_budget,
+                )
+                print(
+                    f"[HOLD] calls={recent_calls} busy={session_busy} "
+                    f"replay={replay} action={action} budget={wait_budget}",
+                    flush=True,
+                )
+                if action == "resume":
+                    print("[HOLD] budget drained; resuming pinned session",
+                          flush=True)
+                    break
                 serve_up = await opencode_bridge.is_opencode_serve_running()
                 dead_polls = 0 if serve_up else dead_polls + 1
                 if dead_polls >= 3:  # ~60s with a dead serve → resume now
                     print("[serve down; resuming pinned session]", flush=True)
                     break
                 await asyncio.sleep(ARTIFACT_POLL_S)
-                wait_budget -= 1
             if _cycle_complete(change):
                 break
     except SystemExit:

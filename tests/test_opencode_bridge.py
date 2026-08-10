@@ -2937,6 +2937,10 @@ class TestServeStability:
                             _scripted_running([False]))
         monkeypatch.setattr(opencode_bridge, "_sync_serve_config", lambda: None)
         monkeypatch.setattr(opencode_bridge, "_open_serve_log", lambda: None)
+        # Never touch the real auth.json (OAuth tokens) during tests.
+        monkeypatch.setattr(
+            opencode_bridge, "_sync_openai_auth_into_serve", lambda env: None,
+        )
 
         async def _exec(*args: Any, **kwargs: Any) -> Any:
             calls.append(list(args))
@@ -2990,6 +2994,10 @@ class TestServeStability:
                             lambda pid, sig: killed.append(pid))
         monkeypatch.setattr(opencode_bridge, "_sync_serve_config", lambda: None)
         monkeypatch.setattr(opencode_bridge, "_open_serve_log", lambda: None)
+        # Never touch the real auth.json (OAuth tokens) during tests.
+        monkeypatch.setattr(
+            opencode_bridge, "_sync_openai_auth_into_serve", lambda env: None,
+        )
 
         async def _exec(*args: Any, **kwargs: Any) -> Any:
             spawns.append(list(args))
@@ -3068,6 +3076,10 @@ class TestServeStability:
                             lambda pid, sig: killed.append(pid))
         monkeypatch.setattr(opencode_bridge, "_sync_serve_config", lambda: None)
         monkeypatch.setattr(opencode_bridge, "_open_serve_log", lambda: None)
+        # Never touch the real auth.json (OAuth tokens) during tests.
+        monkeypatch.setattr(
+            opencode_bridge, "_sync_openai_auth_into_serve", lambda env: None,
+        )
 
         async def _exec(*args: Any, **kwargs: Any) -> Any:
             spawns.append(list(args))
@@ -3550,3 +3562,249 @@ class TestSddSubagentContract:
         assert "SUB-AGENT CONTRACT (MANDATORY" in prompt
         assert "SDD-CYCLE-TERMINAL-FAILURE" in prompt
         assert "RETRY the " in prompt
+
+
+class TestWedgeReplayCarveOut:
+    """The 600s task-part wedge must not fire while the fallback log
+    shows a replay in flight (a replayed turn can run 5-20 min with the
+    task part silent); non-task wedges stay untouched."""
+
+    @staticmethod
+    def _parts(task_running_for_s: int) -> list[dict]:
+        import time as _t
+        return [{
+            "type": "tool",
+            "tool": "task",
+            "state": {
+                "status": "running",
+                "time": {"start": int((_t.time() - task_running_for_s) * 1000)},
+            },
+        }]
+
+    @staticmethod
+    def _client_with(parts: list[dict]) -> _PollClient:
+        client = _PollClient()
+        client.poll_messages = [{"parts": parts}]
+        return client
+
+    @pytest.mark.asyncio
+    async def test_wedged_task_with_replay_in_flight_is_paused(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        log = tmp_path / "rate-limit-fallback.log"
+        log.write_text(
+            json.dumps({
+                "timestamp": "2099-01-01T00:00:00.000Z",
+                "event": "fallback_cycle_started",
+                "sessionID": "ses_child",
+            })
+        )
+        monkeypatch.setattr("opencode_bridge._FALLBACK_REPLAY_LOG", log)
+        monkeypatch.setattr(opencode_bridge, "_TASK_WEDGE_AFTER_S", 60.0)
+        monkeypatch.setattr(opencode_bridge, "_serve_start_epoch_ms", lambda: 0)
+        client = self._client_with(self._parts(task_running_for_s=120))
+        assert await opencode_bridge._detect_wedged_tool(client, "ses_0001") is False
+
+    @pytest.mark.asyncio
+    async def test_wedged_task_without_replay_still_fires(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        log = tmp_path / "rate-limit-fallback.log"
+        log.write_text(
+            json.dumps({
+                "timestamp": "2000-01-01T00:00:00.000Z",  # stale window
+                "event": "fallback_cycle_started",
+                "sessionID": "ses_child",
+            })
+        )
+        monkeypatch.setattr("opencode_bridge._FALLBACK_REPLAY_LOG", log)
+        monkeypatch.setattr(opencode_bridge, "_TASK_WEDGE_AFTER_S", 60.0)
+        monkeypatch.setattr(opencode_bridge, "_serve_start_epoch_ms", lambda: 0)
+        client = self._client_with(self._parts(task_running_for_s=120))
+        assert await opencode_bridge._detect_wedged_tool(client, "ses_0001") is True
+
+    @pytest.mark.asyncio
+    async def test_wedged_bash_fires_even_with_replay(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        log = tmp_path / "rate-limit-fallback.log"
+        log.write_text(
+            json.dumps({
+                "timestamp": "2099-01-01T00:00:00.000Z",
+                "event": "fallback_cycle_started",
+                "sessionID": "ses_child",
+            })
+        )
+        monkeypatch.setattr("opencode_bridge._FALLBACK_REPLAY_LOG", log)
+        monkeypatch.setattr(opencode_bridge, "_TOOL_WEDGE_AFTER_S", 60.0)
+        monkeypatch.setattr(opencode_bridge, "_serve_start_epoch_ms", lambda: 0)
+        parts = [{
+            "type": "tool",
+            "tool": "bash",
+            "state": {
+                "status": "running",
+                "time": {"start": int((time.time() - 120) * 1000)},
+            },
+        }]
+        client = self._client_with(parts)
+        assert await opencode_bridge._detect_wedged_tool(client, "ses_0001") is True
+
+    @pytest.mark.asyncio
+    async def test_unreadable_replay_log_fails_closed(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        log = tmp_path / "rate-limit-fallback.log"
+        log.write_text("garbage not json\n")
+        monkeypatch.setattr("opencode_bridge._FALLBACK_REPLAY_LOG", log)
+        monkeypatch.setattr(opencode_bridge, "_TASK_WEDGE_AFTER_S", 60.0)
+        monkeypatch.setattr(opencode_bridge, "_serve_start_epoch_ms", lambda: 0)
+        client = self._client_with(self._parts(task_running_for_s=120))
+        # Fails closed: today's wedge behavior (fire).
+        assert await opencode_bridge._detect_wedged_tool(client, "ses_0001") is True
+
+
+class TestSyncOpenaiAuthIntoServe:
+    """The serve's openai OAuth sync (token env + auth.json copy + 0600)
+    must be hermetic in tests: no real auth.json reads, no real writes to
+    the serve config dir."""
+
+    def _fake_auth(self, tmp_path, token: str = "tok_abc") -> str:
+        p = tmp_path / "auth.json"
+        p.write_text(json.dumps({"openai": {"access": token}}))
+        return str(p)
+
+    def test_token_env_and_copy_with_0600(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        src = self._fake_auth(tmp_path)
+        cfg_dir = tmp_path / "serve-config"
+        monkeypatch.setattr("opencode_bridge.OPENCODE_SERVE_CONFIG_DIR", str(cfg_dir))
+        monkeypatch.setattr(
+            "opencode_bridge.os.path.expanduser",
+            lambda p: src if p.endswith("auth.json") else p,
+        )
+        env: dict[str, str] = {}
+        opencode_bridge._sync_openai_auth_into_serve(env)
+        assert env["OPENAI_API_KEY"] == "tok_abc"
+        copied = cfg_dir / "opencode" / "auth.json"
+        assert copied.exists()
+        assert copied.read_text() == json.dumps({"openai": {"access": "tok_abc"}})
+        assert (copied.stat().st_mode & 0o777) == 0o600
+
+    def test_missing_source_is_silent(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        cfg_dir = tmp_path / "serve-config"
+        monkeypatch.setattr("opencode_bridge.OPENCODE_SERVE_CONFIG_DIR", str(cfg_dir))
+        monkeypatch.setattr(
+            "opencode_bridge.os.path.expanduser",
+            lambda p: str(tmp_path / "missing.json"),
+        )
+        env: dict[str, str] = {}
+        opencode_bridge._sync_openai_auth_into_serve(env)  # never raises
+        assert "OPENAI_API_KEY" not in env
+
+    def test_corrupt_auth_json_is_silent(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        src = tmp_path / "auth.json"
+        src.write_text("not json")
+        monkeypatch.setattr("opencode_bridge.OPENCODE_SERVE_CONFIG_DIR", str(tmp_path))
+        monkeypatch.setattr(
+            "opencode_bridge.os.path.expanduser",
+            lambda p: str(src),
+        )
+        env: dict[str, str] = {}
+        opencode_bridge._sync_openai_auth_into_serve(env)  # never raises
+        assert "OPENAI_API_KEY" not in env
+
+
+class TestSessionBusyOnCurrentServe:
+    """Quiet-but-working sessions (a running tool part on the current
+    serve) must survive the zombie sweep."""
+
+    @pytest.mark.asyncio
+    async def test_running_tool_after_serve_start_is_busy(self) -> None:
+        client = _PollClient()
+        client.poll_messages = [_assistant_msg([{
+            "id": "prt_t", "messageID": "msg_a", "type": "tool",
+            "tool": "bash",
+            "state": {
+                "status": "running",
+                "time": {"start": int(time.time() * 1000) - 30_000},
+            },
+        }])]
+        serve_start_ms = int(time.time() * 1000) - 300_000
+        assert await opencode_bridge._session_busy_on_current_serve(
+            client, client.session_id, serve_start_ms,
+        ) is True
+
+    @pytest.mark.asyncio
+    async def test_stale_part_is_not_busy(self) -> None:
+        client = _PollClient()
+        client.poll_messages = [_assistant_msg([{
+            "id": "prt_t", "messageID": "msg_a", "type": "tool",
+            "tool": "bash",
+            "state": {
+                "status": "running",
+                "time": {"start": int(time.time() * 1000) - 600_000},
+            },
+        }])]
+        serve_start_ms = int(time.time() * 1000) - 300_000
+        assert await opencode_bridge._session_busy_on_current_serve(
+            client, client.session_id, serve_start_ms,
+        ) is False
+
+    @pytest.mark.asyncio
+    async def test_completed_part_is_not_busy(self) -> None:
+        client = _PollClient()
+        client.poll_messages = [_assistant_msg([{
+            "id": "prt_t", "messageID": "msg_a", "type": "tool",
+            "tool": "bash",
+            "state": {
+                "status": "completed",
+                "time": {"start": int(time.time() * 1000) - 30_000},
+            },
+        }])]
+        serve_start_ms = int(time.time() * 1000) - 300_000
+        assert await opencode_bridge._session_busy_on_current_serve(
+            client, client.session_id, serve_start_ms,
+        ) is False
+
+    @pytest.mark.asyncio
+    async def test_http_error_is_not_busy(self) -> None:
+        client = _FakeClient()
+        client.raise_on = "get"
+        assert await opencode_bridge._session_busy_on_current_serve(
+            client, "ses_0001", int(time.time() * 1000),
+        ) is False
+
+
+class TestCopyIfChanged:
+    def test_identical_content_skips_write(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        src = tmp_path / "src.json"
+        src.write_text("same")
+        dst = tmp_path / "dst.json"
+        dst.write_text("same")
+        calls: list[str] = []
+        orig_open = open
+
+        def fake_open(path, mode="r", encoding=None, **kw):
+            calls.append(f"{path}:{mode}")
+            return orig_open(path, mode, encoding=encoding, **kw)
+
+        monkeypatch.setattr("builtins.open", fake_open)
+        opencode_bridge._copy_if_changed(str(tmp_path / "src.json"), str(dst))
+        assert not any(":w" in c or ":wb" in c for c in calls)
+
+    def test_different_content_writes(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        src = tmp_path / "src.json"
+        src.write_text("new")
+        dst = tmp_path / "dst.json"
+        dst.write_text("old")
+        opencode_bridge._copy_if_changed(str(src), str(dst))
+        assert dst.read_text() == "new"

@@ -1681,6 +1681,16 @@ async def _detect_wedged_tool(client: httpx.AsyncClient, session_id: str) -> boo
                     else _TOOL_WEDGE_AFTER_S
                 )
                 if now_ms - start_ms > threshold_s * 1000:
+                    # REPLAY CARVE-OUT (2026-08-10): a fallback-model
+                    # replay can legitimately run 5-20 min with the task
+                    # part silent (the replayed turn streams no output
+                    # until it lands).  Do not wedge while the fallback
+                    # log shows a replay in flight; fails closed to the
+                    # pre-carve-out behavior when the log is unreadable.
+                    if p.get("tool") == "task" and await asyncio.to_thread(
+                        _replay_in_flight_for_any_session,
+                    ):
+                        continue
                     logger.warning(
                         "wedged tool part %r running without output for %.0fs — session %s",
                         p.get("tool"), elapsed_s, str(session_id)[:16],

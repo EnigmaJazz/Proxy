@@ -138,3 +138,92 @@ class TestReplayWindowReader:
         log.write_text("this is not json\n")
         monkeypatch.setattr("opencode_bridge._FALLBACK_REPLAY_LOG", log)
         assert _replay_in_flight_for_any_session() is False
+
+
+class TestTerminalFailureMarker:
+    """The driver must detect the orchestrator's loud-failure marker in
+    the pinned session and exit terminally instead of resuming."""
+
+    @staticmethod
+    def _fake_client(resp_json, status=200):
+        import httpx as _httpx
+
+        class _FakeResp:
+            status_code = status
+
+            def json(self):
+                return resp_json
+
+        class _FakeClient:
+            def __init__(self, *a, **kw):
+                self._resp = _FakeResp()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, url, **kw):
+                self.url = url
+                return self._resp
+
+        return _FakeClient
+
+    @pytest.mark.asyncio
+    async def test_marker_in_session_text_detected(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from opencode_bridge import _SDD_TERMINAL_FAILURE_MARKER
+
+        client = self._fake_client([
+            {"parts": [
+                {"type": "text",
+                 "text": f"finished. {_SDD_TERMINAL_FAILURE_MARKER}: spec"},
+            ]},
+        ])
+        monkeypatch.setattr(driver.httpx, "AsyncClient", client)
+        assert await driver._session_has_terminal_marker("ses_0001") is True
+
+    @pytest.mark.asyncio
+    async def test_no_marker_is_false(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        client = self._fake_client([
+            {"parts": [{"type": "text", "text": "cycle continues"}]},
+        ])
+        monkeypatch.setattr(driver.httpx, "AsyncClient", client)
+        assert await driver._session_has_terminal_marker("ses_0001") is False
+
+    @pytest.mark.asyncio
+    async def test_transport_error_is_false(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import httpx as _httpx
+
+        class _BrokenClient:
+            def __init__(self, *a, **kw):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, url, **kw):
+                raise _httpx.ConnectError("conn refused")
+
+        monkeypatch.setattr(driver.httpx, "AsyncClient", _BrokenClient)
+        assert await driver._session_has_terminal_marker("ses_0001") is False
+
+    @pytest.mark.asyncio
+    async def test_non_text_parts_ignored(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        client = self._fake_client([
+            {"parts": [{"type": "tool", "tool": "bash",
+                        "state": {"status": "completed"}}]},
+        ])
+        monkeypatch.setattr(driver.httpx, "AsyncClient", client)
+        assert await driver._session_has_terminal_marker("ses_0001") is False

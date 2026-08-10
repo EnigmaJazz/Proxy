@@ -137,6 +137,31 @@ async def _serve_sessions_active() -> bool:
         return False
 
 
+async def _session_has_terminal_marker(session_id: str) -> bool:
+    """True when the pinned session's parts carry the loud-failure marker
+    (the orchestrator ended the cycle terminally — an inline phase failed
+    to produce its artifact).  Never raises; transport failures read
+    False (the driver falls back to the normal resume path).
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"{OPENCODE_SERVE_URL}/session/{session_id}/message",
+            )
+            if resp.status_code != 200:
+                return False
+            for msg in resp.json():
+                for p in msg.get("parts") or []:
+                    if p.get("type") != "text":
+                        continue
+                    if opencode_bridge._SDD_TERMINAL_FAILURE_MARKER in \
+                            (p.get("text") or ""):
+                        return True
+    except (httpx.HTTPError, OSError, ValueError):
+        return False
+    return False
+
+
 def _cycle_complete(change: str) -> bool:
     """True when the change dir carries the archive-report.md marker --
     the archive phase's report is the LAST artifact a full SDD cycle
@@ -230,6 +255,7 @@ async def main(change: str, code_writer: str = "local") -> None:
     session_key = f"{SESSION_KEY_PREFIX}-{change}-{int(time.time())}"
     print("== autonomous SDD cycle ==", flush=True)
     print(f"[code writer: {code_writer}]", flush=True)
+    terminal_failure: Optional[str] = None
     try:
         for attempt in range(MAX_STREAM_ATTEMPTS):
             # Resume the SAME pinned session across attempts: the serve
@@ -255,12 +281,35 @@ async def main(change: str, code_writer: str = "local") -> None:
                         print(f"  {text[:130]}", flush=True)
                     elif kind == "text":
                         print(f"  text: {text[:200]}", flush=True)
+                        if opencode_bridge._SDD_TERMINAL_FAILURE_MARKER in text:
+                            _tail = text.split(
+                                opencode_bridge._SDD_TERMINAL_FAILURE_MARKER,
+                                1,
+                            )[1].split(":", 1)
+                            terminal_failure = (
+                                _tail[1].strip().split(" ")[0]
+                                if len(_tail) > 1 else "?"
+                            )
+                            print(
+                                f"[TERMINAL FAILURE marker seen; phase="
+                                f"{terminal_failure}]",
+                                flush=True,
+                            )
             except CycleStalled as exc:
                 print(f"\n[STALL attempt {attempt + 1}] {exc}", flush=True)
                 # Force-recycle + resume on the next attempt.
                 await opencode_bridge._force_recycle_serve("SDD cycle stalled")
                 continue
             if _cycle_complete(change):
+                break
+            # Loud terminal failure: an inline phase failed to produce
+            # its artifact — never resume.  Check the pinned session
+            # (the marker may have landed in a previous stream).
+            _sid = session_map.get(session_key)
+            if _sid and await _session_has_terminal_marker(_sid):
+                print("[TERMINAL FAILURE marker in pinned session]",
+                      flush=True)
+                terminal_failure = terminal_failure or "unknown"
                 break
             print(f"[stream {attempt + 1} ended; cycle still working — waiting]",
                   flush=True)
@@ -271,6 +320,11 @@ async def main(change: str, code_writer: str = "local") -> None:
             wait_budget = int(ARTIFACT_WAIT_S / ARTIFACT_POLL_S)
             while wait_budget > 0:
                 if _cycle_complete(change):
+                    break
+                if _sid and await _session_has_terminal_marker(_sid):
+                    print("[TERMINAL FAILURE marker in pinned session]",
+                          flush=True)
+                    terminal_failure = terminal_failure or "unknown"
                     break
                 # The go-proxy's model-call flow is the authoritative
                 # "working" signal (part timestamps lag by design); the
@@ -311,6 +365,16 @@ async def main(change: str, code_writer: str = "local") -> None:
     except Exception as exc:  # never crash the driver on a transport error
         print(f"[ERROR] {exc}", flush=True)
         raise SystemExit(1) from None
+
+    if terminal_failure is not None:
+        print(
+            f"\n[TERMINAL FAILURE] phase={terminal_failure} — the cycle "
+            "ended loudly; artifacts preserved below.",
+            flush=True,
+        )
+        for p in _artifacts_for(change):
+            print(" ", p, flush=True)
+        raise SystemExit(3) from None
 
     print("\n== openspec artifacts ==", flush=True)
     for p in _artifacts_for(change):

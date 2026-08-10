@@ -71,6 +71,13 @@ _BRIDGE_SYSTEM_PROMPT = (
 # the bridge is a single request/response and the user will not answer
 # follow-ups mid-cycle.  The preflight choices are supplied in the task
 # text; the orchestrator caches them and proceeds.
+#: The exact marker the orchestrator ends its final message with when an
+#: inline phase fails to produce its artifact (the loud terminal failure
+#: of the sub-agent contract).  The cycle driver matches it to exit
+#: loudly instead of resuming.
+_SDD_TERMINAL_FAILURE_MARKER = "SDD-CYCLE-TERMINAL-FAILURE"
+
+
 #: Canonical SDD sub-agent contract. Shared verbatim with the cycle
 #: driver's task text (``build_task``) and the serve-config orchestrator
 #: prompt; the sync test ``test_sdd_subagent_contract_sites_in_sync``
@@ -95,7 +102,7 @@ _SDD_SUBAGENT_CONTRACT = (
     "archive-report.md. Never skip a phase's artifact. If an inline phase "
     "also fails to produce its artifact, STOP the cycle immediately: end "
     "your final message with the exact marker "
-    "'SDD-CYCLE-TERMINAL-FAILURE: <phase>' and list the artifacts produced "
+    "'" + _SDD_TERMINAL_FAILURE_MARKER + ": <phase>' and list the artifacts produced "
     "so far - do NOT retry, do NOT continue the pipeline, do NOT ask the "
     "user anything."
 )

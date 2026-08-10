@@ -562,6 +562,135 @@ class TestOpenCodeChatHardening:
             "/permissions/" in url for url, _ in fake_client.post_calls
         )
 
+    # -- bridge-cycle-4 REQ-4: bounded blocking respawn ---------------------
+
+    @pytest.mark.asyncio
+    async def test_blocking_respawn_single_retry(
+        self, fake_client: _FakeClient, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """REQ-4 Scenario-1: one network-class failure after a successful
+        ensure → exactly one recycle + re-ensure + one retry; the retried
+        call returns its text."""
+        from opencode_bridge import opencode_chat
+
+        ensure_results = [True, True]
+        ensure_calls: list[str] = []
+        recycle_calls: list[str] = []
+
+        async def _ensure() -> bool:
+            ensure_calls.append("ensure")
+            return ensure_results.pop(0)
+
+        async def _recycle(reason: str = "long-lived call") -> None:
+            recycle_calls.append(reason)
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _ensure)
+        monkeypatch.setattr(opencode_bridge, "_force_recycle_serve", _recycle)
+
+        fake_client.fail_post_times = 1
+        fake_client.message_parts = [{"type": "text", "text": "recovered"}]
+        result = await opencode_chat("task")
+
+        assert result == "recovered"
+        assert len(ensure_calls) == 2
+        assert recycle_calls == ["blocking-path respawn"]
+        msg_posts = [
+            url for url, _ in fake_client.post_calls if "/message" in url
+        ]
+        assert len(msg_posts) == 2
+
+    @pytest.mark.asyncio
+    async def test_blocking_respawn_second_failure_returns_error(
+        self, fake_client: _FakeClient, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """REQ-4 Scenario-2: when the single retry also fails, the error
+        string is returned and no second recycle/third attempt occurs."""
+        from opencode_bridge import opencode_chat
+
+        ensure_results = [True, True]
+        recycle_calls: list[str] = []
+
+        async def _ensure() -> bool:
+            return ensure_results.pop(0)
+
+        async def _recycle(reason: str = "long-lived call") -> None:
+            recycle_calls.append(reason)
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _ensure)
+        monkeypatch.setattr(opencode_bridge, "_force_recycle_serve", _recycle)
+
+        fake_client.fail_post_times = 2
+        result = await opencode_chat("task")
+
+        assert result.startswith("[OpenCode Bridge Network Error:")
+        assert len(recycle_calls) == 1
+        msg_posts = [
+            url for url, _ in fake_client.post_calls if "/message" in url
+        ]
+        assert len(msg_posts) == 2
+
+    @pytest.mark.asyncio
+    async def test_blocking_no_retry_on_http_error(
+        self, fake_client: _FakeClient, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """REQ-4 Scenario-3: an HTTP-status failure never triggers the
+        recycle/retry — the existing HTTP error string is returned."""
+        from opencode_bridge import opencode_chat
+
+        ensure_calls: list[str] = []
+        recycle_calls: list[str] = []
+
+        async def _ensure() -> bool:
+            ensure_calls.append("ensure")
+            return True
+
+        async def _recycle(reason: str = "long-lived call") -> None:
+            recycle_calls.append(reason)
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _ensure)
+        monkeypatch.setattr(opencode_bridge, "_force_recycle_serve", _recycle)
+
+        fake_client.message_status = 503
+        result = await opencode_chat("task")
+
+        assert result == "[OpenCode Bridge Error: message HTTP 503]"
+        assert recycle_calls == []
+        assert len(ensure_calls) == 1
+        msg_posts = [
+            url for url, _ in fake_client.post_calls if "/message" in url
+        ]
+        assert len(msg_posts) == 1
+
+    @pytest.mark.asyncio
+    async def test_blocking_respawn_reensure_failure(
+        self, fake_client: _FakeClient, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """REQ-4: a failed re-ensure after the recycle returns the
+        not-reachable error — exactly one recycle, no retry attempt."""
+        from opencode_bridge import opencode_chat
+
+        ensure_results = [True, False]
+        recycle_calls: list[str] = []
+
+        async def _ensure() -> bool:
+            return ensure_results.pop(0)
+
+        async def _recycle(reason: str = "long-lived call") -> None:
+            recycle_calls.append(reason)
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _ensure)
+        monkeypatch.setattr(opencode_bridge, "_force_recycle_serve", _recycle)
+
+        fake_client.fail_post_times = 1
+        result = await opencode_chat("task")
+
+        assert result == "[OpenCode Bridge Failed: opencode serve not reachable.]"
+        assert len(recycle_calls) == 1
+        msg_posts = [
+            url for url, _ in fake_client.post_calls if "/message" in url
+        ]
+        assert len(msg_posts) == 1
+
 
 class TestStreamExitHygiene:
     """Streaming-path error-exit hygiene (bridge-cycle-6): every error
@@ -709,6 +838,88 @@ class TestStreamExitHygiene:
             url.endswith("/abort") for url, _ in client.post_calls
         )
         assert smap == {"conv": "ses_0001"}  # success path leaves the pin
+
+
+class TestStalePinSelfHeal:
+    """Serve-lifecycle REQ-2 (bridge-cycle-4): a pinned session that a
+    SUCCESSFUL /session/status fetch no longer lists is stale — drop the
+    pin and start fresh instead of posting to a nonexistent session.  A
+    transport-error fetch keeps the pin conservatively.
+
+    Hermetic: scripted _FakeClient + monkeypatched ensure, no live serve.
+    """
+
+    @staticmethod
+    async def _running(*args: Any, **kwargs: Any) -> bool:
+        return True
+
+    @pytest.mark.asyncio
+    async def test_stale_pin_dropped_when_status_lacks_id(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """REQ-2 Scenario-1: a successful status fetch WITHOUT the pinned id
+        drops the pin and POSTs a fresh /session; no abort is fired (the
+        session is gone)."""
+        from opencode_bridge import opencode_chat_stream
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", self._running)
+        client = _FakeClient()
+        client.status_map = {}  # serve lists NO sessions
+        client.stream_lines = _stream_events()
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        smap: dict[str, str] = {"conv": "ses_0001"}
+        deltas = [
+            d async for d in opencode_chat_stream(
+                "task", session_map=smap, session_key="conv",
+            )
+        ]
+
+        # The stream still completes on the fresh session.
+        text = [t for k, t in deltas if k == "text"]
+        assert "Created file." in text
+        assert "Done." in text
+        # A fresh session POST happened (a kept pin would reuse the id
+        # without POSTing) and no abort fired for the nonexistent session.
+        session_posts = [
+            url for url, _ in client.post_calls if url.endswith("/session")
+        ]
+        assert len(session_posts) == 1
+        assert smap == {"conv": "ses_0001"}  # repinned to the fresh session
+        assert not any(
+            url.endswith("/abort") for url, _ in client.post_calls
+        )
+
+    @pytest.mark.asyncio
+    async def test_pin_kept_on_status_fetch_transport_error(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """REQ-2 Scenario-2: a transport-error status fetch keeps the pin —
+        no fresh /session POST; the pinned session is used and the stream
+        completes."""
+        from opencode_bridge import opencode_chat_stream
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", self._running)
+        client = _FakeClient()
+        client.raise_timeout_on = "get"  # status fetch raises ReadTimeout
+        client.stream_lines = _stream_events()
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        smap: dict[str, str] = {"conv": "ses_0001"}
+        deltas = [
+            d async for d in opencode_chat_stream(
+                "task", session_map=smap, session_key="conv",
+            )
+        ]
+
+        # The pinned session carried the stream; the pin was kept.
+        text = [t for k, t in deltas if k == "text"]
+        assert "Created file." in text
+        assert "Done." in text
+        assert not any(
+            url.endswith("/session") for url, _ in client.post_calls
+        )
+        assert smap == {"conv": "ses_0001"}
 
 
 class TestIsRunning:
@@ -2251,10 +2462,131 @@ class TestServeHealth:
 
         monkeypatch.setattr(opencode_bridge, "_serve_health", _health)
         monkeypatch.setattr(opencode_bridge, "_find_serve_pid", _find)
+        # REQ-3 (bridge-cycle-4): the kill primitive now verifies the pid's
+        # cmdline before signalling — patch the verifier to confirm.
+        monkeypatch.setattr(
+            opencode_bridge, "_pid_is_serve", lambda pid, port: True,
+        )
         monkeypatch.setattr(opencode_bridge.os, "kill", lambda pid, sig: killed.append(pid))
 
         await _recycle_serve_if_low_memory()
         assert killed == [12345]
+
+    @pytest.mark.asyncio
+    async def test_recycle_kills_on_pid_match(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """REQ-3 Scenario-1: the low-memory recycle verifies the pid's
+        cmdline and kills on a match."""
+        from opencode_bridge import _recycle_serve_if_low_memory
+
+        killed: list[int] = []
+
+        def _health(port: str) -> tuple[bool, float]:
+            return False, 3600.0  # old serve, recycle condition met
+
+        def _find(port: str) -> int:
+            return 12345
+
+        async def _down(*args: Any, **kwargs: Any) -> bool:
+            return False  # drain breaks immediately
+
+        monkeypatch.setattr(opencode_bridge, "_serve_health", _health)
+        monkeypatch.setattr(opencode_bridge, "_find_serve_pid", _find)
+        monkeypatch.setattr(opencode_bridge, "_pid_is_serve", lambda pid, port: True)
+        monkeypatch.setattr(opencode_bridge, "is_opencode_serve_running", _down)
+        monkeypatch.setattr(opencode_bridge.os, "kill", lambda pid, sig: killed.append(pid))
+
+        await _recycle_serve_if_low_memory()
+        assert killed == [12345]
+
+    @pytest.mark.asyncio
+    async def test_recycle_skips_kill_on_pid_mismatch(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """REQ-3 Scenario-2: a pid whose cmdline no longer matches the serve
+        (reused by another process) is NEVER signalled."""
+        from opencode_bridge import _recycle_serve_if_low_memory
+
+        killed: list[int] = []
+
+        def _health(port: str) -> tuple[bool, float]:
+            return False, 3600.0
+
+        def _find(port: str) -> int:
+            return 12345
+
+        monkeypatch.setattr(opencode_bridge, "_serve_health", _health)
+        monkeypatch.setattr(opencode_bridge, "_find_serve_pid", _find)
+        monkeypatch.setattr(opencode_bridge, "_pid_is_serve", lambda pid, port: False)
+        monkeypatch.setattr(opencode_bridge.os, "kill", lambda pid, sig: killed.append(pid))
+
+        await _recycle_serve_if_low_memory()
+        assert killed == []
+
+    @pytest.mark.asyncio
+    async def test_force_recycle_kills_on_pid_match(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """REQ-3: _force_recycle_serve verifies the pid and kills on match."""
+        from opencode_bridge import _force_recycle_serve
+
+        killed: list[int] = []
+
+        def _find(port: str) -> int:
+            return 12345
+
+        async def _down(*args: Any, **kwargs: Any) -> bool:
+            return False
+
+        monkeypatch.setattr(opencode_bridge, "_find_serve_pid", _find)
+        monkeypatch.setattr(opencode_bridge, "_pid_is_serve", lambda pid, port: True)
+        monkeypatch.setattr(opencode_bridge, "is_opencode_serve_running", _down)
+        monkeypatch.setattr(opencode_bridge.os, "kill", lambda pid, sig: killed.append(pid))
+
+        await _force_recycle_serve("test")
+        assert killed == [12345]
+
+    @pytest.mark.asyncio
+    async def test_force_recycle_skips_kill_on_pid_mismatch(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """REQ-3: a mismatched pid is never signalled by the force recycle."""
+        from opencode_bridge import _force_recycle_serve
+
+        killed: list[int] = []
+
+        def _find(port: str) -> int:
+            return 12345
+
+        monkeypatch.setattr(opencode_bridge, "_find_serve_pid", _find)
+        monkeypatch.setattr(opencode_bridge, "_pid_is_serve", lambda pid, port: False)
+        monkeypatch.setattr(opencode_bridge.os, "kill", lambda pid, sig: killed.append(pid))
+
+        await _force_recycle_serve("test")
+        assert killed == []
+
+    def test_pid_is_serve_matches_cmdline(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """REQ-3: the pid verifier reads /proc/<pid>/cmdline and applies the
+        shared serve matcher; a missing cmdline counts as mismatch."""
+        from opencode_bridge import _pid_is_serve
+
+        _patch_proc_cmdline(
+            monkeypatch,
+            b"/home/user/.opencode/bin/opencode\x00serve\x00"
+            b"--port\x0018999\x00--hostname\x00127.0.0.1\x00",
+        )
+        assert _pid_is_serve(4242, "18999") is True
+        assert _pid_is_serve(4242, "1899") is False   # exact port only
+        assert _pid_is_serve(4242, "189990") is False  # prefix must not match
+
+        def _missing(path: str, *a: Any, **kw: Any) -> Any:
+            raise FileNotFoundError(path)
+
+        monkeypatch.setattr("builtins.open", _missing)
+        assert _pid_is_serve(4242, "18999") is False  # unreadable → mismatch
 
     @pytest.mark.asyncio
     async def test_young_serve_not_recycled(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2460,6 +2792,9 @@ class TestServeDrain:
     ) -> list[int]:
         killed: list[int] = []
         monkeypatch.setattr(opencode_bridge, "_find_serve_pid", lambda port: 424242)
+        # REQ-3 (bridge-cycle-4): the kill primitives verify the pid's
+        # cmdline before signalling — confirm the fake pid.
+        monkeypatch.setattr(opencode_bridge, "_pid_is_serve", lambda pid, port: True)
         monkeypatch.setattr(
             opencode_bridge.os, "kill", lambda pid, sig: killed.append(pid),
         )
@@ -2649,6 +2984,8 @@ class TestServeStability:
         monkeypatch.setattr(opencode_bridge, "is_opencode_serve_running",
                             _scripted_running([True, False, True]))
         monkeypatch.setattr(opencode_bridge, "_find_serve_pid", lambda port: 12345)
+        # REQ-3 (bridge-cycle-4): verify the pid before the drift kill.
+        monkeypatch.setattr(opencode_bridge, "_pid_is_serve", lambda pid, port: True)
         monkeypatch.setattr(opencode_bridge.os, "kill",
                             lambda pid, sig: killed.append(pid))
         monkeypatch.setattr(opencode_bridge, "_sync_serve_config", lambda: None)
@@ -2725,6 +3062,8 @@ class TestServeStability:
         monkeypatch.setattr(opencode_bridge, "_serve_config_mtime", 1000.0)
         monkeypatch.setattr(opencode_bridge, "_config_mtime", lambda: 2000.0)
         monkeypatch.setattr(opencode_bridge, "_find_serve_pid", lambda port: 12345)
+        # REQ-3 (bridge-cycle-4): verify the matched pid before the kill.
+        monkeypatch.setattr(opencode_bridge, "_pid_is_serve", lambda pid, port: True)
         monkeypatch.setattr(opencode_bridge.os, "kill",
                             lambda pid, sig: killed.append(pid))
         monkeypatch.setattr(opencode_bridge, "_sync_serve_config", lambda: None)

@@ -3511,3 +3511,42 @@ class TestCompletionResolvesPermissions:
                    for u, b in perm_posts)
         # No pending entry leaked.
         assert PP.get("ses_0001") is None
+
+
+class TestSddSubagentContract:
+    """The SDD sub-agent contract is the single source of truth for the
+    bounded delegation rule (artifact-check-first, retry-once, inline
+    fallback, loud terminal failure).  The bridge prompt, the cycle
+    driver's task text, and the serve-config orchestrator prompt must
+    all carry the canonical contract; drift fails here."""
+
+    def test_contract_has_bounded_rule_and_marker(self) -> None:
+        c = opencode_bridge._SDD_SUBAGENT_CONTRACT
+        assert "RETRY the " in c and "ONCE" in c
+        assert "CHECK the phase artifact on disk FIRST" in c
+        assert "perform that phase INLINE" in c
+        assert "SDD-CYCLE-TERMINAL-FAILURE" in c
+        assert "never start a retry while the original sub-agent session" in c
+        # The old unbounded rule is gone from the canonical text.
+        assert "DO NOT retry the sub-agent" not in c
+
+    def test_bridge_prompt_embeds_contract(self) -> None:
+        assert opencode_bridge._SDD_SUBAGENT_CONTRACT in \
+            opencode_bridge._SDD_AUTONOMOUS_SYSTEM_PROMPT
+
+    def test_driver_task_text_embeds_contract(self) -> None:
+        import scripts.sdd_autonomous_cycle as driver  # type: ignore[import-not-found]
+        task = driver.build_task("bridge-cycle-sync", "cloud")
+        assert opencode_bridge._SDD_SUBAGENT_CONTRACT in task
+        # The old "delegate once, no retry" rule must not survive.
+        assert "DO NOT retry the sub-agent" not in task
+
+    def test_serve_config_prompt_embeds_contract(self) -> None:
+        import json as _json
+
+        raw = open("opencode-serve-config.opencode.jsonc", encoding="utf-8-sig").read()
+        cfg = _json.loads(raw)
+        prompt = cfg["agent"]["gentle-orchestrator"]["prompt"]
+        assert "SUB-AGENT CONTRACT (MANDATORY" in prompt
+        assert "SDD-CYCLE-TERMINAL-FAILURE" in prompt
+        assert "RETRY the " in prompt

@@ -69,6 +69,35 @@ _BRIDGE_SYSTEM_PROMPT = (
 # the bridge is a single request/response and the user will not answer
 # follow-ups mid-cycle.  The preflight choices are supplied in the task
 # text; the orchestrator caches them and proceeds.
+#: Canonical SDD sub-agent contract. Shared verbatim with the cycle
+#: driver's task text (``build_task``) and the serve-config orchestrator
+#: prompt; the sync test ``test_sdd_subagent_contract_sites_in_sync``
+#: guards against drift.  Supersedes the old "delegate ONCE, DO NOT retry"
+#: fallback rule with the bounded contract (artifact-check-first, one
+#: retry, inline fallback, loud terminal failure).
+_SDD_SUBAGENT_CONTRACT = (
+    "SUB-AGENT CONTRACT (MANDATORY): delegate each SDD phase to its phase "
+    "sub-agent (sdd-explore/sdd-propose/sdd-spec/sdd-design/sdd-tasks/"
+    "sdd-apply/sdd-verify/sdd-archive). If the sub-agent's result does not "
+    "arrive (the task tool hangs or errors), CHECK the phase artifact on "
+    "disk FIRST: if it exists, the work landed despite the delivery "
+    "failure - the phase is complete. If it is missing, RETRY the "
+    "sub-agent ONCE. If the retry also fails, check the artifact again: "
+    "exists -> complete; missing -> perform that phase INLINE yourself "
+    "with your own tools (read/write/edit/bash) and write the artifact "
+    "yourself. NEVER delegate a phase more than twice (initial + one "
+    "retry), and never start a retry while the original sub-agent session "
+    "is still running. A phase is COMPLETE ONLY when its artifact file "
+    "exists - proposal.md, specs/<change>/spec.md, design.md, tasks.md, "
+    "the applied code + tests, verify-report.md, and finally "
+    "archive-report.md. Never skip a phase's artifact. If an inline phase "
+    "also fails to produce its artifact, STOP the cycle immediately: end "
+    "your final message with the exact marker "
+    "'SDD-CYCLE-TERMINAL-FAILURE: <phase>' and list the artifacts produced "
+    "so far - do NOT retry, do NOT continue the pipeline, do NOT ask the "
+    "user anything."
+)
+
 _SDD_AUTONOMOUS_SYSTEM_PROMPT = (
     "You are the SDD orchestrator in AUTONOMOUS mode through a proxy "
     "bridge. Run the COMPLETE Spec-Driven Development cycle for the "
@@ -99,8 +128,11 @@ _SDD_AUTONOMOUS_SYSTEM_PROMPT = (
     "- Keep the final summary short: change name, artifacts produced, "
     "tests run, and any remaining risk.\n"
     "You still have full sub-agent access; use it for every phase. Do NOT "
-    "ask the user anything."
+    "ask the user anything.\n\n"
+    + _SDD_SUBAGENT_CONTRACT
 )
+
+
 
 # Recycle the opencode serve after this uptime: the serve's agent-loop
 # tool runner progressively wedges (bash hangs on trivial commands even

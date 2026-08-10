@@ -39,7 +39,9 @@ DEFAULT_PROFILES_PATH = CONFIG_ROOT / "model_profiles.yaml"
 # source of context_window.
 _MODEL_INTENTS: dict[str, tuple[str, ...]] = {
     "coder": ("code",),
-    "professional": ("chat", "code"),
+    # professional is the vision model: image requests (IMAGE intent)
+    # always route here with the image sampling profile.
+    "professional": ("chat", "code", "image"),
     "architect": ("code",),
     "creative": ("chat",),
     "scholar": ("chat",),
@@ -50,6 +52,8 @@ _MODEL_INTENTS: dict[str, tuple[str, ...]] = {
 _INTENT_DEFAULTS: dict[str, dict[str, Any]] = {
     "code": {"temperature": 0.2, "top_p": 0.95, "thinking_budget_tokens": 4096},
     "chat": {"temperature": 0.7, "top_p": 1.0, "thinking_budget_tokens": 0},
+    # Image analysis: precise and concise — low temperature, no long CoT.
+    "image": {"temperature": 0.2, "top_p": 0.9, "thinking_budget_tokens": 0},
 }
 
 _FALLBACK_ROWS: list[dict[str, Any]] = [

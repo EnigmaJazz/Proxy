@@ -29,7 +29,7 @@ from routes import (
 )
 from tests.conftest import _NoOpCooling, _NoOpDatabase, _NoOpSystemd
 
-QUESTION = f"{_CODING_QUESTION_PREFIX} Coding task detected — route to OpenCode or the local code pathway (Professional)? Reply `opencode` or `local`."
+QUESTION = f"{_CODING_QUESTION_PREFIX} Coding task detected — route to OpenCode or the local code pathway (Professional)? Reply `opencode`, `local`, or `sdd`."
 
 
 def _classification(intent: str = "CODE", *, tools_required: bool = False, is_valid: bool = True) -> dict[str, Any]:
@@ -394,7 +394,7 @@ class TestCodingDecisionGate:
     async def test_code_question_includes_difficulty_assessment(self, gate_client) -> None:
         """A fresh coding request shows the local model's difficulty
         assessment inside the question.  Advisory only — the answer domain
-        (Reply `opencode` or `local`.) is unchanged.
+        (Reply `opencode`, `local`, or `sdd`.) is unchanged.
         """
         with patch(
             "routes.classify_with_frontdesk",
@@ -424,7 +424,7 @@ class TestCodingDecisionGate:
         assert "high difficulty" in content
         assert "recommends `opencode`" in content
         assert "multi-file" in content
-        assert "Reply `opencode` or `local`." in content
+        assert "Reply `opencode`, `local`, or `sdd`." in content
 
     @pytest.mark.asyncio
     async def test_code_question_falls_back_when_assessment_fails(self, gate_client) -> None:
@@ -453,7 +453,7 @@ class TestCodingDecisionGate:
 
             assert response.status_code == 200
             assert "Coding decision" in text
-            assert "Reply `opencode` or `local`." in text
+            assert "Reply `opencode`, `local`, or `sdd`." in text
 
     @pytest.mark.asyncio
     async def test_assessment_skipped_for_non_code_intent(self, gate_client) -> None:
@@ -489,6 +489,18 @@ class TestCodingDecisionGate:
 # ---------------------------------------------------------------------------
 # Code-keyword heuristic (frontdesk says CHAT, keyword forces CODE)
 # ---------------------------------------------------------------------------
+
+
+    @pytest.mark.asyncio
+    async def test_sdd_answer_runs_autonomous_cycle(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The user's `sdd` reply to the coding question routes the task to
+        the opencode bridge in SDD-autonomous mode (the full cycle prompt,
+        the SDD timeout, autonomous=True)."""
+        from routes import _parse_coding_answer
+        assert _parse_coding_answer("use sdd please") == "sdd"
+        assert _parse_coding_answer("run a spec-driven cycle") == "sdd"
+        assert _parse_coding_answer("just local") == "professional"
+        assert _parse_coding_answer("opencode it") == "opencode"
 
 class TestCodeKeywordHeuristic:
     @pytest.mark.asyncio
@@ -874,7 +886,10 @@ class TestClientDisconnectCancellation:
 
         # Consume the triage chunk + one model chunk, then close the
         # generator (GeneratorExit) mid-stream inside the try block.
-        await gen.__anext__()  # triage
+        triage_chunk = await gen.__anext__()  # triage
+        # The triage must end on a newline so the model response does not
+        # run straight into it (2026-08-08).
+        assert triage_chunk.endswith("\n\n"), triage_chunk[-60:]
         await gen.__anext__()  # first model chunk
         await gen.aclose()
 
@@ -910,7 +925,7 @@ class TestEmbeddedCommandFalsePositive:
                             "function": {"name": "run_shell", "arguments": "{}"},
                         }]},
                         {"role": "tool", "tool_call_id": "call_1",
-                         "content": "~/.opencode/bin/opencode\n~/weight_loss/.git/opencode"},
+                         "content": "/home/user/.opencode/bin/opencode\n/home/user/weight_loss/.git/opencode"},
                         {"role": "user", "content": "thanks"},
                     ],
                     "stream": True,

@@ -3,61 +3,264 @@
 
 One message carries the change AND the full preflight choices, so the
 orchestrator runs proposal -> spec -> design -> tasks -> apply -> verify
--> archive in a single long-lived turn (OPENCODE_SDD_TIMEOUT=3600s),
-never stopping for per-phase questions.
+-> archive in a single long-lived turn (timeout=3600s), never stopping
+for per-phase questions.
 """
+import argparse
 import asyncio
+import glob
+import os
 import sys
+import time
+import httpx
 
 sys.path.insert(0, ".")
 
 import opencode_bridge
 
+from scripts.sdd_cycle_common import STALL_S, CycleStalled, guard_stall
+
 OPENCODE_SERVE_URL = "http://127.0.0.1:18900"
-SESSION_KEY = "sdd-autonomous-cycle"
+SESSION_KEY_PREFIX = "sdd-autonomous-cycle"
 
-TASK = """Use SDD to make this change:
+#: After the bridge stream ends (the orchestrator keeps working in
+#: sub-agent sessions, so the stream can end before the cycle does), wait
+#: up to this long for the change's OpenSpec artifacts to appear.  A full
+#: cycle takes ~30 min (proposal → archive), so the window must exceed
+#: that; verified 2026-08-08: the change dir appears ~10 min in, the
+#: archive report ~30 min in.
+ARTIFACT_WAIT_S: float = 2400.0
+ARTIFACT_POLL_S: float = 20.0
 
-CHANGE NAME: bridge-docs
-DESCRIPTION: Add a small documentation file to docs/ describing what
-proxy/opencode_bridge.py does and how it works (routes requests to a
-headless opencode serve backend, relays permissions, streams progress).
+#: The opencode serve can die mid-cycle (1.18.15: silent death under
+#: sustained multi-session traffic — 2026-08-08).  The bridge auto-
+#: respawns it on the next call, and the pinned session survives; the
+#: driver RESUMES the session instead of giving up.  Max stream attempts.
+MAX_STREAM_ATTEMPTS: int = 12
+
+
+def _artifacts_for(change: str) -> list[str]:
+    """Sorted *.md artifacts for a change dir (or [])."""
+    return sorted(glob.glob(f"openspec/changes/{change}/*.md"))
+
+
+async def _serve_sessions_active() -> bool:
+    """True when ANY session on the serve has a running tool part (the
+    session is busy generating/executing, not stalled).
+
+    The session parts' timestamps LAG (the serve's storage writes parts
+    late), so a quiet-looking phase is often still working — the model
+    calls keep flowing through the go-proxy.  The driver must not resume
+    against busy sessions; only a serve with NO working session is a
+    genuine stall candidate (2026-08-09).
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"{OPENCODE_SERVE_URL}/session/status", timeout=10.0,
+            )
+            if resp.status_code != 200:
+                return False
+            status_map = resp.json()
+            if not isinstance(status_map, dict):
+                return False
+            return any(
+                (s.get("type") == "busy" or bool(s.get("running")))
+                for s in status_map.values()
+                if isinstance(s, dict)
+            )
+    except (httpx.HTTPError, ValueError, OSError):
+        return False
+
+
+def _cycle_complete(change: str) -> bool:
+    """True when the change dir carries the archive-report.md marker --
+    the archive phase's report is the LAST artifact a full SDD cycle
+    writes (proposal.md alone only proves the cycle started)."""
+    return os.path.exists(
+        f"openspec/changes/{change}/archive-report.md",
+    )
+
+
+def build_task(change: str, code_writer: str = "local") -> str:
+    """Compose the SDD task prompt for a change name.
+
+    ``code_writer`` is "local" (apply uses the local model — may contend
+    with other local-model traffic) or "cloud" (apply uses the cloud
+    model, keeping the local models free for communication).
+    """
+    writer_label = "Local model" if code_writer == "local" else "Cloud model"
+    return f"""Use SDD to make this change:
+
+CHANGE NAME: {change}
 
 SDD SESSION PREFLIGHT (user-supplied, do NOT ask):
 - Pace: Automatic
 - Artifacts: Both (Engram + OpenSpec)
 - PRs: Single PR
 - Review budget: 400 lines
-- Code writer: Local model
+- Code writer: {writer_label}
 
-Run the complete SDD cycle end-to-end now."""
+Run the complete SDD cycle end-to-end now.
+
+LOCAL-MODEL DELEGATION RULE (MANDATORY): when delegating code work to
+the LOCAL model (apply's local writer), delegate ONE FILE at a time —
+one task per file — for big tasks.  Never bundle multiple files into a
+single local-model task: the local context window is limited, and a
+per-file task keeps each delegation within budget.
+
+TOOL RETRY RULE (MANDATORY): when a tool call fails with a transient
+error (e.g. "Tool execution aborted", connection resets), retry the
+tool ONCE immediately before giving up.  The serve's tool runner
+intermittently aborts in-flight tool executions (writes included);
+the retry normally succeeds.
+
+SUB-AGENT FALLBACK RULE (MANDATORY): delegate each SDD phase to its
+phase sub-agent (sdd-explore/sdd-propose/sdd-spec/sdd-design/sdd-tasks/
+sdd-apply/sdd-verify/sdd-archive) ONCE.  If a sub-agent's result does
+not arrive (the task tool hangs or errors), DO NOT retry the sub-agent:
+perform that phase INLINE yourself with your own tools
+(read/write/edit/bash).  A phase is COMPLETE ONLY when its artifact
+file exists — proposal.md, specs/<change>/spec.md, design.md,
+tasks.md, the applied code + tests, verify-report.md, and finally
+archive-report.md.  Never skip a phase's artifact: write it yourself
+and CONTINUE the pipeline in SDD order (proposal -> spec -> design ->
+tasks -> apply -> verify -> archive).  Inline phase work is always
+acceptable and often faster."""
 
 
-async def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Drive one autonomous SDD cycle through the opencode-sdd bridge model.",
+    )
+    parser.add_argument(
+        "--change",
+        required=True,
+        help="Change name (openspec/changes/<name>) the cycle runs against.",
+    )
+    parser.add_argument(
+        "--code-writer",
+        choices=("local", "cloud"),
+        default="local",
+        help="Who writes the apply-phase code: 'local' (default; may contend "
+             "with other local-model traffic) or 'cloud' (keeps the local "
+             "models free for communication).",
+    )
+    return parser
+
+
+
+def choose_code_writer(code_writer: Optional[str]) -> str:
+    """Resolve the apply-phase writer: an explicit --code-writer wins; a
+    non-interactive run (no stdin) defaults to 'local'; otherwise the user
+    is asked BEFORE the cycle starts."""
+    if code_writer:
+        return code_writer
+    try:
+        answer = input(
+            "Apply-phase code writer — 'local' (may contend with other "
+            "local-model traffic) or 'cloud' (keeps local models free for "
+            "communication)? [local/cloud] "
+        ).strip().lower()
+    except (EOFError, OSError):
+        print("[no stdin — defaulting code writer to 'local']", flush=True)
+        return "local"
+    return "cloud" if answer == "cloud" else "local"
+
+
+async def main(change: str, code_writer: str = "local") -> None:
     opencode_bridge.OPENCODE_SERVE_URL = OPENCODE_SERVE_URL
     session_map: dict[str, str] = {}
+    # Unique per run: a fresh key avoids colliding with a concurrent cycle
+    # on the same serve (each run pins its own session).
+    session_key = f"{SESSION_KEY_PREFIX}-{change}-{int(time.time())}"
     print("== autonomous SDD cycle ==", flush=True)
-    async for kind, text in opencode_bridge.opencode_chat_stream(
-        TASK,
-        agent="gentle-orchestrator",
-        session_map=session_map,
-        session_key=SESSION_KEY,
-        system_prompt=opencode_bridge._SDD_AUTONOMOUS_SYSTEM_PROMPT,
-        timeout=3600.0,  # matches OPENCODE_SDD_TIMEOUT
-    ):
-        if kind == "question":
-            print("\n[QUESTION - should not happen in autonomous mode]\n"
-                  + text[:400] + "\n[/QUESTION]\n", flush=True)
-        elif kind == "status":
-            print(f"  {text[:130]}", flush=True)
-        elif kind == "text":
-            print(f"  text: {text[:200]}", flush=True)
+    print(f"[code writer: {code_writer}]", flush=True)
+    try:
+        for attempt in range(MAX_STREAM_ATTEMPTS):
+            # Resume the SAME pinned session across attempts: the serve
+            # may die mid-cycle (silent death, opencode 1.18.15) and the
+            # next bridge call respawns it — the pinned session resumes
+            # where it stalled.  No-op after the cycle completes.
+            try:
+                async for kind, text in guard_stall(
+                    opencode_bridge.opencode_chat_stream(
+                        build_task(change, code_writer),
+                        agent="gentle-orchestrator",
+                        session_map=session_map,
+                        session_key=session_key,
+                        system_prompt=opencode_bridge._SDD_AUTONOMOUS_SYSTEM_PROMPT,
+                        timeout=7200.0,  # apply phases run past 60 min; the 3600s cap aborted them
+                        autonomous=True,  # PR-1: force-recycle + auto-allow
+                    )
+                ):
+                    if kind == "question":
+                        print("\n[QUESTION - should not happen in autonomous mode]\n"
+                              + text[:400] + "\n[/QUESTION]\n", flush=True)
+                    elif kind == "status":
+                        print(f"  {text[:130]}", flush=True)
+                    elif kind == "text":
+                        print(f"  text: {text[:200]}", flush=True)
+            except CycleStalled as exc:
+                print(f"\n[STALL attempt {attempt + 1}] {exc}", flush=True)
+                # Force-recycle + resume on the next attempt.
+                await opencode_bridge._force_recycle_serve("SDD cycle stalled")
+                continue
+            if _cycle_complete(change):
+                break
+            print(f"[stream {attempt + 1} ended; cycle still working — waiting]",
+                  flush=True)
+            # Let the orchestrator/sub-agents work, then resume the stream.
+            # Resume EARLY when the serve dies (its sessions stall): the
+            # next attempt force-recycles + respawns + resumes the pin.
+            dead_polls = 0
+            wait_budget = int(ARTIFACT_WAIT_S / ARTIFACT_POLL_S)
+            busy_resets = 0
+            while wait_budget > 0:
+                if _cycle_complete(change):
+                    break
+                if await _serve_sessions_active():
+                    # Sessions are busy doing real work (the parts lag) —
+                    # reset the budget and keep waiting, never resume
+                    # against a working phase.  BOUNDED: a session stuck
+                    # 'busy' forever (the serve reports prompt_async
+                    # sessions busy even after completion) must not keep
+                    # the driver waiting indefinitely — after
+                    # MAX_BUSY_RESETS the budget drains and the resume/
+                    # recycle recovery fires.
+                    busy_resets += 1
+                    if busy_resets <= 6:
+                        wait_budget = int(ARTIFACT_WAIT_S / ARTIFACT_POLL_S)
+                else:
+                    busy_resets = 0
+                serve_up = await opencode_bridge.is_opencode_serve_running()
+                dead_polls = 0 if serve_up else dead_polls + 1
+                if dead_polls >= 3:  # ~60s with a dead serve → resume now
+                    print("[serve down; resuming pinned session]", flush=True)
+                    break
+                await asyncio.sleep(ARTIFACT_POLL_S)
+                wait_budget -= 1
+            if _cycle_complete(change):
+                break
+    except SystemExit:
+        raise
+    except Exception as exc:  # never crash the driver on a transport error
+        print(f"[ERROR] {exc}", flush=True)
+        raise SystemExit(1) from None
 
-    import glob
     print("\n== openspec artifacts ==", flush=True)
-    for p in glob.glob("openspec/changes/bridge-docs/*.md"):
+    for p in _artifacts_for(change):
         print(" ", p, flush=True)
+    if not _artifacts_for(change):
+        print(
+            f"[NO ARTIFACTS] change {change!r} produced no OpenSpec artifacts "
+            "across all stream attempts — the cycle is still in flight or failed.",
+            flush=True,
+        )
+        raise SystemExit(2) from None
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    args = build_parser().parse_args()
+    writer = choose_code_writer(args.code_writer)
+    asyncio.run(main(args.change, writer))

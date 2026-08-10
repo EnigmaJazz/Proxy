@@ -263,9 +263,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     _opencode_session_state(app)  # noqa: B018 — intentional warm-up
 
     # ---- 6. Background tasks -----------------------------------------------
-    # Thermal monitor (reads sensors, enforces shutdown thresholds)
+    # Thermal monitor (reads sensors, enforces shutdown thresholds,
+    # keeps professional resident on the GPU when it is free)
     thermal_task = asyncio.create_task(
-        thermal_monitor_task(state.thermal_state, SENSOR_INTERVAL),
+        thermal_monitor_task(state.thermal_state, SENSOR_INTERVAL, systemd),
     )
 
     # Queue worker (processes enqueued jobs from the database)

@@ -45,6 +45,15 @@ project-specific.
    opt-out via `X-Proxy-Context-Governance: off`. This is a mechanical budget
    optimization, not an intent alteration.
 
+   **Documented carve-out — current date/time stamp** (`routes.py`
+   `_inject_current_datetime`): frontends (nanobot, OpenWebUI) never send
+   the date, so the models they drive run date-blind. The proxy MAY prefix
+   the OUTBOUND system message with the current date and time. It never
+   touches user or assistant text, never mutates the client's stored
+   conversation or the DB audit copy, and is per-request opt-out via
+   `X-Proxy-Date-Time: off`. This is a content-availability fix mirroring
+   the opencode app's own date stamp for its sessions.
+
    **Documented carve-out — search-result enrichment** (`proxy/search_enrichment.py`):
    frontends own tool execution and often return thin `search_web` results (a JSON
    array of `{title, link, snippet}`) that the model cannot answer from. When a
@@ -78,6 +87,15 @@ project-specific.
 6. **No global state outside `proxy.app.state`**: per-request state lives on the
    request, shared state lives on `proxy.app.state.*`. Module-level mutable
    globals are forbidden except cached constants in `constants.py`.
+
+   **Documented carve-out — serve-config mtime cache** (`opencode_bridge.py`
+   `_serve_config_mtime`): a scalar `Optional[float]` cache of the serve
+   config's last-synced mtime, mutated only in `_sync_serve_config` /
+   `_spawn_serve`. The spawn gate has no `app.state` handle (it runs from
+   scripts and tests too), so threading app state through would couple the
+   bridge's core to the FastAPI app. Accepted as a project exception
+   (2026-08-09, F5 note in `opencode_bridge.py`); the cache is a scalar
+   timestamp, never a container.
 
 7. **Tests**: new code paths MUST have a regression test. Use the harness in
    `tests/conftest.py` (stubs FlashRank + heavy deps, lifespan disabled).

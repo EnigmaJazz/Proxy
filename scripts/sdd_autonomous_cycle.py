@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import glob
 import os
+import re
 import subprocess
 import sys
 import time
@@ -137,6 +138,20 @@ async def _serve_sessions_active() -> bool:
         return False
 
 
+def _ends_with_terminal_marker(text: str) -> bool:
+    """True when the text's tail is the loud-failure marker line — the
+    orchestrator's FINAL message ends with ``SDD-CYCLE-TERMINAL-FAILURE:
+    <phase>`` (only the phase may follow the marker).  Quoting the rule
+    mid-turn, or the task text carrying the contract, never matches.
+    """
+    tail = text[-200:]
+    marker = opencode_bridge._SDD_TERMINAL_FAILURE_MARKER
+    if marker not in tail:
+        return False
+    rest = tail.split(marker, 1)[1]
+    return re.fullmatch(r"\s*:\s*\S+\s*", rest) is not None
+
+
 async def _session_has_terminal_marker(session_id: str) -> bool:
     """True when the pinned session's parts carry the loud-failure marker
     (the orchestrator ended the cycle terminally — an inline phase failed
@@ -150,13 +165,16 @@ async def _session_has_terminal_marker(session_id: str) -> bool:
             )
             if resp.status_code != 200:
                 return False
-            for msg in resp.json():
-                for p in msg.get("parts") or []:
+            for msg in reversed(resp.json()):
+                if msg.get("role") != "assistant":
+                    continue
+                for p in reversed(msg.get("parts") or []):
                     if p.get("type") != "text":
                         continue
-                    if opencode_bridge._SDD_TERMINAL_FAILURE_MARKER in \
-                            (p.get("text") or ""):
-                        return True
+                    # The marker is only meaningful in the orchestrator's
+                    # FINAL message (it must END with it); quoting the
+                    # contract mid-turn must not trigger a terminal exit.
+                    return _ends_with_terminal_marker(p.get("text") or "")
     except (httpx.HTTPError, OSError, ValueError):
         return False
     return False
@@ -281,7 +299,7 @@ async def main(change: str, code_writer: str = "local") -> None:
                         print(f"  {text[:130]}", flush=True)
                     elif kind == "text":
                         print(f"  text: {text[:200]}", flush=True)
-                        if opencode_bridge._SDD_TERMINAL_FAILURE_MARKER in text:
+                        if _ends_with_terminal_marker(text):
                             _tail = text.split(
                                 opencode_bridge._SDD_TERMINAL_FAILURE_MARKER,
                                 1,

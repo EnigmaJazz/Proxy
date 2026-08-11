@@ -142,7 +142,9 @@ class TestReplayWindowReader:
 
 class TestTerminalFailureMarker:
     """The driver must detect the orchestrator's loud-failure marker in
-    the pinned session and exit terminally instead of resuming."""
+    the pinned session and exit terminally instead of resuming.  Only the
+    FINAL assistant message ending with the marker counts — the task text
+    (user role) quotes the contract, and mid-turn quotes must not fire."""
 
     @staticmethod
     def _fake_client(resp_json, status=200):
@@ -171,26 +173,62 @@ class TestTerminalFailureMarker:
         return _FakeClient
 
     @pytest.mark.asyncio
-    async def test_marker_in_session_text_detected(
+    async def test_final_assistant_message_with_marker_detected(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         from opencode_bridge import _SDD_TERMINAL_FAILURE_MARKER
 
         client = self._fake_client([
-            {"parts": [
-                {"type": "text",
-                 "text": f"finished. {_SDD_TERMINAL_FAILURE_MARKER}: spec"},
-            ]},
+            {"role": "user", "parts": [{"type": "text",
+                                        "text": "Use SDD..."}]},
+            {"role": "assistant", "parts": [{"type": "text",
+                                             "text": "still working"}]},
+            {"role": "assistant",
+             "parts": [{"type": "text",
+                        "text": f"done. {_SDD_TERMINAL_FAILURE_MARKER}: spec"}]},
         ])
         monkeypatch.setattr(driver.httpx, "AsyncClient", client)
         assert await driver._session_has_terminal_marker("ses_0001") is True
+
+    @pytest.mark.asyncio
+    async def test_user_task_text_with_marker_is_not_terminal(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from opencode_bridge import _SDD_TERMINAL_FAILURE_MARKER
+
+        client = self._fake_client([
+            {"role": "user",
+             "parts": [{"type": "text",
+                        "text": f"rules: {_SDD_TERMINAL_FAILURE_MARKER}: <phase>"}]},
+            {"role": "assistant", "parts": [{"type": "text",
+                                             "text": "ok, continuing"}]},
+        ])
+        monkeypatch.setattr(driver.httpx, "AsyncClient", client)
+        assert await driver._session_has_terminal_marker("ses_0001") is False
+
+    @pytest.mark.asyncio
+    async def test_mid_turn_quote_is_not_terminal(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from opencode_bridge import _SDD_TERMINAL_FAILURE_MARKER
+
+        client = self._fake_client([
+            {"role": "assistant",
+             "parts": [{"type": "text",
+                        "text": f"I follow the rule: end with "
+                                f"{_SDD_TERMINAL_FAILURE_MARKER}: <phase>. "
+                                f"Continuing the spec now."}]},
+        ])
+        monkeypatch.setattr(driver.httpx, "AsyncClient", client)
+        assert await driver._session_has_terminal_marker("ses_0001") is False
 
     @pytest.mark.asyncio
     async def test_no_marker_is_false(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         client = self._fake_client([
-            {"parts": [{"type": "text", "text": "cycle continues"}]},
+            {"role": "assistant",
+             "parts": [{"type": "text", "text": "cycle continues"}]},
         ])
         monkeypatch.setattr(driver.httpx, "AsyncClient", client)
         assert await driver._session_has_terminal_marker("ses_0001") is False
@@ -222,7 +260,8 @@ class TestTerminalFailureMarker:
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         client = self._fake_client([
-            {"parts": [{"type": "tool", "tool": "bash",
+            {"role": "assistant",
+             "parts": [{"type": "tool", "tool": "bash",
                         "state": {"status": "completed"}}]},
         ])
         monkeypatch.setattr(driver.httpx, "AsyncClient", client)

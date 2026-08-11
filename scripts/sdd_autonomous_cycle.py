@@ -274,6 +274,11 @@ SDD SESSION PREFLIGHT (user-supplied, do NOT ask):
 
 Run the complete SDD cycle end-to-end now.
 
+SUB-AGENT TOOL RULE (MANDATORY): instruct EVERY phase sub-agent in its
+delegation prompt: do NOT use the `glob` tool — the headless serve's
+tool runner can wedge on glob calls indefinitely (stranding the phase);
+use `read` with explicit paths or `bash` with `ls`/`find` instead.
+
 LOCAL-MODEL DELEGATION RULE (MANDATORY): when delegating code work to
 the LOCAL model (apply's local writer), delegate ONE FILE at a time —
 one task per file — for big tasks.  Never bundle multiple files into a

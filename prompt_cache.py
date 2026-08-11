@@ -99,12 +99,48 @@ _NANOBOT_UNTRUSTED_SNIPPET = (
 )
 
 
-def _nanobot_identity(workspace_path: str) -> str:
+_NANOBOT_CHANNELS = (
+    "", "telegram", "qq", "discord", "whatsapp", "sms", "email", "cli",
+    "mochat",
+)
+
+
+def _nanobot_format_hint(channel: str) -> str:
+    """The identity template's channel-dependent format hint (the proxy
+    sees nanobot requests from any channel, so every variant must be
+    primable — the wire's identity renders the hint for its channel).
+    """
+    if channel in ("telegram", "qq", "discord"):
+        return (
+            "## Format Hint\nThis conversation is on a messaging app. Use "
+            "short paragraphs. Avoid large headings (#, ##). Use **bold** "
+            "sparingly. No tables — use plain lists."
+        )
+    if channel in ("whatsapp", "sms"):
+        return (
+            "## Format Hint\nThis conversation is on a text messaging "
+            "platform that does not render markdown. Use plain text only."
+        )
+    if channel == "email":
+        return (
+            "## Format Hint\nThis conversation is via email. Structure "
+            "with clear sections. Markdown may not render — keep formatting "
+            "simple."
+        )
+    if channel in ("cli", "mochat"):
+        return (
+            "## Format Hint\nOutput is rendered in a terminal. Avoid "
+            "markdown headings and tables. Use plain text with minimal "
+            "formatting."
+        )
+    return ""
+
+
+def _nanobot_identity(workspace_path: str, channel: str = "") -> str:
     """Render the nanobot's identity section exactly as its context
     builder does (``agent/templates/identity.md`` with the runtime,
-    workspace, POSIX platform policy, and an empty channel — the proxy's
-    requests carry no channel, so no format hint is emitted).  The
-    runtime string is deterministic per machine.
+    workspace, POSIX platform policy, and the given channel's format
+    hint).  The runtime string is deterministic per machine.
     """
     import platform as _platform
 
@@ -121,6 +157,7 @@ def _nanobot_identity(workspace_path: str) -> str:
         f"(append-only JSONL; prefer built-in `grep` for search).\n"
         f"- Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md\n\n"
         f"{_NANOBOT_PLATFORM_POLICY}\n\n"
+        f"{_nanobot_format_hint(channel)}\n\n"
         "## Search & Discovery\n\n"
         "- Prefer built-in `grep` over `exec` for workspace search.\n"
         '- On broad searches, use `grep(output_mode="count")` to scope '
@@ -206,11 +243,24 @@ def seek_nanobot_prompt(workspace_dir: Optional[str] = None) -> str:
     history = _nanobot_recent_history(base)
     if history:
         parts.append(history)
-    assembled = "\n\n---\n\n".join(parts)
-    if assembled and _PROMPTS.get("nanobot") != assembled:
-        register_prompt("nanobot", assembled)
-        _LAST_PRIMED.pop("nanobot", None)  # a change forces a re-prime
-    return assembled
+    # The wire's requests render the identity for the caller's channel
+    # (the format hint!), so every channel variant must be registered and
+    # primable — the nanobot's channel-less default plus each known
+    # channel (2026-08-11: the channel-less-only prime never matched the
+    # wire, which diverges at the format hint).
+    variants = [
+        _nanobot_identity(base, channel=channel)
+        + "\n\n---\n\n" + "\n\n---\n\n".join(parts[1:])
+        for channel in _NANOBOT_CHANNELS
+    ]
+    registered_any = False
+    for channel, variant in zip(_NANOBOT_CHANNELS, variants):
+        key = "nanobot" if not channel else f"nanobot:{channel}"
+        if _PROMPTS.get(key) != variant:
+            register_prompt(key, variant)
+            _LAST_PRIMED.pop(key, None)  # a change forces a re-prime
+            registered_any = True
+    return variants[0]
 
 
 def _nanobot_builtin_skills_dir() -> str:

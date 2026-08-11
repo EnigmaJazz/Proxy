@@ -390,3 +390,44 @@ class TestDeterministicHistoryAndSkills:
         assert "Probe body" in assembled
         assert "# Skills" in assembled
         assert "**probe-skill**" in assembled
+
+
+class TestPerChannelPrimingVariants:
+    """The wire's identity renders the format hint for the caller's
+    channel, so every channel variant must be registered and primable —
+    the channel-less-only prime never matched the wire (2026-08-11)."""
+
+    def _workspace(self, tmp_path: Any) -> Any:
+        (tmp_path / "AGENTS.md").write_text("AGENTS body", encoding="utf-8")
+        (tmp_path / "SOUL.md").write_text("SOUL body", encoding="utf-8")
+        (tmp_path / "USER.md").write_text("USER body", encoding="utf-8")
+        (tmp_path / "TOOLS.md").write_text("TOOLS body", encoding="utf-8")
+        mem = tmp_path / "memory"
+        mem.mkdir()
+        (mem / "MEMORY.md").write_text("MEM body", encoding="utf-8")
+        (mem / ".dream_cursor").write_text("0", encoding="utf-8")
+        (mem / "history.jsonl").write_text(
+            '{"cursor": 1, "timestamp": "t1", "content": "c1"}',
+            encoding="utf-8",
+        )
+        return tmp_path
+
+    def test_all_channel_variants_registered(self, tmp_path: Any) -> None:
+        import prompt_cache as pc
+        pc._PROMPTS.clear()
+        ws = self._workspace(tmp_path)
+        pc.seek_nanobot_prompt(str(ws))
+        reg = pc.registered_prompts()
+        for key in (
+            "nanobot", "nanobot:telegram", "nanobot:qq", "nanobot:discord",
+            "nanobot:whatsapp", "nanobot:sms", "nanobot:email",
+            "nanobot:cli", "nanobot:mochat",
+        ):
+            assert key in reg, key
+        # the messaging channels carry the hint; the base does not
+        assert "## Format Hint" in reg["nanobot:telegram"]
+        assert "## Format Hint" not in reg["nanobot"]
+        # every variant shares the full deterministic tail
+        for key in reg:
+            assert "## AGENTS.md" in reg[key]
+            assert "# Recent History" in reg[key]

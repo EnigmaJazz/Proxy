@@ -596,6 +596,7 @@ async def list_models(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
+#: One-shot wire-capture flag (2026-08-11): logs the first observed
 def _inject_current_datetime(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Prepend the current date + time to the OUTBOUND copy's system
     message.
@@ -821,6 +822,16 @@ async def chat_completions(request: Request) -> Response:
         # included) and priming warms what the next request actually sends.
         _priming_caller = _priming_caller_for(headers, caller_type)
         register_observed_system_prompt(_priming_caller, _sys_msg)
+        # WIRE-CAPTURE DEBUG (2026-08-11): log the observed system's
+        # shape so a priming mismatch can be diffed against the seek's
+        # assembly without guessing.
+        if _priming_caller in ("nanobot", "AGENTIC"):
+            logger.debug(
+                "Priming observation: caller=%s sys_len=%s sys_head=%r",
+                _priming_caller,
+                len(_sys_msg) if isinstance(_sys_msg, str) else None,
+                (_sys_msg[:600] if isinstance(_sys_msg, str) else _sys_msg),
+            )
     except (OSError, ValueError, StopIteration):
         pass
 

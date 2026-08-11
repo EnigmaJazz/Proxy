@@ -175,10 +175,18 @@ class TestPromptPriming:
         pc.register_observed_system_prompt("openwebui", "You are OpenWebUI.")
         reg = pc.registered_prompts()
         assert reg["nanobot"] == "You are nanobot. Be helpful."
-        assert reg["observed:openwebui"] == "You are OpenWebUI."
-        # refresh on change
+        # the observed entries are keyed by caller AND content hash so
+        # every DISTINCT system prompt gets its own primable entry
+        assert any(
+            k.startswith("observed:openwebui:") and v == "You are OpenWebUI."
+            for k, v in reg.items()
+        )
+        # refresh on change registers a new distinct entry
         pc.register_observed_system_prompt("openwebui", "New prompt.")
-        assert pc.registered_prompts()["observed:openwebui"] == "New prompt."
+        assert any(
+            k.startswith("observed:openwebui:") and v == "New prompt."
+            for k, v in pc.registered_prompts().items()
+        )
 
     def test_seek_nanobot_prompt_registers_and_refreshes(
         self, tmp_path: Any,

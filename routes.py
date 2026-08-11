@@ -166,7 +166,7 @@ def _coding_decision_state(app: FastAPI) -> dict[str, str]:
     return state.coding_decisions
 
 
-def _opencode_session_state(app: FastAPI) -> dict[str, str]:
+async def _opencode_session_state(app: FastAPI) -> dict[str, str]:
     """Lazy accessor for the pinned opencode agent sessions on ``app.state``.
 
     Keyed by proxy ``session_id`` → opencode session id.  Pinning lets a
@@ -179,9 +179,12 @@ def _opencode_session_state(app: FastAPI) -> dict[str, str]:
     state = app.state
     if not hasattr(state, "opencode_sessions"):
         # Deliberate one-time lazy init (a single cold read on first
-        # access; the map is then cached on app.state and all later
-        # mutations are disk-persisted off the event loop).
-        state.opencode_sessions = _load_opencode_sessions()
+        # access — on a worker thread, Rule 3; the map is then cached on
+        # app.state and all later mutations are disk-persisted off the
+        # event loop).
+        state.opencode_sessions = await asyncio.to_thread(
+            _load_opencode_sessions,
+        )
     return state.opencode_sessions
 
 
@@ -209,7 +212,7 @@ async def _persist_opencode_sessions(app: FastAPI) -> None:
     """
     try:
         path = Path.home() / ".kinver-proxy" / "opencode-sessions.json"
-        data = json.dumps(_opencode_session_state(app))
+        data = json.dumps(await _opencode_session_state(app))
         await asyncio.to_thread(_write_opencode_sessions, path, data)
     except OSError as exc:
         logger.warning("Failed to persist opencode sessions: %s", exc)
@@ -298,7 +301,8 @@ def _looks_like_gibberish(text: str) -> bool:
     """True when the text has fewer than two alphabetic words — the
     profile of complete nonsense (e.g. ``asdfghjkl12345!!!@@@``).  Used as
     a guard so the 2B frontdesk's ``is_valid=False`` cannot false-positive
-    on short-but-meaningful queries like ``help``.  The ``[role]:`` labels
+    on short-but-meaningful multi-word queries (a lone ``help`` IS
+    intercepted when the frontdesk says invalid).  The ``[role]:`` labels
     from the context dump are stripped first so they don't count as words.
     """
     stripped = re.sub(r"\[[^\]]+\]:\s*", "", text or "")
@@ -596,10 +600,9 @@ async def list_models(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
-#: One-shot wire-capture flag (2026-08-11): logs the first observed
 def _inject_current_datetime(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Prepend the current date + time to the OUTBOUND copy's system
-    message.
+    """Append the current DATE to the OUTBOUND copy's system message
+    (date-only — the clock time broke the KV-cache prefix every request).
 
     Frontends (nanobot, OpenWebUI) never send the date, so the models
     they drive run date-blind; the opencode app's own sessions do get a
@@ -609,10 +612,14 @@ def _inject_current_datetime(messages: list[dict[str, Any]]) -> list[dict[str, A
     never mutated.  Opt out per request with ``X-Proxy-Date-Time: off``.
     """
     now = datetime.now()
-    stamp = (
-        f"Today's date: {now.strftime('%A, %B %d, %Y')}. "
-        f"Current time: {now.strftime('%H:%M')}."
-    )
+    # DATE-ONLY (2026-08-11): the clock time changed the cache-visible
+    # system content EVERY request — the llama-server's prefix matching
+    # diverged at the stamp's position and invalidated every checkpoint,
+    # forcing full ~14k-token prefills on session follow-ups (the
+    # checkpoints' "erased invalidated" evidence).  The date changes once
+    # per day, so the system stays cache-stable within the day; the
+    # opencode app itself injects only the date.
+    stamp = f"Today's date: {now.strftime('%A, %B %d, %Y')}."
     # Copy the list, never mutate: the client's stored conversation is
     # preserved verbatim (the outbound copy gets the stamp).
     messages = list(messages)
@@ -802,6 +809,7 @@ async def chat_completions(request: Request) -> Response:
     caller_type = discriminate_caller(headers)
     lane_b = is_lane_b(headers)
     is_dream = False
+    is_apply_local = False  # bound for every caller path (2026-08-11)
 
     # ---- Prompt-priming observation (best-effort): register the caller's
     # system message so the residency loop can prime it into the
@@ -969,7 +977,7 @@ async def chat_completions(request: Request) -> Response:
         resp = await _handle_opencode_request(
             processed_messages,
             client_stream,
-            session_map=_opencode_session_state(request.app),
+            session_map=await _opencode_session_state(request.app),
             session_key=session_key,
             pending_permissions=_pending_permissions_state(request.app),
             sdd=(requested_model == "opencode-sdd"),
@@ -984,7 +992,7 @@ async def chat_completions(request: Request) -> Response:
     # the last assistant message is the pending coding-decision question
     # — that turn is owned by the gate (the user's "opencode"/"local"
     # answer must resolve the routing, never become the agent's task).
-    pinned = _opencode_session_state(request.app).get(session_key)
+    pinned = (await _opencode_session_state(request.app)).get(session_key)
     if pinned and _find_coding_question_index(processed_messages) is None:
         answer = _last_user_text(processed_messages)
         # Pending external_directory WRITE permission from the previous
@@ -1012,7 +1020,7 @@ async def chat_completions(request: Request) -> Response:
         resp = await _opencode_task_response(
             answer or "continue",
             client_stream,
-            session_map=_opencode_session_state(request.app),
+            session_map=await _opencode_session_state(request.app),
             session_key=session_key,
             pending_permissions=_pending_permissions_state(request.app),
             just_approved_permission=just_approved,
@@ -1738,44 +1746,38 @@ async def _event_stream(
     # user.
     tts_tool_call_indices: set[int] = set()
 
-    # ---- Yield proxy-injected preamble events -----------------------------
-    # These events (e.g. params_replaced) are emitted before the triage
-    # status chunk so consumers see substitution signals first.
-    if proxy_preamble:
-        for event_line in proxy_preamble:
-            yield event_line
-
-    # ---- Yield triage metadata as first SSE chunk ---------------------------
-    # Let the frontend know which model was selected and why, so users
-    # see the routing announcement during the model-loading gap.  Emitted
-    # as sentinel-prefixed delta.content via _make_status_chunk: visible
-    # inline, but stripped from the OUTBOUND model-copy on the next
-    # request (strip_proxy_status) so the model never echoes it back.
-    # Previously emitted as custom events, which the model never saw but
-    # which ALSO made the status invisible to nanobot — users lost all
-    # feedback during loading/tool gaps.  The sentinel restores inline
-    # visibility without the echo degeneration.
-    #
-    # Mid-tool-flow requests (last message is a tool call or a tool
-    # result) skip the triage entirely: the model is continuing a chain
-    # it already started, so re-announcing the route adds noise AND
-    # feeds the model's own input with repeated "Proxy triage" text.
-    last_msg = processed_messages[-1] if processed_messages else {}
-    mid_tool_flow = (
-        last_msg.get("role") == "assistant" and "tool_calls" in last_msg
-    ) or last_msg.get("role") == "tool"
-    triage_msg = _build_triage_message(route, client_named_model=client_named_model)
-    if not mid_tool_flow:
-        # Trailing newline: the triage must not run straight into the
-        # model's response — frontends render them adjacent, so the
-        # response starts on a fresh line (2026-08-08).
-        yield _make_status_chunk(triage_msg + "\n", kind="triage")
-
     # Terminal outcome of this stream: completed | failed | cancelled.
     # Stays "unknown" if the generator is closed early (client disconnect
     # delivered as GeneratorExit) so the finally block can mark the job.
     outcome = "unknown"
     try:
+        # ---- Yield proxy-injected preamble events -------------------------
+        # These events (e.g. params_replaced) are emitted before the
+        # triage status chunk so consumers see substitution signals
+        # first.  INSIDE the try: a client disconnect during ANY yield
+        # (preamble, triage, stream) reaches the finally and marks the
+        # job (2026-08-11).
+        if proxy_preamble:
+            for event_line in proxy_preamble:
+                yield event_line
+        # ---- Yield triage metadata as first SSE chunk ---------------------
+        # Let the frontend know which model was selected and why, so
+        # users see the routing announcement during the model-loading
+        # gap.  Skipped mid-tool-flow entirely: the model is continuing
+        # a chain it already started, so re-announcing the route adds
+        # noise AND feeds the model's own input with repeated "Proxy
+        # triage" text.
+        last_msg = processed_messages[-1] if processed_messages else {}
+        mid_tool_flow = (
+            last_msg.get("role") == "assistant" and "tool_calls" in last_msg
+        ) or last_msg.get("role") == "tool"
+        triage_msg = _build_triage_message(
+            route, client_named_model=client_named_model,
+        )
+        if not mid_tool_flow:
+            # Trailing newline: the triage must not run straight into
+            # the model's response (2026-08-08).
+            yield _make_status_chunk(triage_msg + "\n", kind="triage")
         async for chunk in stream_llm(
             endpoint=route.model_key,
             payload=payload,
@@ -2125,6 +2127,7 @@ async def _event_stream_with_model_startup(
     This wrapper brings the same behaviour to the direct-streaming path.
     """
     systemd = state.systemd
+    db = state.database
     model_key = route.model_key
 
     # Only intervene for heavy GPU models that may need cold-starting.
@@ -2194,6 +2197,14 @@ async def _event_stream_with_model_startup(
                 })
                 yield f"data: {error_chunk}\n\n"
                 yield "data: [DONE]\n\n"
+                # The job was already enqueued — mark it failed so it
+                # never lingers active and re-processes on restart
+                # (2026-08-11).
+                if db is not None:
+                    try:
+                        await db.fail_job(job_id)
+                    except (OSError, ValueError):
+                        logger.exception("Failed to mark job %s failed", job_id)
                 return
 
             # ---- Restore project-specific KV cache if available --------------
@@ -2681,7 +2692,7 @@ async def _apply_coding_decision_gate(
             resp = await _opencode_task_response(
                 _last_user_text(task_messages),
                 client_stream,
-                session_map=_opencode_session_state(app),
+                session_map=await _opencode_session_state(app),
                 session_key=session_id,
                 pending_permissions=_pending_permissions_state(app),
                 system_prompt=(
@@ -2706,7 +2717,7 @@ async def _apply_coding_decision_gate(
             resp = await _opencode_task_response(
                 _last_user_text(messages),
                 client_stream,
-                session_map=_opencode_session_state(app),
+                session_map=await _opencode_session_state(app),
                 session_key=session_id,
                 pending_permissions=_pending_permissions_state(app),
                 system_prompt=(
@@ -2760,7 +2771,7 @@ async def _apply_coding_decision_gate(
                             resp = await _opencode_task_response(
                                 _last_user_text(messages),
                                 client_stream,
-                                session_map=_opencode_session_state(app),
+                                session_map=await _opencode_session_state(app),
                                 session_key=session_id,
                                 pending_permissions=_pending_permissions_state(app),
                                 system_prompt=(

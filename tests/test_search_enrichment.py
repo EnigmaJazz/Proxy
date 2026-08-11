@@ -293,8 +293,10 @@ class TestDateTimeInjection:
         # every request and forced full ~45s prefills.
         assert out[0]["content"].startswith("You are helpful.")
         assert "Today's date:" in out[0]["content"]
-        assert "Current time:" in out[0]["content"]
-        assert "Current time:" in out[0]["content"][-40:]  # stamp at the very end
+        # DATE-ONLY (2026-08-11): the clock time changed the cache-
+        # visible prefix every request and invalidated every checkpoint
+        assert "Current time:" not in out[0]["content"]
+        assert "Today's date:" in out[0]["content"][-60:]  # stamp at the end
         assert out[1] == msgs[1]  # user message untouched
 
     def test_inserts_system_message_when_absent(self) -> None:

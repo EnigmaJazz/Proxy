@@ -10,7 +10,7 @@ Covers:
 from __future__ import annotations
 
 import json
-from typing import Any, Optional
+from typing import Any, AsyncIterator, Optional
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -1001,7 +1001,8 @@ class TestPinnedContinuationVsGate:
         sid = _resolve_session_id(msgs, proxy.app)
         # Pin an opencode session for this conversation (as if a previous
         # opencode task had pinned it).
-        _opencode_session_state(proxy.app)[sid] = "ses_0001"
+        state = await _opencode_session_state(proxy.app)
+        state[sid] = "ses_0001"
 
         seen_task: list[str] = []
 

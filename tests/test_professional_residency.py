@@ -460,6 +460,10 @@ class TestRuntimeVersionMatch:
         (mem / ".dream_cursor").write_text("0", encoding="utf-8")
         assembled = pc.seek_nanobot_prompt(str(tmp_path))
         assert "Python 3.14.4" in assembled.splitlines()[1]
+        # the WIRE template's identity text (the lib64 install)
+        assert "Your current project workspace is at:" in assembled
+        assert "- Agent profile:" in assembled
+        assert "## External Content" in assembled
         # not the proxy's own version when they differ
         import platform as _platform
         assert "Python 3.14.6" not in assembled.splitlines()[1]

@@ -62,17 +62,24 @@ def register_prompt(name: str, system_prompt: str) -> None:
 
 def register_observed_system_prompt(
     caller: str, system_prompt: Any,
-) -> None:
-    """Register the system message observed on a request (first-seen per
-    caller).  ``caller`` is e.g. ``nanobot`` or ``openwebui``; the same
-    caller's system message is refreshed on change so priming always uses
-    the CURRENT prompt."""
+) -> bool:
+    """Register the system message observed on a request, keyed by caller
+    AND content hash so every DISTINCT system prompt gets its own
+    primable entry.  The caller alone thrashes: all agentic callers share
+    the AGENTIC token and the last request's system won the single key,
+    so the prime warmed the wrong prompt (2026-08-11).  Returns True when
+    the registration changed (a new system, or a content refresh).
+    """
+    import hashlib
     if not isinstance(system_prompt, str) or not system_prompt.strip():
-        return
-    key = f"observed:{caller}"
+        return False
+    digest = hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()[:12]
+    key = f"observed:{caller}:{digest}"
     if _PROMPTS.get(key) != system_prompt:
         _PROMPTS[key] = system_prompt
         _LAST_PRIMED.pop(key, None)
+        return True
+    return False
 
 
 def registered_prompts() -> dict[str, str]:
@@ -181,9 +188,12 @@ def _nanobot_python_version() -> str:
 
 def _nanobot_identity(workspace_path: str, channel: str = "") -> str:
     """Render the nanobot's identity section exactly as its context
-    builder does (``agent/templates/identity.md`` with the runtime,
-    workspace, POSIX platform policy, and the given channel's format
-    hint).  The runtime string is deterministic per machine.
+    builder does — the WIRE template from the lib64 install the runtime
+    actually uses (``agent/templates/identity.md`` with the runtime,
+    current-project workspace, agent-profile line, POSIX platform
+    policy, the given channel's format hint, and the External Content
+    block).  The old lib/python3.14 install has a DIFFERENT identity.md;
+    replicating it never matched the wire (2026-08-11).
     """
     import platform as _platform
 
@@ -191,38 +201,23 @@ def _nanobot_identity(workspace_path: str, channel: str = "") -> str:
         f"{_platform.system()} {_platform.machine()}, "
         f"Python {_nanobot_python_version()}"
     )
+    hint = _nanobot_format_hint(channel)
     return (
         f"## Runtime\n{runtime}\n\n"
-        f"## Workspace\nYour workspace is at: {workspace_path}\n"
+        f"## Workspace\nYour current project workspace is at: "
+        f"{workspace_path}\n"
+        f"- Agent profile: {workspace_path}/SOUL.md and "
+        f"{workspace_path}/USER.md (automatically managed by Dream — do "
+        f"not edit directly)\n"
         f"- Long-term memory: {workspace_path}/memory/MEMORY.md "
         f"(automatically managed by Dream — do not edit directly)\n"
         f"- History log: {workspace_path}/memory/history.jsonl "
         f"(append-only JSONL; prefer built-in `grep` for search).\n"
         f"- Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md\n\n"
-        f"{_NANOBOT_PLATFORM_POLICY}\n\n"
-        f"{_nanobot_format_hint(channel)}\n\n"
-        "## Search & Discovery\n\n"
-        "- Prefer built-in `grep` over `exec` for workspace search.\n"
-        '- On broad searches, use `grep(output_mode="count")` to scope '
-        "before requesting full content.\n"
-        f"{_NANOBOT_UNTRUSTED_SNIPPET}\n\n"
-        "Reply directly with text for the current conversation. Do not use "
-        "the 'message' tool for normal replies in the current chat.\n"
-        "When you need to call tools before answering, do not include the "
-        "final user-visible answer in the same assistant message as the tool "
-        "calls. Wait for the tool results, then answer once.\n"
-        "Use the 'message' tool only for proactive sends, cross-channel "
-        "delivery, or explicitly sending existing local files as "
-        "attachments. When a tool such as 'generate_image' creates "
-        "user-visible media, the runtime attaches those artifacts to the "
-        "final assistant reply automatically, so do not call 'message' just "
-        "to announce or resend them.\n"
-        "To send an existing local file that was not automatically attached "
-        "by another tool, call 'message' with the 'media' parameter. Do NOT "
-        "use read_file to \"send\" a file — reading a file only shows its "
-        "content to you, it does NOT deliver the file to the user. Example: "
-        'message(content="Here is the document", channel="telegram", '
-        'chat_id="...", media=["/path/to/file.pdf"])'
+        f"{_NANOBOT_PLATFORM_POLICY}\n"
+        f"{hint}\n\n"
+        "## External Content\n\n"
+        f"{_NANOBOT_UNTRUSTED_SNIPPET}"
     )
 
 

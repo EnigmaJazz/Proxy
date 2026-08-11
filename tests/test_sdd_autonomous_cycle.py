@@ -34,48 +34,48 @@ class TestHoldDecision:
 
     def test_working_activity_resets_budget(self) -> None:
         action, budget = driver.hold_decision(
-            recent_calls=3, session_busy=False, replay_in_flight=False,
-            budget=1,
+            recent_calls=3, session_busy=False, parts_grew=False,
+            replay_in_flight=False, budget=1,
         )
         assert action == "hold"
         assert budget == self._full()
 
     def test_busy_session_holds_even_without_calls(self) -> None:
         action, budget = driver.hold_decision(
-            recent_calls=0, session_busy=True, replay_in_flight=False,
-            budget=5,
+            recent_calls=0, session_busy=True, parts_grew=False,
+            replay_in_flight=False, budget=5,
         )
         assert action == "hold"
         assert budget == self._full()
 
     def test_no_activity_drains_one_poll(self) -> None:
         action, budget = driver.hold_decision(
-            recent_calls=0, session_busy=False, replay_in_flight=False,
-            budget=10,
+            recent_calls=0, session_busy=False, parts_grew=False,
+            replay_in_flight=False, budget=10,
         )
         assert action == "drain"
         assert budget == 9
 
     def test_budget_exhausted_resumes(self) -> None:
         action, budget = driver.hold_decision(
-            recent_calls=0, session_busy=False, replay_in_flight=False,
-            budget=1,
+            recent_calls=0, session_busy=False, parts_grew=False,
+            replay_in_flight=False, budget=1,
         )
         assert action == "resume"
         assert budget == 0
 
     def test_replay_pauses_the_drain(self) -> None:
         action, budget = driver.hold_decision(
-            recent_calls=0, session_busy=False, replay_in_flight=True,
-            budget=7,
+            recent_calls=0, session_busy=False, parts_grew=False,
+            replay_in_flight=True, budget=7,
         )
         assert action == "hold"
         assert budget == 7  # unchanged: neither reset nor drained
 
     def test_replay_wins_over_working_activity(self) -> None:
         action, budget = driver.hold_decision(
-            recent_calls=0, session_busy=False, replay_in_flight=True,
-            budget=3,
+            recent_calls=0, session_busy=False, parts_grew=False,
+            replay_in_flight=True, budget=3,
         )
         assert action == "hold"
         assert budget == 3
@@ -266,3 +266,42 @@ class TestTerminalFailureMarker:
         ])
         monkeypatch.setattr(driver.httpx, "AsyncClient", client)
         assert await driver._session_has_terminal_marker("ses_0001") is False
+
+
+class TestHoldDecisionSustainedActivity:
+    """A lone spurious call must not re-arm the budget; only sustained
+    flow (>= 2 calls) or call-plus-part-growth counts as working."""
+
+    def test_lone_call_without_growth_drains(self) -> None:
+        action, budget = driver.hold_decision(
+            recent_calls=1, session_busy=False, parts_grew=False,
+            replay_in_flight=False, budget=50,
+        )
+        assert action == "drain"
+        assert budget == 49
+
+    def test_lone_call_with_growth_holds(self) -> None:
+        action, budget = driver.hold_decision(
+            recent_calls=1, session_busy=False, parts_grew=True,
+            replay_in_flight=False, budget=50,
+        )
+        assert action == "hold"
+
+    def test_two_calls_hold_even_without_growth(self) -> None:
+        action, budget = driver.hold_decision(
+            recent_calls=2, session_busy=False, parts_grew=False,
+            replay_in_flight=False, budget=50,
+        )
+        assert action == "hold"
+        assert budget == int(driver.ARTIFACT_WAIT_S / driver.ARTIFACT_POLL_S)
+
+    def test_zero_calls_with_growth_alone_drains(self) -> None:
+        # Part growth without any model-call evidence is not enough on
+        # its own (the parts can lag in) — the go-proxy flow stays the
+        # primary signal.
+        action, budget = driver.hold_decision(
+            recent_calls=0, session_busy=False, parts_grew=True,
+            replay_in_flight=False, budget=50,
+        )
+        assert action == "drain"
+        assert budget == 49

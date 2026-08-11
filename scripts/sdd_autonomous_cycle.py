@@ -88,8 +88,15 @@ def _recent_go_proxy_calls(window_s: float = _GO_PROXY_ACTIVITY_WINDOW_S) -> int
 
 
 def hold_decision(*, recent_calls: int, session_busy: bool,
-                  replay_in_flight: bool, budget: int) -> tuple[str, int]:
+                  parts_grew: bool, replay_in_flight: bool,
+                  budget: int) -> tuple[str, int]:
     """One poll of the driver's hold state machine.
+
+    Working activity means SUSTAINED model-call flow (>= 2 calls in the
+    window) OR any model-call flow accompanied by part growth — a lone
+    spurious call (a stuck session's retry traffic) must not re-arm the
+    budget and hold the cycle forever (2026-08-11: cycle-11's static
+    spec parts with 1-2-call blips).
 
     Returns (action, new_budget) consumed directly by the wait loop:
       - ("hold", full_budget)  working activity: reset the budget.
@@ -102,7 +109,8 @@ def hold_decision(*, recent_calls: int, session_busy: bool,
         # The replay window pauses the drain entirely; a phantom replay
         # window is bounded by its staleness horizon on the bridge side.
         return "hold", budget
-    if recent_calls > 0 or session_busy:
+    working = recent_calls >= 2 or (recent_calls >= 1 and parts_grew)
+    if working or session_busy:
         return "hold", full_budget
     if budget <= 1:
         return "resume", 0
@@ -150,6 +158,25 @@ def _ends_with_terminal_marker(text: str) -> bool:
         return False
     rest = tail.split(marker, 1)[1]
     return re.fullmatch(r"\s*:\s*\S+\s*", rest) is not None
+
+
+async def _session_part_count(session_id: str) -> int:
+    """Total parts across the pinned session's messages, or -1 when the
+    count cannot be determined (transport failure — treated as unknown,
+    which never re-arms the hold).  Never raises.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"{OPENCODE_SERVE_URL}/session/{session_id}/message",
+            )
+            if resp.status_code != 200:
+                return -1
+            return sum(
+                len(m.get("parts") or []) for m in resp.json()
+            )
+    except (httpx.HTTPError, OSError, ValueError):
+        return -1
 
 
 async def _session_has_terminal_marker(session_id: str) -> bool:
@@ -336,6 +363,7 @@ async def main(change: str, code_writer: str = "local") -> None:
             # next attempt force-recycles + respawns + resumes the pin.
             dead_polls = 0
             wait_budget = int(ARTIFACT_WAIT_S / ARTIFACT_POLL_S)
+            parts_prev = -1
             while wait_budget > 0:
                 if _cycle_complete(change):
                     break
@@ -355,15 +383,20 @@ async def main(change: str, code_writer: str = "local") -> None:
                     opencode_bridge._replay_in_flight_for_any_session,
                 )
                 session_busy = await _serve_sessions_active()
+                parts_now = await _session_part_count(sid) if sid else -1
+                parts_grew = 0 <= parts_now and parts_now > parts_prev
+                parts_prev = parts_now if parts_now >= 0 else parts_prev
                 action, wait_budget = hold_decision(
                     recent_calls=recent_calls,
                     session_busy=session_busy,
+                    parts_grew=parts_grew,
                     replay_in_flight=replay,
                     budget=wait_budget,
                 )
                 print(
                     f"[HOLD] calls={recent_calls} busy={session_busy} "
-                    f"replay={replay} action={action} budget={wait_budget}",
+                    f"parts_grew={parts_grew} replay={replay} "
+                    f"action={action} budget={wait_budget}",
                     flush=True,
                 )
                 if action == "resume":

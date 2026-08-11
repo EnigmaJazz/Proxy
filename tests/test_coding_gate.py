@@ -1110,3 +1110,48 @@ class TestKeywordHeuristicsTightened:
         # NOT hijack a scholar request into an opencode/local choice.
         assert "Coding decision" not in text
         assert capture.payload is not None
+
+
+class TestLowDifficultyNoPrompt:
+    """Simple coding tasks (professional assessment: low difficulty) must
+    route straight through per the recommendation — the user asked for no
+    prompt, so the question must NEVER appear for them."""
+
+    async def _send(self, gate_client, content: str) -> str:
+        capture = _StreamCapture()
+        with patch("routes.stream_llm", new=capture), \
+             patch(
+                 "routes.classify_with_frontdesk",
+                 new=AsyncMock(return_value=_classification("CODE")),
+             ), \
+             patch(
+                 "routes.evaluate_coding_task",
+                 new=AsyncMock(return_value={
+                     "difficulty": "low",
+                     "recommendation": "local",
+                     "reason": "trivial single-file change",
+                 }),
+             ):
+            response = await gate_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "auto",
+                    "messages": [{
+                        "role": "user",
+                        "content": content,
+                    }],
+                    "stream": True,
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            return (await response.aread()).decode()
+
+    @pytest.mark.asyncio
+    async def test_low_difficulty_never_prompts(self, gate_client) -> None:
+        text = await self._send(
+            gate_client, "fix the typo in the welcome message",
+        )
+        # No coding question, no prompt — the normal flow continues
+        # (the professional answering stream).
+        assert "Coding decision" not in text
+        assert "Reply" not in text

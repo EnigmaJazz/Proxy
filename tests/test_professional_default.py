@@ -12,6 +12,7 @@ import pytest
 import pytest_asyncio
 
 import proxy
+import routes
 from profile_loader import ModelProfileTable
 from routing import RouteDecision, resolve_route_for_lane_a
 
@@ -640,3 +641,65 @@ class TestQueueLifecycle:
             "and the stream ends in 'All connection attempts failed'."
         )
         assert captured["is_lane_b"] is False
+
+
+class TestReclassificationGate:
+    """The professional reclassification runs only when the frontdesk
+    flags medium/high complexity — the simple-request fast path must not
+    pay the ~12s professional generation (whose KV-cache the answering
+    pass cannot reuse: the system prompts diverge at the first token)."""
+
+    @pytest.mark.asyncio
+    async def test_low_complexity_skips_reclass(self) -> None:
+        from unittest.mock import AsyncMock
+
+        called = AsyncMock(return_value={"intent": "CODE"})
+        classification = {
+            "intent": "CHAT", "priority": 3, "complexity": "low",
+            "project_name": "general", "is_factual": False,
+        }
+        with patch("routes.reclassify_with_professional", called):
+            await routes._reclassify_gated(classification, "hi")
+        called.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_medium_complexity_runs_reclass(self) -> None:
+        from unittest.mock import AsyncMock
+
+        called = AsyncMock(return_value={"intent": "CODE"})
+        classification = {
+            "intent": "CHAT", "priority": 2, "complexity": "medium",
+            "project_name": "general", "is_factual": False,
+        }
+        with patch("routes.reclassify_with_professional", called):
+            await routes._reclassify_gated(classification, "refactor the routing")
+        called.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_high_complexity_runs_reclass(self) -> None:
+        from unittest.mock import AsyncMock
+
+        called = AsyncMock(return_value={"intent": "CODE", "priority": 1})
+        classification = {
+            "intent": "CHAT", "priority": 3, "complexity": "high",
+            "project_name": "general", "is_factual": False,
+        }
+        with patch("routes.reclassify_with_professional", called):
+            await routes._reclassify_gated(classification, "rearchitect the router")
+        called.assert_awaited_once()
+        assert classification["intent"] == "CODE"
+        assert classification["priority"] == 1
+
+    @pytest.mark.asyncio
+    async def test_gated_failure_preserves_frontdesk(self) -> None:
+        from unittest.mock import AsyncMock
+
+        called = AsyncMock(side_effect=httpx.ConnectError("boom"))
+        classification = {
+            "intent": "CHAT", "priority": 2, "complexity": "high",
+            "project_name": "general", "is_factual": False,
+        }
+        with patch("routes.reclassify_with_professional", called):
+            await routes._reclassify_gated(classification, "complex request")
+        called.assert_awaited_once()
+        assert classification["intent"] == "CHAT"  # frontdesk kept

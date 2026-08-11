@@ -672,6 +672,49 @@ async def _govern_messages(
     )
 
 
+async def _reclassify_gated(
+    classification: dict[str, Any],
+    user_text: str,
+    *,
+    port: int = 0,
+) -> dict[str, Any]:
+    """Professional reclassification (user-approved 2026-08-09; gated
+    2026-08-11): the 2B frontdesk under-judges complex work, so ask the
+    professional to reclassify BEFORE answering — but ONLY when the
+    frontdesk flags medium/high complexity.  The gate restores the fast
+    path for simple requests: the reclass costs a full ~12s professional
+    generation and its KV-cache is NOT reusable by the answering pass
+    (the system prompts diverge at the first token).  The reclassified
+    intent/priority/complexity replace the frontdesk's values and the
+    proxy assigns the reclass-recommended sampling parameters to the
+    answering call.  Best-effort: any failure keeps the frontdesk's
+    classification.  Returns the reclass dict (empty when gated off or
+    failed).
+    """
+    if classification.get("complexity", "low") not in ("medium", "high"):
+        return {}
+    try:
+        reclass = await reclassify_with_professional(
+            user_text, model_port=port,
+        )
+    except (httpx.HTTPError, OSError, ValueError):
+        return {}
+    if reclass.get("intent"):
+        classification["intent"] = reclass["intent"]
+        classification["priority"] = reclass.get(
+            "priority", classification.get("priority", 2),
+        )
+        classification["complexity"] = reclass.get(
+            "complexity", classification.get("complexity", "low"),
+        )
+        logger.info(
+            "Professional reclassified: intent=%s priority=%s complexity=%s",
+            classification["intent"], classification["priority"],
+            classification["complexity"],
+        )
+    return reclass
+
+
 async def chat_completions(request: Request) -> Response:
     """
     OpenAI-compatible chat completions endpoint.
@@ -1118,36 +1161,13 @@ async def chat_completions(request: Request) -> Response:
             classification.get("is_factual"),
         )
 
-        # Professional reclassification (user-approved 2026-08-09): the 2B
-        # frontdesk under-judges complex work.  Ask the professional to
-        # reclassify the request before answering — its KV-cache makes the
-        # reclassification preprocessing reusable by the answering pass
-        # (the context is cached), and the proxy then assigns the correct
-        # intent-based sampling parameters to the actual answering call.
-        # Best-effort: any failure keeps the frontdesk's classification.
-        try:
-            systemd_state = getattr(request.app.state, "systemd", None)
-            reclass_port = 0
-            if systemd_state is not None:
-                reclass_port = await systemd_state.get_port("professional")
-            reclass = await reclassify_with_professional(
-                user_text, model_port=reclass_port,
-            )
-        except (httpx.HTTPError, OSError, ValueError):
-            reclass = {}
-        if reclass.get("intent"):
-            classification["intent"] = reclass["intent"]
-            classification["priority"] = reclass.get(
-                "priority", classification.get("priority", 2),
-            )
-            classification["complexity"] = reclass.get(
-                "complexity", classification.get("complexity", "low"),
-            )
-            logger.info(
-                "Professional reclassified: intent=%s priority=%s complexity=%s",
-                classification["intent"], classification["priority"],
-                classification["complexity"],
-            )
+        systemd_state = getattr(request.app.state, "systemd", None)
+        reclass_port = 0
+        if systemd_state is not None:
+            reclass_port = await systemd_state.get_port("professional")
+        reclass = await _reclassify_gated(
+            classification, user_text, port=reclass_port,
+        )
     else:
         classification["intent"] = "CODE"
         classification["priority"] = 1
@@ -2680,9 +2700,38 @@ async def _apply_coding_decision_gate(
                     reason_suffix = f" ({reason})" if reason else ""
                     if difficulty == "low":
                         # Simple coding task — the user asked for no prompt:
-                        # route straight through (the recommendation's route)
-                        # and keep the normal flow.
+                        # apply the recommendation's route immediately and
+                        # skip the question (the bare question must never
+                        # appear for simple tasks).
+                        logger.info(
+                            "Coding decision for session %s: low difficulty — "
+                            "applying recommendation %r without prompting",
+                            session_id, recommendation,
+                        )
                         decisions[session_id] = recommendation
+                        if recommendation in ("opencode", "sdd"):
+                            is_sdd = recommendation == "sdd"
+                            resp = await _opencode_task_response(
+                                _last_user_text(messages),
+                                client_stream,
+                                session_map=_opencode_session_state(app),
+                                session_key=session_id,
+                                pending_permissions=_pending_permissions_state(app),
+                                system_prompt=(
+                                    _SDD_AUTONOMOUS_SYSTEM_PROMPT
+                                    if is_sdd else _BRIDGE_SYSTEM_PROMPT
+                                ),
+                                timeout=(
+                                    OPENCODE_SDD_TIMEOUT
+                                    if is_sdd else OPENCODE_SERVE_TIMEOUT
+                                ),
+                                autonomous=is_sdd,
+                            )
+                            await _persist_opencode_sessions(app)
+                            return resp
+                        # "local"/"professional" recommendation: the normal
+                        # flow continues to the local code pathway.
+                        return None
                     question = (
                         f"{_CODING_QUESTION_PREFIX} Coding task detected — route to OpenCode, "
                         f"the local code pathway (Professional), or a full SDD cycle "

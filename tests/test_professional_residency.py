@@ -275,3 +275,52 @@ class TestThermalMonitorWiring:
             await task
 
         assert state.cpu == 40.0  # loop still ran fine without a systemd manager
+
+
+class TestDeterministicNanobotSeek:
+    """The nanobot system prompt is deterministic given the workspace
+    files; the seek assembles the full stable head (identity template +
+    bootstrap blocks + long-term memory) in the nanobot's exact order and
+    refreshes on file changes (the automatic monitoring)."""
+
+    def _workspace(self, tmp_path: Any) -> Any:
+        (tmp_path / "AGENTS.md").write_text("AGENTS body", encoding="utf-8")
+        (tmp_path / "SOUL.md").write_text("SOUL body", encoding="utf-8")
+        (tmp_path / "USER.md").write_text("USER body", encoding="utf-8")
+        (tmp_path / "TOOLS.md").write_text("TOOLS body", encoding="utf-8")
+        mem = tmp_path / "memory"
+        mem.mkdir()
+        (mem / "MEMORY.md").write_text("MEM body", encoding="utf-8")
+        return tmp_path
+
+    def test_full_deterministic_assembly(self, tmp_path: Any) -> None:
+        import prompt_cache as pc
+        pc._PROMPTS.clear()
+        ws = self._workspace(tmp_path)
+        assembled = pc.seek_nanobot_prompt(str(ws))
+        # identity (rendered) first
+        assert assembled.startswith("## Runtime\n")
+        assert "## Platform Policy (POSIX)" in assembled
+        # bootstrap blocks in the nanobot's exact order
+        assert assembled.index("## AGENTS.md") < assembled.index("## SOUL.md")
+        assert assembled.index("## SOUL.md") < assembled.index("## USER.md")
+        assert assembled.index("## USER.md") < assembled.index("## TOOLS.md")
+        # memory section after the bootstrap
+        assert "## TOOLS.md" in assembled
+        assert "## Long-term Memory\nMEM body" in assembled
+        # registered + deterministic
+        assert pc.registered_prompts().get("nanobot") == assembled
+        assert pc.seek_nanobot_prompt(str(ws)) == assembled
+
+    def test_memory_change_forces_refresh(self, tmp_path: Any) -> None:
+        import prompt_cache as pc
+        pc._PROMPTS.clear()
+        pc._LAST_PRIMED.clear()
+        ws = self._workspace(tmp_path)
+        pc.seek_nanobot_prompt(str(ws))
+        assert "old memory" not in pc.registered_prompts()["nanobot"]
+        (ws / "memory" / "MEMORY.md").write_text("old memory", encoding="utf-8")
+        pc.seek_nanobot_prompt(str(ws))
+        assert "old memory" in pc.registered_prompts()["nanobot"]
+        # the refresh forces a re-prime (throttle cleared)
+        assert "nanobot" not in pc._LAST_PRIMED

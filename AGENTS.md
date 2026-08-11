@@ -101,6 +101,15 @@ project-specific.
    (2026-08-09, F5 note in `opencode_bridge.py`); the cache is a scalar
    timestamp, never a container.
 
+   **Documented carve-out — prompt priming registries** (`prompt_cache.py`
+   `_PROMPTS` / `_LAST_PRIMED`): runtime-mutable module-level registries
+   for the frontend system-prompt priming. The priming runs from the
+   residency monitor loop (hardware.py) AND the request path (routes.py)
+   with no app.state handle in the monitor, so threading app state through
+   would couple the cache to the FastAPI app. Accepted as a project
+   exception (2026-08-11, F6 note in `prompt_cache.py`); the registries
+   are small, per-process, and die with the process.
+
 7. **Tests**: new code paths MUST have a regression test. Use the harness in
    `tests/conftest.py` (stubs FlashRank + heavy deps, lifespan disabled).
    Async tests need `@pytest_asyncio.fixture` (NOT plain `@pytest.fixture`).

@@ -179,38 +179,40 @@ async def _session_part_count(session_id: str) -> int:
         return -1
 
 
-async def _serve_total_parts() -> int:
-    """Total parts across ALL serve sessions — the cycle's own evidence
-    of work (sub-agent sessions are where the real work lands; the
-    pinned orchestrator session alone misses them).  The go-proxy
-    journal is SHARED with the user's own TUI sessions, so model-call
-    counts there are not cycle-scoped (2026-08-11: the hold re-armed on
-    this conversation's own traffic while the design phase was dead).
-    -1 when the count cannot be determined (never re-arms).
+def _serve_total_parts_db() -> int:
+    """Total parts across ALL serve sessions, read from the serve's
+    SQLite session store — the cycle's own evidence of work.  The
+    serve's HTTP status/message API is NOT reliable here: after a
+    recycle or quiet window the fresh serve returns an empty status
+    and 404s persisted sessions (2026-08-11), while the DB holds the
+    ground truth (its write-lag is minutes, acceptable for the hold).
+    -1 when the DB cannot be read (never re-arms).
     """
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                f"{OPENCODE_SERVE_URL}/session/status",
+        import sqlite3
+
+        db_path = os.path.join(
+            opencode_bridge.OPENCODE_SERVE_CONFIG_DIR,
+            "opencode", "opencode.db",
+        )
+        con = sqlite3.connect(db_path, timeout=3.0)
+        try:
+            cur = con.cursor()
+            cur.execute(
+                "SELECT COUNT(*) FROM part "
+                "WHERE session_id IN (SELECT id FROM session)",
             )
-            if resp.status_code != 200:
-                return -1
-            sessions = resp.json()
-            if not isinstance(sessions, dict):
-                return -1
-            total = 0
-            for sid in sessions:
-                mresp = await client.get(
-                    f"{OPENCODE_SERVE_URL}/session/{sid}/message",
-                )
-                if mresp.status_code != 200:
-                    continue
-                total += sum(
-                    len(m.get("parts") or []) for m in mresp.json()
-                )
-            return total
-    except (httpx.HTTPError, OSError, ValueError):
+            total = cur.fetchone()[0]
+        finally:
+            con.close()
+        return int(total)
+    except (sqlite3.Error, OSError, ValueError, TypeError):
         return -1
+
+
+async def _serve_total_parts() -> int:
+    """Async wrapper around the DB read (off the event loop)."""
+    return await asyncio.to_thread(_serve_total_parts_db)
 
 
 async def _session_has_terminal_marker(session_id: str) -> bool:

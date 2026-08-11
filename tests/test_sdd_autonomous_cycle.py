@@ -69,3 +69,41 @@ class TestHoldDecision:
         assert budget == 3
 
 
+
+
+class TestServeTotalPartsDb:
+    """The cycle-scoped work signal reads the serve's SQLite store —
+    the HTTP status API 404s persisted sessions after a recycle."""
+
+    def _make_db(self, tmp_path, session_parts: dict[str, int]) -> str:
+        import sqlite3 as _sq
+
+        db_path = tmp_path / "serve-config" / "opencode" / "opencode.db"
+        db_path.parent.mkdir(parents=True)
+        con = _sq.connect(str(db_path))
+        con.execute("CREATE TABLE session (id TEXT PRIMARY KEY)")
+        con.execute("CREATE TABLE part (id TEXT PRIMARY KEY, session_id TEXT)")
+        for sid, n in session_parts.items():
+            con.execute("INSERT INTO session (id) VALUES (?)", (sid,))
+            for i in range(n):
+                con.execute(
+                    "INSERT INTO part (id, session_id) VALUES (?, ?)",
+                    (f"{sid}-p{i}", sid),
+                )
+        con.commit()
+        con.close()
+        return str(tmp_path / "serve-config")
+
+    def test_totals_all_sessions(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "opencode_bridge.OPENCODE_SERVE_CONFIG_DIR",
+            self._make_db(tmp_path, {"ses_a": 5, "ses_b": 3}),
+        )
+        assert driver._serve_total_parts_db() == 8
+
+    def test_missing_db_is_negative(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "opencode_bridge.OPENCODE_SERVE_CONFIG_DIR",
+            str(tmp_path / "nope"),
+        )
+        assert driver._serve_total_parts_db() == -1

@@ -40,7 +40,10 @@ from llm import call_model
 # from the residency monitor loop (hardware.py) AND the request path
 # (routes.py) with no app.state handle in the monitor, so threading app
 # state through would couple the cache to the FastAPI app.  The registries
-# are small, per-process, and die with the process.
+# are small, per-process, and die with the process.  ``_NANOBOT_PYTHON_VERSION``
+# is the same class: a lazy subprocess-derived scalar cache (one probe of
+# the tool's python, then immutable for the process) — covered by this
+# carve-out.
 _PROMPTS: dict[str, str] = {}
 
 #: Last time each prompt was primed (epoch seconds), to avoid re-priming
@@ -136,6 +139,46 @@ def _nanobot_format_hint(channel: str) -> str:
     return ""
 
 
+_NANOBOT_PYTHON_VERSION: str = ""
+
+
+def _nanobot_python_version() -> str:
+    """The nanobot process's Python version — the wire's identity renders
+    ``platform.python_version()`` of the TOOL's python (the uv tool env),
+    which can differ in the patch from the proxy's own python.  A single
+    token mismatch at the runtime line kills the whole KV-cache match, so
+    the seek must render the tool's version, resolved once and cached.
+    """
+    global _NANOBOT_PYTHON_VERSION
+    if _NANOBOT_PYTHON_VERSION:
+        return _NANOBOT_PYTHON_VERSION
+    import glob
+    import os
+    import subprocess
+    try:
+        from local_config import UV_NANOBOT_PATTERN
+        for base in glob.glob(UV_NANOBOT_PATTERN):
+            tool_py = os.path.join(
+                os.path.dirname(os.path.dirname(base)),
+                "bin", "python",
+            )
+            if not os.path.exists(tool_py):
+                continue
+            out = subprocess.run(
+                [tool_py, "-c",
+                 "import platform; print(platform.python_version())"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if out.returncode == 0 and out.stdout.strip():
+                _NANOBOT_PYTHON_VERSION = out.stdout.strip()
+                return _NANOBOT_PYTHON_VERSION
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    import platform as _platform
+    _NANOBOT_PYTHON_VERSION = _platform.python_version()
+    return _NANOBOT_PYTHON_VERSION
+
+
 def _nanobot_identity(workspace_path: str, channel: str = "") -> str:
     """Render the nanobot's identity section exactly as its context
     builder does (``agent/templates/identity.md`` with the runtime,
@@ -146,7 +189,7 @@ def _nanobot_identity(workspace_path: str, channel: str = "") -> str:
 
     runtime = (
         f"{_platform.system()} {_platform.machine()}, "
-        f"Python {_platform.python_version()}"
+        f"Python {_nanobot_python_version()}"
     )
     return (
         f"## Runtime\n{runtime}\n\n"

@@ -431,3 +431,27 @@ class TestPerChannelPrimingVariants:
         for key in reg:
             assert "## AGENTS.md" in reg[key]
             assert "# Recent History" in reg[key]
+
+
+class TestRuntimeVersionMatch:
+    """The wire's identity renders the TOOL's python version (the uv
+    tool env), which differs from the proxy's own python in the patch —
+    a single token mismatch at the runtime line kills the KV-cache match.
+    The seek must render the tool's version."""
+
+    def test_runtime_uses_tool_python(self, tmp_path: Any) -> None:
+        import prompt_cache as pc
+        pc._PROMPTS.clear()
+        (tmp_path / "AGENTS.md").write_text("AGENTS body", encoding="utf-8")
+        (tmp_path / "SOUL.md").write_text("SOUL body", encoding="utf-8")
+        (tmp_path / "USER.md").write_text("USER body", encoding="utf-8")
+        (tmp_path / "TOOLS.md").write_text("TOOLS body", encoding="utf-8")
+        mem = tmp_path / "memory"
+        mem.mkdir()
+        (mem / "MEMORY.md").write_text("MEM body", encoding="utf-8")
+        (mem / ".dream_cursor").write_text("0", encoding="utf-8")
+        assembled = pc.seek_nanobot_prompt(str(tmp_path))
+        assert "Python 3.14.4" in assembled.splitlines()[1]
+        # not the proxy's own version when they differ
+        import platform as _platform
+        assert "Python 3.14.6" not in assembled.splitlines()[1]

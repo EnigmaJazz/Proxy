@@ -87,16 +87,17 @@ def _recent_go_proxy_calls(window_s: float = _GO_PROXY_ACTIVITY_WINDOW_S) -> int
     return _count_go_proxy_calls(out)
 
 
-def hold_decision(*, recent_calls: int, session_busy: bool,
-                  parts_grew: bool, replay_in_flight: bool,
+def hold_decision(*, parts_grew: bool, replay_in_flight: bool,
                   budget: int) -> tuple[str, int]:
     """One poll of the driver's hold state machine.
 
-    Working activity means SUSTAINED model-call flow (>= 2 calls in the
-    window) OR any model-call flow accompanied by part growth — a lone
-    spurious call (a stuck session's retry traffic) must not re-arm the
-    budget and hold the cycle forever (2026-08-11: cycle-11's static
-    spec parts with 1-2-call blips).
+    The re-arm is PART GROWTH ONLY — the serve's own evidence of the
+    cycle's work (the sub-agents' sessions grow when a phase works).
+    The busy flag and the go-proxy journal must NOT re-arm: the serve
+    reports prompt_async sessions busy even after completion (the F5
+    busy-forever false hold), and the go-proxy journal is shared with
+    the user's TUI sessions (2026-08-11: the hold re-armed on this
+    conversation's own traffic while the design phase was dead).
 
     Returns (action, new_budget) consumed directly by the wait loop:
       - ("hold", full_budget)  working activity: reset the budget.
@@ -109,8 +110,7 @@ def hold_decision(*, recent_calls: int, session_busy: bool,
         # The replay window pauses the drain entirely; a phantom replay
         # window is bounded by its staleness horizon on the bridge side.
         return "hold", budget
-    working = recent_calls >= 2 or (recent_calls >= 1 and parts_grew)
-    if working or session_busy:
+    if parts_grew:
         return "hold", full_budget
     if budget <= 1:
         return "resume", 0
@@ -175,6 +175,40 @@ async def _session_part_count(session_id: str) -> int:
             return sum(
                 len(m.get("parts") or []) for m in resp.json()
             )
+    except (httpx.HTTPError, OSError, ValueError):
+        return -1
+
+
+async def _serve_total_parts() -> int:
+    """Total parts across ALL serve sessions — the cycle's own evidence
+    of work (sub-agent sessions are where the real work lands; the
+    pinned orchestrator session alone misses them).  The go-proxy
+    journal is SHARED with the user's own TUI sessions, so model-call
+    counts there are not cycle-scoped (2026-08-11: the hold re-armed on
+    this conversation's own traffic while the design phase was dead).
+    -1 when the count cannot be determined (never re-arms).
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"{OPENCODE_SERVE_URL}/session/status",
+            )
+            if resp.status_code != 200:
+                return -1
+            sessions = resp.json()
+            if not isinstance(sessions, dict):
+                return -1
+            total = 0
+            for sid in sessions:
+                mresp = await client.get(
+                    f"{OPENCODE_SERVE_URL}/session/{sid}/message",
+                )
+                if mresp.status_code != 200:
+                    continue
+                total += sum(
+                    len(m.get("parts") or []) for m in mresp.json()
+                )
+            return total
     except (httpx.HTTPError, OSError, ValueError):
         return -1
 
@@ -376,26 +410,26 @@ async def main(change: str, code_writer: str = "local") -> None:
                 # "working" signal (part timestamps lag by design); the
                 # serve's busy flag stays as the secondary signal.  A
                 # fallback-model replay pauses the drain entirely.
-                recent_calls = await asyncio.to_thread(
-                    _recent_go_proxy_calls,
-                )
+                # CYCLE-SCOPED SIGNAL (2026-08-11): the go-proxy journal
+                # is shared with the user's TUI sessions, so its model
+                # calls are not the cycle's evidence.  Total part growth
+                # across ALL serve sessions is the cycle's own work
+                # signal (sub-agent sessions included).
                 replay = await asyncio.to_thread(
                     opencode_bridge._replay_in_flight_for_any_session,
                 )
                 session_busy = await _serve_sessions_active()
-                parts_now = await _session_part_count(_sid) if _sid else -1
+                parts_now = await _serve_total_parts()
                 parts_grew = 0 <= parts_now and parts_now > parts_prev
                 parts_prev = parts_now if parts_now >= 0 else parts_prev
                 action, wait_budget = hold_decision(
-                    recent_calls=recent_calls,
-                    session_busy=session_busy,
                     parts_grew=parts_grew,
                     replay_in_flight=replay,
                     budget=wait_budget,
                 )
                 print(
-                    f"[HOLD] calls={recent_calls} busy={session_busy} "
-                    f"parts_grew={parts_grew} replay={replay} "
+                    f"[HOLD] serve_parts={parts_now} parts_grew={parts_grew} "
+                    f"busy={session_busy} replay={replay} "
                     f"action={action} budget={wait_budget}",
                     flush=True,
                 )

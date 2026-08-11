@@ -294,7 +294,7 @@ class TestCodingDecisionGate:
                  new=AsyncMock(return_value=_classification()),
              ), \
              patch(
-                 "routes.opencode_chat",
+                 "routes.opencode_chat_stream",
                  new=AsyncMock(return_value="SHOULD_NOT_RUN"),
              ):
             response = await gate_client.post(

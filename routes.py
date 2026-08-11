@@ -26,7 +26,6 @@ import sqlite3
 import subprocess
 import time
 from datetime import datetime
-import time
 import uuid
 from pathlib import Path
 import httpx
@@ -69,7 +68,6 @@ from opencode_bridge import (
     _SDD_AUTONOMOUS_SYSTEM_PROMPT,
     _parse_permission_answer,
     _post_permission_response,
-    opencode_chat,
     opencode_chat_stream,
 )
 from routing import (
@@ -619,7 +617,14 @@ def _inject_current_datetime(messages: list[dict[str, Any]]) -> list[dict[str, A
     messages = list(messages)
     for i, m in enumerate(messages):
         if m.get("role") == "system" and isinstance(m.get("content"), str):
-            messages[i] = {**m, "content": stamp + "\n\n" + m["content"]}
+            # KV-CACHE POSITION (2026-08-11): the stamp goes at the END
+            # of the system message, NOT the start.  Prepended, the time
+            # changed the cache-visible prefix every request and the
+            # professional re-prefilled the FULL ~20k-token prompt each
+            # time (~45s/request — the measured slowdown).  Appended,
+            # the stable system content + growing history stay cache-
+            # visible and only the ~20-token stamp delta re-prefills.
+            messages[i] = {**m, "content": m["content"] + "\n\n" + stamp}
             return messages
     return [{"role": "system", "content": stamp}] + messages
 

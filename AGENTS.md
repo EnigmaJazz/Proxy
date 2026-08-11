@@ -47,10 +47,14 @@ project-specific.
 
    **Documented carve-out — current date/time stamp** (`routes.py`
    `_inject_current_datetime`): frontends (nanobot, OpenWebUI) never send
-   the date, so the models they drive run date-blind. The proxy MAY prefix
-   the OUTBOUND system message with the current date and time. It never
-   touches user or assistant text, never mutates the client's stored
-   conversation or the DB audit copy, and is per-request opt-out via
+   the date, so the models they drive run date-blind. The proxy MAY add
+   the current date and time to the OUTBOUND system message, APPENDED
+   after the system content (not prefixed): the stable system prefix must
+   stay KV-cache-visible so the model's prompt cache hits across
+   requests — a prefixed time changed the cache-visible prefix every
+   request and forced full ~45s prefills (2026-08-11). It never touches
+   user or assistant text, never mutates the client's stored conversation
+   or the DB audit copy, and is per-request opt-out via
    `X-Proxy-Date-Time: off`. This is a content-availability fix mirroring
    the opencode app's own date stamp for its sessions.
 

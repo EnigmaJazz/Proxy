@@ -287,9 +287,14 @@ class TestDateTimeInjection:
         msgs = [{"role": "system", "content": "You are helpful."},
                 {"role": "user", "content": "hi"}]
         out = self._inject(msgs)
-        assert out[0]["content"].startswith("Today's date:")
+        # KV-CACHE POSITION (2026-08-11): the stamp is APPENDED to the
+        # system message so the stable system content stays the
+        # cache-visible prefix — a prepended time changed the prefix
+        # every request and forced full ~45s prefills.
+        assert out[0]["content"].startswith("You are helpful.")
+        assert "Today's date:" in out[0]["content"]
         assert "Current time:" in out[0]["content"]
-        assert out[0]["content"].endswith("You are helpful.")
+        assert "Current time:" in out[0]["content"][-40:]  # stamp at the very end
         assert out[1] == msgs[1]  # user message untouched
 
     def test_inserts_system_message_when_absent(self) -> None:
@@ -312,7 +317,8 @@ class TestDateTimeInjection:
         request = _types.SimpleNamespace(headers={})
         msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
         out = await _govern_messages(request, msgs, model_key="professional", max_tokens=4096)
-        assert out[0]["content"].startswith("Today's date:")
+        assert out[0]["content"].startswith("sys")
+        assert "Today's date:" in out[0]["content"]
 
     @pytest.mark.asyncio
     async def test_govern_wiring_opt_out(self) -> None:

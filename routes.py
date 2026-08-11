@@ -696,7 +696,17 @@ async def _reclassify_gated(
     classification.  Returns the reclass dict (empty when gated off or
     failed).
     """
-    if classification.get("complexity", "low") not in ("medium", "high"):
+    # The gate runs the professional second opinion when the frontdesk
+    # flags medium/high complexity OR the request is a coding task
+    # (intent CODE).  The frontdesk UNDER-JUDGES complex work — its
+    # complexity rating is the unreliable signal — so coding tasks
+    # always reclassify (2026-08-11: a medium-complexity coding task
+    # rated low by the frontdesk skipped the reclass entirely).
+    intent = classification.get("intent", "")
+    if (
+        intent != "CODE"
+        and classification.get("complexity", "low") not in ("medium", "high")
+    ):
         return {}
     try:
         reclass = await reclassify_with_professional(

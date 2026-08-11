@@ -703,3 +703,37 @@ class TestReclassificationGate:
             await routes._reclassify_gated(classification, "complex request")
         called.assert_awaited_once()
         assert classification["intent"] == "CHAT"  # frontdesk kept
+
+
+class TestReclassificationGateCodeTasks:
+    """Coding tasks always get the professional reclassification — the
+    frontdesk's complexity rating under-judges them (2026-08-11: a
+    medium-complexity coding task rated low skipped the reclass)."""
+
+    @pytest.mark.asyncio
+    async def test_code_intent_reclassifies_even_when_frontdesk_says_low(
+        self,
+    ) -> None:
+        from unittest.mock import AsyncMock
+
+        called = AsyncMock(return_value={"intent": "CODE"})
+        classification = {
+            "intent": "CODE", "priority": 2, "complexity": "low",
+            "project_name": "general", "is_factual": False,
+        }
+        with patch("routes.reclassify_with_professional", called):
+            await routes._reclassify_gated(classification, "refactor the router")
+        called.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_low_chat_still_skips(self) -> None:
+        from unittest.mock import AsyncMock
+
+        called = AsyncMock(return_value={"intent": "CHAT"})
+        classification = {
+            "intent": "CHAT", "priority": 2, "complexity": "low",
+            "project_name": "general", "is_factual": False,
+        }
+        with patch("routes.reclassify_with_professional", called):
+            await routes._reclassify_gated(classification, "hi there")
+        called.assert_not_awaited()

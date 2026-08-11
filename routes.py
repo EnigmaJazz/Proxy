@@ -677,6 +677,18 @@ async def _govern_messages(
     )
 
 
+def _priming_caller_for(headers: dict[str, str], caller_type: str) -> str:
+    """The priming registration key for a request: the nanobot's
+    user-agent gets the stable "nanobot" key (its apiKey is the shared
+    AGENTIC token — the generic caller would thrash the observed
+    registration); everyone else uses the discriminated caller type.
+    """
+    ua = headers.get("user-agent", "").lower()
+    if "nanobot" in ua:
+        return "nanobot"
+    return caller_type or "unknown"
+
+
 async def _reclassify_gated(
     classification: dict[str, Any],
     user_text: str,
@@ -800,7 +812,15 @@ async def chat_completions(request: Request) -> Response:
             (m.get("content") for m in messages if m.get("role") == "system"),
             None,
         )
-        register_observed_system_prompt(caller_type or "unknown", _sys_msg)
+        # PRIMING-CALLER KEY (2026-08-11): the nanobot's apiKey is the
+        # shared "AGENTIC" token, so the generic caller_type would register
+        # every agentic caller under ONE observed key (the last request
+        # wins and priming warms the wrong prompt).  The nanobot's
+        # user-agent gets its own stable key so the observed registration
+        # captures the EXACT wire system prompt (channel-specific identity
+        # included) and priming warms what the next request actually sends.
+        _priming_caller = _priming_caller_for(headers, caller_type)
+        register_observed_system_prompt(_priming_caller, _sys_msg)
     except (OSError, ValueError, StopIteration):
         pass
 

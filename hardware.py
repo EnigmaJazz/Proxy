@@ -764,12 +764,23 @@ async def thermal_monitor_task(
                 # re-prime of the refreshed prompt.
                 if state.gpu_vram_used_gb < GPU_BUSY_VRAM_GB:
                     try:
-                        from prompt_cache import prime, seek_nanobot_prompt
-                        seek_nanobot_prompt()
+                        from prompt_cache import (
+                            prime, registered_prompts, seek_nanobot_prompt,
+                        )
+                        assembled = seek_nanobot_prompt()
                         port = await systemd.get_port("professional")
-                        await prime(port=port)
-                    except (OSError, ValueError, AttributeError):
-                        pass
+                        result = await prime(port=port)
+                        logger.debug(
+                            "Prompt priming: seek_len=%d prompts=%s "
+                            "result=%s port=%d",
+                            len(assembled),
+                            sorted(registered_prompts()),
+                            result, port,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - monitor loop
+                        logger.warning(
+                            "Prompt priming failed: %r", exc,
+                        )
 
             # ---- Thermal threshold enforcement -------------------------------
             # Only real temperature sensors belong in the zone map. RAM usage

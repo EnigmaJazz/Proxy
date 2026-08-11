@@ -366,3 +366,25 @@ class TestGovernMessagesWiring:
         msgs = _search_messages(THIN_SNIPPET_JSON)
         out = await self._govern(msgs, {"x-proxy-search-enrichment": "off"})
         assert out[3]["content"] == THIN_SNIPPET_JSON
+
+
+class TestPrimingCallerKey:
+    """The observed registration keys the nanobot's requests under a
+    stable "nanobot" caller (its apiKey is the shared AGENTIC token —
+    the generic caller would thrash the observed registration)."""
+
+    @pytest.mark.asyncio
+    async def test_nanobot_ua_registers_nanobot_key(self) -> None:
+        from routes import _priming_caller_for
+
+        assert _priming_caller_for(
+            {"user-agent": "nanobot/0.5.1 python-httpx"}, "AGENTIC",
+        ) == "nanobot"
+
+    @pytest.mark.asyncio
+    async def test_other_agentic_keeps_caller_type(self) -> None:
+        from routes import _priming_caller_for
+
+        assert _priming_caller_for(
+            {"user-agent": "python-httpx/0.27"}, "AGENTIC",
+        ) == "AGENTIC"

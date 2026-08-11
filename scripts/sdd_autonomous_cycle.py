@@ -383,7 +383,7 @@ async def main(change: str, code_writer: str = "local") -> None:
                     opencode_bridge._replay_in_flight_for_any_session,
                 )
                 session_busy = await _serve_sessions_active()
-                parts_now = await _session_part_count(sid) if sid else -1
+                parts_now = await _session_part_count(_sid) if _sid else -1
                 parts_grew = 0 <= parts_now and parts_now > parts_prev
                 parts_prev = parts_now if parts_now >= 0 else parts_prev
                 action, wait_budget = hold_decision(

@@ -186,11 +186,194 @@ def seek_nanobot_prompt(workspace_dir: Optional[str] = None) -> str:
             parts.append(f"# Memory\n\n## Long-term Memory\n{memory}")
     except OSError:
         pass
+    # Skills: the always-on skills' content + the progressive-loading
+    # summary — deterministic (the SKILL.md files + the frontmatter).
+    active = _nanobot_active_skills(base)
+    if active:
+        parts.append(f"# Active Skills\n\n{active}")
+    summary = _nanobot_skills_summary(base)
+    if summary:
+        parts.append(
+            "# Skills\n\nThe following skills extend your capabilities. "
+            "To use a skill, read its SKILL.md file using the read_file "
+            "tool.\nUnavailable skills need dependencies installed first — "
+            "you can try installing them with apt/brew.\n\n" + summary,
+        )
+    # Recent history: the append-only JSONL after the last dream cursor —
+    # deterministic at injection time and changed only by interactions the
+    # proxy observes, so the seek re-reads it every window and refreshes
+    # the registration automatically (2026-08-11).
+    history = _nanobot_recent_history(base)
+    if history:
+        parts.append(history)
     assembled = "\n\n---\n\n".join(parts)
     if assembled and _PROMPTS.get("nanobot") != assembled:
         register_prompt("nanobot", assembled)
         _LAST_PRIMED.pop("nanobot", None)  # a change forces a re-prime
     return assembled
+
+
+def _nanobot_builtin_skills_dir() -> str:
+    """The nanobot package's builtin ``skills/`` dir, resolved via the
+    user-level install glob (local_config.UV_NANOBOT_PATTERN); "" when
+    it cannot be located (the builtin entries are then skipped).
+    """
+    import glob
+    import os
+    try:
+        from local_config import UV_NANOBOT_PATTERN
+    except (ImportError, AttributeError):
+        return ""
+    for base in glob.glob(UV_NANOBOT_PATTERN):
+        candidate = os.path.join(
+            base, "site-packages", "nanobot", "skills",
+        )
+        if os.path.isdir(candidate):
+            return candidate
+    return ""
+
+
+def _nanobot_skill_entries(workspace_path: str) -> list[dict[str, str]]:
+    """The workspace + builtin skill entries, in the nanobot's load order
+    (workspace first, then builtin; per-directory filesystem order).
+    """
+    import os
+    entries: list[dict[str, str]] = []
+    bases = (
+        (os.path.join(workspace_path, "skills"), "workspace"),
+        (_nanobot_builtin_skills_dir(), "builtin"),
+    )
+    for base, source in bases:
+        try:
+            names = sorted(os.listdir(base))
+        except OSError:
+            continue
+        for name in names:
+            skill_file = os.path.join(base, name, "SKILL.md")
+            if os.path.isfile(skill_file):
+                entries.append(
+                    {"name": name, "path": skill_file, "source": source},
+                )
+    return entries
+
+
+def _nanobot_skill_meta(skill_file: str) -> dict:
+    """The skill's frontmatter (description / always / requires), parsed
+    as YAML — the same shape the nanobot's loader reads.
+    """
+    try:
+        text = open(skill_file, encoding="utf-8").read()
+    except OSError:
+        return {}
+    if not text.startswith("---"):
+        return {}
+    try:
+        body = text.split("---", 2)[1]
+        import yaml
+        parsed = yaml.safe_load(body)
+        return parsed if isinstance(parsed, dict) else {}
+    except (ValueError, ImportError, OSError, yaml.YAMLError):
+        return {}
+
+
+def _nanobot_active_skills(workspace_path: str) -> str:
+    """The ``# Active Skills`` section: the content of every skill whose
+    frontmatter marks it ``always``, frontmatter-stripped, in the loader's
+    format (``### Skill: <name>`` blocks).
+    """
+    import re
+    parts: list[str] = []
+    for entry in _nanobot_skill_entries(workspace_path):
+        meta = _nanobot_skill_meta(entry["path"])
+        if not (meta.get("always") or (meta.get("metadata") or {}).get("always")):
+            continue
+        try:
+            text = open(entry["path"], encoding="utf-8").read()
+        except OSError:
+            continue
+        stripped = re.sub(r"^---.*?---\n", "", text, count=1, flags=re.S).strip()
+        if stripped:
+            parts.append(f"### Skill: {entry['name']}\n\n{stripped}")
+    return "\n\n---\n\n".join(parts)
+
+
+def _nanobot_skills_summary(workspace_path: str) -> str:
+    """The progressive-loading skills summary: one line per skill
+    (name — description, path), available vs unavailable marked per
+    the frontmatter's requirements.
+    """
+    import os
+    import shutil
+    lines: list[str] = []
+    for entry in _nanobot_skill_entries(workspace_path):
+        meta = _nanobot_skill_meta(entry["path"])
+        requires = meta.get("requires") or {}
+        missing_bins = [
+            c for c in (requires.get("bins") or []) if not shutil.which(c)
+        ]
+        missing_env = [
+            v for v in (requires.get("env") or []) if not os.environ.get(v)
+        ]
+        desc = meta.get("description") or entry["name"]
+        if not missing_bins and not missing_env:
+            lines.append(
+                f"- **{entry['name']}** — {desc}  `{entry['path']}`",
+            )
+        else:
+            missing = ", ".join(
+                [f"CLI: {c}" for c in missing_bins]
+                + [f"ENV: {v}" for v in missing_env],
+            )
+            suffix = f" (unavailable: {missing})" if missing else " (unavailable)"
+            lines.append(
+                f"- **{entry['name']}** — {desc}{suffix}  `{entry['path']}`",
+            )
+    return "\n".join(lines)
+
+
+def _nanobot_recent_history(workspace_path: str) -> str:
+    """The ``# Recent History`` section: the history.jsonl entries after
+    the last dream cursor, capped at 50 entries / 32k chars — the exact
+    shape the nanobot's context builder emits.
+    """
+    import json as _json
+    import os
+    history_path = os.path.join(workspace_path, "memory", "history.jsonl")
+    cursor_path = os.path.join(workspace_path, "memory", ".dream_cursor")
+    try:
+        since = int(open(cursor_path, encoding="utf-8").read().strip())
+    except (OSError, ValueError):
+        since = 0
+    entries: list[dict] = []
+    try:
+        with open(history_path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = _json.loads(line)
+                except ValueError:
+                    continue
+                raw = entry.get("cursor")
+                try:
+                    cursor = int(raw)
+                except (TypeError, ValueError):
+                    continue
+                if cursor > since:
+                    entries.append(entry)
+    except OSError:
+        return ""
+    recent = entries[-50:]
+    history_text = "\n".join(
+        f"- [{e.get('timestamp', '')}] {e.get('content', '')}"
+        for e in recent
+    )
+    if not history_text:
+        return ""
+    if len(history_text) > 32_000:
+        history_text = history_text[:32_000] + "\n... (truncated)"
+    return f"# Recent History\n\n{history_text}"
 
 
 async def prime(port: int = 0) -> dict[str, bool]:

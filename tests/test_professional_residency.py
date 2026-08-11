@@ -324,3 +324,69 @@ class TestDeterministicNanobotSeek:
         assert "old memory" in pc.registered_prompts()["nanobot"]
         # the refresh forces a re-prime (throttle cleared)
         assert "nanobot" not in pc._LAST_PRIMED
+
+
+class TestDeterministicHistoryAndSkills:
+    """The full deterministic head: active skills + skills summary +
+    recent history (the only variable is the session summary + the
+    conversation turns, which priming cannot warm)."""
+
+    def _workspace(self, tmp_path: Any) -> Any:
+        (tmp_path / "AGENTS.md").write_text("AGENTS body", encoding="utf-8")
+        (tmp_path / "SOUL.md").write_text("SOUL body", encoding="utf-8")
+        (tmp_path / "USER.md").write_text("USER body", encoding="utf-8")
+        (tmp_path / "TOOLS.md").write_text("TOOLS body", encoding="utf-8")
+        mem = tmp_path / "memory"
+        mem.mkdir()
+        (mem / "MEMORY.md").write_text("MEM body", encoding="utf-8")
+        (mem / ".dream_cursor").write_text("0", encoding="utf-8")
+        return tmp_path
+
+    def test_history_and_skills_sections(self, tmp_path: Any) -> None:
+        import json as _json
+        import prompt_cache as pc
+        pc._PROMPTS.clear()
+        ws = self._workspace(tmp_path)
+        hist = ws / "memory" / "history.jsonl"
+        hist.write_text(
+            "\n".join([
+                _json.dumps({"cursor": i, "timestamp": f"t{i}", "content": f"c{i}"})
+                for i in (1, 2, 3)
+            ]),
+            encoding="utf-8",
+        )
+        assembled = pc.seek_nanobot_prompt(str(ws))
+        assert "# Recent History" in assembled
+        assert "- [t3] c3" in assembled
+        # the dream cursor filters older entries
+        (ws / "memory" / ".dream_cursor").write_text("2", encoding="utf-8")
+        assembled2 = pc.seek_nanobot_prompt(str(ws))
+        assert "- [t3] c3" in assembled2
+        assert "- [t1] c1" not in assembled2
+        # a history change refreshes the registration (the interaction-
+        # driven updates are visible to the proxy)
+        hist.write_text(
+            _json.dumps({"cursor": 4, "timestamp": "t4", "content": "c4"}),
+            encoding="utf-8",
+        )
+        assembled3 = pc.seek_nanobot_prompt(str(ws))
+        assert "- [t4] c4" in assembled3
+        assert pc.registered_prompts().get("nanobot") == assembled3
+
+    def test_skills_sections_present(self, tmp_path: Any) -> None:
+        import prompt_cache as pc
+        pc._PROMPTS.clear()
+        ws = self._workspace(tmp_path)
+        skills = ws / "skills" / "probe-skill"
+        skills.mkdir(parents=True)
+        (skills / "SKILL.md").write_text(
+            "---\nname: probe-skill\ndescription: Probe skill\nalways: true\n"
+            "requires:\n  bins: []\n---\nProbe body\n",
+            encoding="utf-8",
+        )
+        assembled = pc.seek_nanobot_prompt(str(ws))
+        assert "# Active Skills" in assembled
+        assert "### Skill: probe-skill" in assembled
+        assert "Probe body" in assembled
+        assert "# Skills" in assembled
+        assert "**probe-skill**" in assembled

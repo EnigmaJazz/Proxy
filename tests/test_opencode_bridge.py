@@ -3808,3 +3808,92 @@ class TestCopyIfChanged:
         dst.write_text("old")
         opencode_bridge._copy_if_changed(str(src), str(dst))
         assert dst.read_text() == "new"
+
+
+class TestStallAwareAbort:
+    """A task part whose child session has dropped out of the live status
+    map means the sub-agent finished but the delivery is stuck — the
+    wedge fires early (before the 600s threshold) so the orchestrator's
+    artifact-check proceeds without redoing the phase."""
+
+    @staticmethod
+    def _parts(task_running_for_s: int, child_id: str | None) -> list[dict]:
+        import time as _t
+
+        meta: dict[str, object] = {}
+        if child_id:
+            meta = {"metadata": {"sessionId": child_id}}
+        return [{
+            "type": "tool",
+            "tool": "task",
+            "state": {
+                "status": "running",
+                "time": {"start": int((_t.time() - task_running_for_s) * 1000)},
+                **meta,
+            },
+        }]
+
+    @pytest.mark.asyncio
+    async def test_stalled_child_fires_early(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        log = tmp_path / "rate-limit-fallback.log"
+        log.write_text("")  # no replay window
+        monkeypatch.setattr("opencode_bridge._FALLBACK_REPLAY_LOG", log)
+        monkeypatch.setattr(opencode_bridge, "_TASK_WEDGE_AFTER_S", 600.0)
+        monkeypatch.setattr(opencode_bridge, "_TASK_STALL_AFTER_S", 60.0)
+        monkeypatch.setattr(opencode_bridge, "_serve_start_epoch_ms", lambda: 0)
+        client = _PollClient()
+        client.session_id = "ses_parent"
+        client.poll_messages = [{"parts": self._parts(120, "ses_child")}]
+        client.status_map = {"ses_parent": {"type": "busy"}}  # child NOT live
+        assert await opencode_bridge._detect_wedged_tool(client, "ses_parent") is True
+
+    @pytest.mark.asyncio
+    async def test_live_child_does_not_fire_early(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        log = tmp_path / "rate-limit-fallback.log"
+        log.write_text("")
+        monkeypatch.setattr("opencode_bridge._FALLBACK_REPLAY_LOG", log)
+        monkeypatch.setattr(opencode_bridge, "_TASK_WEDGE_AFTER_S", 600.0)
+        monkeypatch.setattr(opencode_bridge, "_TASK_STALL_AFTER_S", 60.0)
+        monkeypatch.setattr(opencode_bridge, "_serve_start_epoch_ms", lambda: 0)
+        client = _PollClient()
+        client.session_id = "ses_parent"
+        client.poll_messages = [{"parts": self._parts(120, "ses_child")}]
+        client.status_map = {"ses_parent": {"type": "busy"},
+                             "ses_child": {"type": "busy"}}  # child live
+        assert await opencode_bridge._detect_wedged_tool(client, "ses_parent") is False
+
+    @pytest.mark.asyncio
+    async def test_fresh_task_does_not_fire_early(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        log = tmp_path / "rate-limit-fallback.log"
+        log.write_text("")
+        monkeypatch.setattr("opencode_bridge._FALLBACK_REPLAY_LOG", log)
+        monkeypatch.setattr(opencode_bridge, "_TASK_WEDGE_AFTER_S", 600.0)
+        monkeypatch.setattr(opencode_bridge, "_TASK_STALL_AFTER_S", 60.0)
+        monkeypatch.setattr(opencode_bridge, "_serve_start_epoch_ms", lambda: 0)
+        client = _PollClient()
+        client.session_id = "ses_parent"
+        client.poll_messages = [{"parts": self._parts(10, "ses_child")}]
+        client.status_map = {"ses_parent": {"type": "busy"}}
+        assert await opencode_bridge._detect_wedged_tool(client, "ses_parent") is False
+
+    @pytest.mark.asyncio
+    async def test_no_child_id_waits_for_threshold(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        log = tmp_path / "rate-limit-fallback.log"
+        log.write_text("")
+        monkeypatch.setattr("opencode_bridge._FALLBACK_REPLAY_LOG", log)
+        monkeypatch.setattr(opencode_bridge, "_TASK_WEDGE_AFTER_S", 60.0)
+        monkeypatch.setattr(opencode_bridge, "_TASK_STALL_AFTER_S", 60.0)
+        monkeypatch.setattr(opencode_bridge, "_serve_start_epoch_ms", lambda: 0)
+        client = _PollClient()
+        client.session_id = "ses_parent"
+        client.poll_messages = [{"parts": self._parts(120, None)}]
+        client.status_map = {"ses_parent": {"type": "busy"}}
+        assert await opencode_bridge._detect_wedged_tool(client, "ses_parent") is True

@@ -168,6 +168,15 @@ _TOOL_WEDGE_AFTER_S: float = 300.0
 #: phases at the first sub-agent lull, so task parts get their own,
 #: much longer window (2026-08-09).
 _TASK_WEDGE_AFTER_S: float = 600.0
+
+#: STALL-AWARE ABORT (2026-08-11): a task part running this long whose
+#: child session has dropped out of the live status map means the
+#: sub-agent finished but the delivery never propagated (upstream
+#: #11865/#23296; the serve's tool runner also wedges on glob calls,
+#: stranding the child).  Fire the wedge early so the orchestrator's
+#: artifact-check-first proceeds WITHOUT redoing the phase.
+_TASK_STALL_AFTER_S: float = 180.0
+
 # How often the stream checks the session for a wedged tool part.
 _WEDGE_CHECK_INTERVAL_S: float = 10.0
 
@@ -1645,6 +1654,26 @@ async def _yield_part_deltas(
         return
 
 
+async def _session_live(client: httpx.AsyncClient, session_id: str) -> bool:
+    """True when the session appears in the serve's live status map
+    (the map holds the active sessions; a finished session drops out).
+    Failure to fetch reads True — the stall-abort never fires on a
+    transport error.  Never raises.
+    """
+    try:
+        resp = await client.get(
+            f"{OPENCODE_SERVE_URL}/session/status", timeout=10.0,
+        )
+        if resp.status_code != 200:
+            return True
+        st_map = resp.json()
+        if not isinstance(st_map, dict):
+            return True
+        return session_id in st_map
+    except (httpx.HTTPError, OSError, ValueError):
+        return True
+
+
 async def _detect_wedged_tool(client: httpx.AsyncClient, session_id: str) -> bool:
     """Detect a tool part stuck in "running" with no output.
 
@@ -1687,6 +1716,27 @@ async def _detect_wedged_tool(client: httpx.AsyncClient, session_id: str) -> boo
                     _TASK_WEDGE_AFTER_S if p.get("tool") == "task"
                     else _TOOL_WEDGE_AFTER_S
                 )
+                # STALL-AWARE ABORT (2026-08-11): the sub-agent's
+                # completion never propagates to the parent's task part
+                # (upstream #11865/#23296; the serve's tool runner also
+                # wedges on glob calls, stranding the child).  A task
+                # part old enough whose child has dropped out of the
+                # live status map means the work finished but the
+                # delivery is stuck: fire early so the orchestrator's
+                # artifact-check-first proceeds WITHOUT redoing the
+                # phase.
+                if p.get("tool") == "task" and start_ms < now_ms - _TASK_STALL_AFTER_S * 1000:
+                    child_id = (p.get("state") or {}).get(
+                        "metadata", {},
+                    ).get("sessionId")
+                    if child_id and not await _session_live(client, child_id):
+                        logger.warning(
+                            "stalled task delivery: child %s not live while "
+                            "task part runs %.0fs — session %s",
+                            str(child_id)[:16], elapsed_s,
+                            str(session_id)[:16],
+                        )
+                        return True
                 if now_ms - start_ms > threshold_s * 1000:
                     # REPLAY CARVE-OUT (2026-08-10): a fallback-model
                     # replay can legitimately run 5-20 min with the task

@@ -266,7 +266,8 @@ CHANGE NAME: {change}
 
 SDD SESSION PREFLIGHT (user-supplied, do NOT ask):
 - Pace: Automatic
-- Artifacts: Both (Engram + OpenSpec)
+- Artifacts: OpenSpec (file-based; the serve sessions have no engram
+  MCP — do NOT attempt engram/mem_* tools; use openspec/ paths only)
 - PRs: Single PR
 - Review budget: 400 lines
 - Code writer: {writer_label}

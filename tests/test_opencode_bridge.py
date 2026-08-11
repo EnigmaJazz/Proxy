@@ -3791,7 +3791,8 @@ class TestCopyIfChanged:
         calls: list[str] = []
         orig_open = open
 
-        def fake_open(path, mode="r", encoding=None, **kw):
+        def fake_open(path: str, mode: str = "r",
+                      encoding: str | None = None, **kw: object) -> object:
             calls.append(f"{path}:{mode}")
             return orig_open(path, mode, encoding=encoding, **kw)
 
@@ -3897,3 +3898,105 @@ class TestStallAwareAbort:
         client.poll_messages = [{"parts": self._parts(120, None)}]
         client.status_map = {"ses_parent": {"type": "busy"}}
         assert await opencode_bridge._detect_wedged_tool(client, "ses_parent") is True
+
+
+class TestStallAwareChildWedge:
+    """The stall-abort also fires when the CHILD's own tool runner is
+    wedged (a running tool with no output past the threshold) — the
+    child will never finish, so the delivery is stuck with it."""
+
+    @staticmethod
+    def _parent_parts(task_running_for_s: int, child_id: str) -> list[dict]:
+        import time as _t
+        return [{
+            "type": "tool",
+            "tool": "task",
+            "state": {
+                "status": "running",
+                "metadata": {"sessionId": child_id},
+                "time": {"start": int((_t.time() - task_running_for_s) * 1000)},
+            },
+        }]
+
+    @pytest.mark.asyncio
+    async def test_wedged_child_fires_early(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import time as _t
+        log = tmp_path / "rate-limit-fallback.log"
+        log.write_text("")
+        monkeypatch.setattr("opencode_bridge._FALLBACK_REPLAY_LOG", log)
+        monkeypatch.setattr(opencode_bridge, "_TASK_WEDGE_AFTER_S", 600.0)
+        monkeypatch.setattr(opencode_bridge, "_TOOL_WEDGE_AFTER_S", 60.0)
+        monkeypatch.setattr(opencode_bridge, "_TASK_STALL_AFTER_S", 60.0)
+        monkeypatch.setattr(opencode_bridge, "_serve_start_epoch_ms", lambda: 0)
+
+        class Client(_PollClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.session_id = "ses_parent"
+                self.child_messages: list[dict] = []
+
+            async def get(self, url: str, **kw: object) -> _FakeResp:
+                if url.endswith("/session/ses_parent/message"):
+                    return _FakeResp(
+                        200, [{"parts":
+                               TestStallAwareChildWedge._parent_parts(
+                                   120, "ses_child")}],
+                    )
+                if url.endswith("/session/ses_child/message"):
+                    return _FakeResp(200, self.child_messages)
+                return await _PollClient.get(self, url, **kw)
+
+        client = Client()
+        # child is LIVE in the status (so the not-live branch is off)
+        client.status_map = {"ses_parent": {"type": "busy"},
+                             "ses_child": {"type": "busy"}}
+        # child's own tool is wedged: running read, no output, old
+        client.child_messages = [{"parts": [{
+            "type": "tool", "tool": "read",
+            "state": {"status": "running",
+                      "time": {"start": int((_t.time() - 120) * 1000)}},
+        }]}]
+        assert await opencode_bridge._detect_wedged_tool(client, "ses_parent") is True
+
+    @pytest.mark.asyncio
+    async def test_busy_child_with_healthy_tools_waits(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import time as _t
+        log = tmp_path / "rate-limit-fallback.log"
+        log.write_text("")
+        monkeypatch.setattr("opencode_bridge._FALLBACK_REPLAY_LOG", log)
+        monkeypatch.setattr(opencode_bridge, "_TASK_WEDGE_AFTER_S", 600.0)
+        monkeypatch.setattr(opencode_bridge, "_TOOL_WEDGE_AFTER_S", 60.0)
+        monkeypatch.setattr(opencode_bridge, "_TASK_STALL_AFTER_S", 60.0)
+        monkeypatch.setattr(opencode_bridge, "_serve_start_epoch_ms", lambda: 0)
+
+        class Client(_PollClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.session_id = "ses_parent"
+                self.child_messages: list[dict] = []
+
+            async def get(self, url: str, **kw: object) -> _FakeResp:
+                if url.endswith("/session/ses_parent/message"):
+                    return _FakeResp(
+                        200, [{"parts":
+                               TestStallAwareChildWedge._parent_parts(
+                                   120, "ses_child")}],
+                    )
+                if url.endswith("/session/ses_child/message"):
+                    return _FakeResp(200, self.child_messages)
+                return await _PollClient.get(self, url, **kw)
+
+        client = Client()
+        client.status_map = {"ses_parent": {"type": "busy"},
+                             "ses_child": {"type": "busy"}}
+        # child busy with a RECENT running tool (real work, not wedged)
+        client.child_messages = [{"parts": [{
+            "type": "tool", "tool": "read",
+            "state": {"status": "running",
+                      "time": {"start": int(_t.time() * 1000) - 5_000}},
+        }]}]
+        assert await opencode_bridge._detect_wedged_tool(client, "ses_parent") is False

@@ -1654,6 +1654,39 @@ async def _yield_part_deltas(
         return
 
 
+async def _child_wedged(client: httpx.AsyncClient, child_id: str) -> bool:
+    """True when the child session's own tool runner is wedged: a
+    running tool part (not ``question``) with no output, started past
+    the tool-wedge threshold.  The serve's runner degrades
+    progressively (bash/glob/read all strand), so a wedged child never
+    finishes and the parent's delivery is stuck with it.  Failure reads
+    False (no extra early abort).  Never raises.
+    """
+    try:
+        resp = await client.get(
+            f"{OPENCODE_SERVE_URL}/session/{child_id}/message",
+            timeout=10.0,
+        )
+        if resp.status_code != 200:
+            return False
+        now_ms = int(time.time() * 1000)
+        for m in resp.json():
+            for p in m.get("parts") or []:
+                if p.get("type") != "tool" or p.get("tool") == "question":
+                    continue
+                st = p.get("state") or {}
+                if st.get("status") != "running" or st.get("output"):
+                    continue
+                start = (st.get("time") or {}).get("start")
+                if start is None:
+                    continue
+                if now_ms - int(start) > _TOOL_WEDGE_AFTER_S * 1000:
+                    return True
+    except (httpx.HTTPError, OSError, ValueError):
+        return False
+    return False
+
+
 async def _session_live(client: httpx.AsyncClient, session_id: str) -> bool:
     """True when the session appears in the serve's live status map
     (the map holds the active sessions; a finished session drops out).
@@ -1729,10 +1762,13 @@ async def _detect_wedged_tool(client: httpx.AsyncClient, session_id: str) -> boo
                     child_id = (p.get("state") or {}).get(
                         "metadata", {},
                     ).get("sessionId")
-                    if child_id and not await _session_live(client, child_id):
+                    if child_id and (
+                        not await _session_live(client, child_id)
+                        or await _child_wedged(client, child_id)
+                    ):
                         logger.warning(
-                            "stalled task delivery: child %s not live while "
-                            "task part runs %.0fs — session %s",
+                            "stalled task delivery: child %s not live or "
+                            "wedged while task part runs %.0fs — session %s",
                             str(child_id)[:16], elapsed_s,
                             str(session_id)[:16],
                         )

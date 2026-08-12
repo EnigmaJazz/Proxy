@@ -2725,6 +2725,13 @@ async def _apply_coding_decision_gate(
 
     # ---- Fresh coding request: prompt once, then cache the choice ------
     if route.intent == "CODE" and not has_tool_calls:
+        # MICRO-INPUT GUARD (2026-08-12): a single-word ping ("test",
+        # "hello") is not a coding task — the frontdesk over-classifies
+        # short CODE intents, and the coding machinery (assessment +
+        # prompt + recommendation) must not fire for them.  The normal
+        # flow answers directly.
+        if _looks_like_gibberish(_last_user_text(messages)):
+            return None
         decision = decisions.get(session_id)
         if decision in ("opencode", "sdd"):
             is_sdd = decision == "sdd"

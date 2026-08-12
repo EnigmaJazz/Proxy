@@ -1156,3 +1156,50 @@ class TestLowDifficultyNoPrompt:
         # (the professional answering stream).
         assert "Coding decision" not in text
         assert "Reply" not in text
+
+
+class TestMicroInputGuard:
+    """A single-word ping ("test") must never trigger the coding gate —
+    the frontdesk over-classifies short CODE intents and the assessment +
+    prompt + recommendation machinery must not fire for them."""
+
+    async def _send(self, gate_client, content: str) -> str:
+        capture = _StreamCapture()
+        with patch("routes.stream_llm", new=capture), \
+             patch(
+                 "routes.classify_with_frontdesk",
+                 new=AsyncMock(return_value=_classification("CODE")),
+             ), \
+             patch(
+                 "routes.evaluate_coding_task",
+                 new=AsyncMock(return_value={
+                     "difficulty": "medium",
+                     "recommendation": "opencode",
+                     "reason": "coding task",
+                 }),
+             ):
+            response = await gate_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "auto",
+                    "messages": [{
+                        "role": "user",
+                        "content": content,
+                    }],
+                    "stream": True,
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            return (await response.aread()).decode()
+
+    @pytest.mark.asyncio
+    async def test_single_word_ping_never_prompts(self, gate_client) -> None:
+        text = await self._send(gate_client, "test")
+        # no coding question, no recommendation — the normal flow answers
+        assert "Coding decision" not in text
+        assert "recommends" not in text
+
+    @pytest.mark.asyncio
+    async def test_meaningful_coding_task_still_prompts(self, gate_client) -> None:
+        text = await self._send(gate_client, "refactor the routing module")
+        assert "Coding decision" in text

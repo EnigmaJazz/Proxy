@@ -29,7 +29,10 @@ import asyncio
 import time
 from typing import Any, Optional
 
+from constants import get_logger
 from llm import call_model
+
+logger = get_logger("prompt_cache")
 
 #: Registered system prompts, by name (the value is the system message
 #: text).  The registry is process-local; observed prompts are added at
@@ -598,13 +601,18 @@ async def prime(port: int = 0) -> dict[str, bool]:
             results[name] = True  # already primed recently — skip
             continue
         try:
-            await asyncio.wait_for(
+            _t0 = time.monotonic()
+            _content = await asyncio.wait_for(
                 call_model(
                     port or 13109,
                     f"{prompt}\n\nSay OK.",
                     max_tokens=4,
                 ),
                 timeout=30.0,
+            )
+            logger.debug(
+                "Prime %s: %.1fs content_len=%d", name,
+                time.monotonic() - _t0, len(_content),
             )
             _LAST_PRIMED[name] = now
             results[name] = True

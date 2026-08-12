@@ -753,36 +753,7 @@ async def thermal_monitor_task(
                     state.gpu_vram_used_gb,
                 )
                 await systemd.ensure_professional_resident(state.gpu_vram_used_gb)
-                # Prompt priming (2026-08-09): when professional is resident
-                # and the GPU is idle, run the registered frontend system
-                # prompts through the model once so the KV-cache holds the
-                # processed prefixes — the next request with the same system
-                # message starts streaming almost immediately (no prefill).
-                # The nanobot prompt is ACTIVELY SEEKED from its workspace
-                # (SOUL.md + AGENTS.md) on every window — a dream pass that
-                # updates the memory files changes the mtime, which forces a
-                # re-prime of the refreshed prompt.
-                if state.gpu_vram_used_gb < GPU_BUSY_VRAM_GB:
-                    try:
-                        from prompt_cache import (
-                            prime, registered_prompts, seek_nanobot_prompt,
-                        )
-                        assembled = seek_nanobot_prompt()
-                        port = await systemd.get_port("professional")
-                        result = await prime(port=port)
-                        logger.debug(
-                            "Prompt priming: seek_len=%d prompts=%s "
-                            "result=%s port=%d",
-                            len(assembled),
-                            sorted(registered_prompts()),
-                            result, port,
-                        )
-                    except Exception as exc:  # noqa: BLE001 - monitor loop
-                        logger.warning(
-                            "Prompt priming failed: %r", exc,
-                        )
-
-            # ---- Thermal threshold enforcement -------------------------------
+            # ---- Thermal threshold enforcement ----------------            # ---- Thermal threshold enforcement -------------------------------
             # Only real temperature sensors belong in the zone map. RAM usage
             # percent is NOT a temperature and must never be compared against
             # °C thresholds (it used to power the host off at 80% RAM via a

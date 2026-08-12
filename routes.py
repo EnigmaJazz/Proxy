@@ -817,46 +817,6 @@ async def chat_completions(request: Request) -> Response:
     is_dream = False
     is_apply_local = False  # bound for every caller path (2026-08-11)
 
-    # ---- Prompt-priming observation (best-effort): register the caller's
-    # system message so the residency loop can prime it into the
-    # professional's KV-cache (faster time-to-first-token for the
-    # frontend's large fixed system prompt).  Never blocks, never raises.
-    try:
-        from prompt_cache import register_observed_system_prompt
-        _sys_msg = next(
-            (m.get("content") for m in messages if m.get("role") == "system"),
-            None,
-        )
-        # PRIMING-CALLER KEY (2026-08-11): the nanobot's apiKey is the
-        # shared "AGENTIC" token, so the generic caller_type would register
-        # every agentic caller under ONE observed key (the last request
-        # wins and priming warms the wrong prompt).  The nanobot's
-        # user-agent gets its own stable key so the observed registration
-        # captures the EXACT wire system prompt (channel-specific identity
-        # included) and priming warms what the next request actually sends.
-        _priming_caller = _priming_caller_for(headers, caller_type)
-        register_observed_system_prompt(_priming_caller, _sys_msg)
-        # WIRE-CAPTURE DEBUG (2026-08-11): log the observed system's
-        # shape so a priming mismatch can be diffed against the seek's
-        # assembly without guessing.
-        if _priming_caller in ("nanobot", "AGENTIC"):
-            logger.debug(
-                "Priming observation: caller=%s sys_len=%s",
-                _priming_caller,
-                len(_sys_msg) if isinstance(_sys_msg, str) else None,
-            )
-            if isinstance(_sys_msg, str) and _sys_msg:
-                # WIRE DUMP (diagnostic): the full system message to a
-                # local file so the primed variants can be diffed against
-                # the exact wire content (2026-08-12).  The write runs on
-                # a worker thread — Rule 3, the request path is async.
-                try:
-                    await asyncio.to_thread(_dump_wire_system, _sys_msg)
-                except (OSError, ValueError):
-                    pass
-    except (OSError, ValueError, StopIteration):
-        pass
-
     # ---- Prepare messages (Glass Pipe Rule: NO text alteration) ------------
     processed_messages: list[dict[str, Any]] = list(messages)  # Shallow copy
 

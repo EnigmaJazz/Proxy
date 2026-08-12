@@ -140,3 +140,12 @@ project-specific.
 - `openspec/changes/glass-pipe-followups/` — R17/R18 specs and design
 - `docs/brainstorms/2026-07-05-proxy-glass-pipe-hardening-requirements.md` — R1–R10 violations
 - `docs/brainstorms/2026-07-19-client-named-model-fix.md` — R19 fix background
+
+## Task routing (workflow recipe)
+
+This repo participates in the machine-wide task-routing recipe. The canonical recipe is `/home/james/ai-workspace/workflow_optimisation/WORKFLOW.md` (loaded via the global opencode AGENTS.md); its task classes are tiny fix, small feature, substantial feature, bug investigation, documentation, and global tooling change.
+
+- Classify incoming tasks by decision content, not file count; ambiguous → ask, default substantial.
+- Every code change passes the receipt-driven review gate before delivery (RDD is enabled globally).
+- After each routed task, append one row to `ROUTER-LOG.md` in this repo (date, task, class, reclassification, gate outcome, probe flag, evidence) AND add the `ROUTED: <class>@<gate-outcome>` trailer to the task's commit.
+- The `.gga` hook and this file remain the code-review contract for this proxy; the routing recipe sits alongside it, not in place of it.

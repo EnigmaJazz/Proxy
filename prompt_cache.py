@@ -88,16 +88,19 @@ def registered_prompts() -> dict[str, str]:
 
 
 #: The nanobot bootstrap files, in the exact order its context builder
-#: loads them (``ContextBuilder.BOOTSTRAP_FILES``): the workspace sections
-#: appear in the system message as ``## <filename>`` blocks.
-_NANOBOT_BOOTSTRAP_FILES = ("AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md")
+#: loads them (the lib64 install's ``ContextBuilder.BOOTSTRAP_FILES``):
+#: the workspace sections appear as ``## <filename>`` blocks.  The old
+#: lib/python3.14 install also listed TOOLS.md — the lib64 build does
+#: NOT; the tool guidance is the bundled tool_contract template instead
+#: (2026-08-12).
+_NANOBOT_BOOTSTRAP_FILES = ("AGENTS.md", "SOUL.md", "USER.md")
 
 #: The rendered POSIX platform-policy branch (the system is Linux; the
 #: nanobot's template picks this branch for every non-Windows system).
 _NANOBOT_PLATFORM_POLICY = (
     "## Platform Policy (POSIX)\n"
     "- You are running on a POSIX system. Prefer UTF-8 and standard shell tools.\n"
-    "- Use file tools when they are simpler or more reliable than shell commands."
+    "- Use file tools when they are simpler or more reliable than shell commands.\n"
 )
 
 _NANOBOT_UNTRUSTED_SNIPPET = (
@@ -108,6 +111,15 @@ _NANOBOT_UNTRUSTED_SNIPPET = (
     "descriptions."
 )
 
+
+#: The nanobot runtime's PATH (observed from its process environ): the
+#: system default WITHOUT the user bins (linuxbrew/cargo/...).  The
+#: wire's skill-availability checks run with THIS path — the proxy's own
+#: PATH would mark the linuxbrew tools available and diverge from the
+#: wire (2026-08-12).
+_NANOBOT_RUNTIME_PATH = (
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/snap/bin"
+)
 
 _NANOBOT_CHANNELS = (
     "", "telegram", "qq", "discord", "whatsapp", "sms", "email", "cli",
@@ -245,18 +257,24 @@ def seek_nanobot_prompt(workspace_dir: Optional[str] = None) -> str:
         try:
             path = os.path.join(base, fname)
             with open(path, encoding="utf-8") as fh:
-                text = fh.read().strip()
-            if text:
+                # RAW content (no strip): the nanobot's builder appends
+                # the file verbatim, so the trailing newline is part of
+                # the wire's separator sequence (2026-08-12).
+                text = fh.read()
+            if text.strip():
                 bootstrap.append(f"## {fname}\n\n{text}")
         except OSError:
             continue
     if bootstrap:
         parts.append("\n\n".join(bootstrap))
+    contract = _nanobot_tool_contract()
+    if contract:
+        parts.append(contract)
     try:
         with open(
             os.path.join(base, "memory", "MEMORY.md"), encoding="utf-8",
         ) as fh:
-            memory = fh.read().strip()
+            memory = fh.read()  # raw — the wire keeps the file verbatim
         if memory:
             parts.append(f"# Memory\n\n## Long-term Memory\n{memory}")
     except OSError:
@@ -270,9 +288,8 @@ def seek_nanobot_prompt(workspace_dir: Optional[str] = None) -> str:
     if summary:
         parts.append(
             "# Skills\n\nThe following skills extend your capabilities. "
-            "To use a skill, read its SKILL.md file using the read_file "
-            "tool.\nUnavailable skills need dependencies installed first — "
-            "you can try installing them with apt/brew.\n\n" + summary,
+            "Each group lists one absolute root and relative SKILL.md "
+            "paths; join them when using `read_file`.\n\n" + summary,
         )
     # Recent history: the append-only JSONL after the last dream cursor —
     # deterministic at injection time and changed only by interactions the
@@ -301,10 +318,10 @@ def seek_nanobot_prompt(workspace_dir: Optional[str] = None) -> str:
     return variants[0]
 
 
-def _nanobot_builtin_skills_dir() -> str:
-    """The nanobot package's builtin ``skills/`` dir, resolved via the
-    user-level install glob (local_config.UV_NANOBOT_PATTERN); "" when
-    it cannot be located (the builtin entries are then skipped).
+def _nanobot_package_dir() -> str:
+    """The nanobot package dir (site-packages/nanobot), preferring the
+    lib64 install the runtime actually uses; "" when it cannot be
+    located.
     """
     import glob
     import os
@@ -312,13 +329,80 @@ def _nanobot_builtin_skills_dir() -> str:
         from local_config import UV_NANOBOT_PATTERN
     except (ImportError, AttributeError):
         return ""
-    for base in glob.glob(UV_NANOBOT_PATTERN):
-        candidate = os.path.join(
-            base, "site-packages", "nanobot", "skills",
-        )
+    bases = sorted(glob.glob(UV_NANOBOT_PATTERN))
+    # The lib64 install (the runtime's!) is a SIBLING of lib/ — the
+    # UV_NANOBOT_PATTERN ("lib/python*/") never matches it (2026-08-12).
+    # The tool root: ".../lib/python*/" (the trailing slash makes the
+    # last component empty, so two dirnames only reach ".../lib") →
+    # strip the slash first, then two dirnames land on ".../nanobot-ai".
+    tool_root = os.path.dirname(os.path.dirname(
+        UV_NANOBOT_PATTERN.rstrip("/"),
+    ))
+    bases += sorted(glob.glob(os.path.join(tool_root, "lib64", "python*/")))
+    # prefer lib64 (the runtime's install) over lib, and among those the
+    # newest python; the wire's build marker is the tool_contract template
+    # (the lib64/python3.14 install has it; the lib64/python3.13 does
+    # not — 2026-08-12).
+    def _version(b: str) -> int:
+        m = __import__("re").search(r"python3\.(\d+)", b)
+        return int(m.group(1)) if m else 0
+
+    bases.sort(key=lambda b: (0 if "lib64" in b else 1, -_version(b)))
+    for base in bases:
+        candidate = os.path.join(base, "site-packages", "nanobot")
+        if not os.path.isdir(candidate):
+            continue
+        if os.path.isfile(
+            os.path.join(
+                candidate, "templates", "agent", "tool_contract.md",
+            ),
+        ):
+            return candidate
+    # fall back to any lib64 install, then the first candidate
+    for base in bases:
+        candidate = os.path.join(base, "site-packages", "nanobot")
         if os.path.isdir(candidate):
             return candidate
     return ""
+
+
+def _nanobot_builtin_skills_dir() -> str:
+    """The nanobot package's builtin ``skills/`` dir.  The WIRE's
+    builtin root is the plain ``lib/python3.14`` install's skills (the
+    runtime's package dirs are a mixed overlay — the templates come from
+    lib64/python3.14 while the skills' ``__file__``-relative root is the
+    lib install's; 2026-08-12).  Prefer the highest non-lib64 python's
+    skills.
+    """
+    import glob
+    import os
+    try:
+        from local_config import UV_NANOBOT_PATTERN
+    except (ImportError, AttributeError):
+        return ""
+    bases = [b for b in glob.glob(UV_NANOBOT_PATTERN) if "lib64" not in b]
+    bases.sort(reverse=True)  # highest python first (3.14 > 3.13)
+    for base in bases:
+        candidate = os.path.join(base, "site-packages", "nanobot", "skills")
+        if os.path.isdir(candidate):
+            return candidate
+    return ""
+
+
+def _nanobot_tool_contract() -> str:
+    """The lib64 build's bundled ``tool_contract.md`` template — the
+    wire's tool-guidance section (static content, no variables).
+    """
+    import os
+    pkg = _nanobot_package_dir()
+    if not pkg:
+        return ""
+    path = os.path.join(pkg, "templates", "agent", "tool_contract.md")
+    try:
+        text = open(path, encoding="utf-8").read()
+    except OSError:
+        return ""
+    return text.strip()
 
 
 def _nanobot_skill_entries(workspace_path: str) -> list[dict[str, str]]:
@@ -333,7 +417,10 @@ def _nanobot_skill_entries(workspace_path: str) -> list[dict[str, str]]:
     )
     for base, source in bases:
         try:
-            names = sorted(os.listdir(base))
+            # RAW readdir order (not sorted): the nanobot's loader uses
+            # ``iterdir``, whose filesystem order the wire preserves —
+            # sorting alphabetically reorders the summary (2026-08-12).
+            names = os.listdir(base)
         except OSError:
             continue
         for name in names:
@@ -347,7 +434,12 @@ def _nanobot_skill_entries(workspace_path: str) -> list[dict[str, str]]:
 
 def _nanobot_skill_meta(skill_file: str) -> dict:
     """The skill's frontmatter (description / always / requires), parsed
-    as YAML — the same shape the nanobot's loader reads.
+    as YAML — the same shape the nanobot's loader reads.  The lib64
+    frontmatter nests the nanobot-specific keys under
+    ``metadata.nanobot`` (``requires`` / ``always``), which the wire's
+    loader resolves — the returned dict carries ``requires`` and
+    ``always`` merged from BOTH the top level and the nested nanobot
+    block (2026-08-12).
     """
     try:
         text = open(skill_file, encoding="utf-8").read()
@@ -359,9 +451,18 @@ def _nanobot_skill_meta(skill_file: str) -> dict:
         body = text.split("---", 2)[1]
         import yaml
         parsed = yaml.safe_load(body)
-        return parsed if isinstance(parsed, dict) else {}
     except (ValueError, ImportError, OSError, yaml.YAMLError):
         return {}
+    if not isinstance(parsed, dict):
+        return {}
+    nested = parsed.get("metadata")
+    if isinstance(nested, dict):
+        nanobot_meta = nested.get("nanobot")
+        if isinstance(nanobot_meta, dict):
+            for key in ("requires", "always"):
+                if key in nanobot_meta and key not in parsed:
+                    parsed[key] = nanobot_meta[key]
+    return parsed
 
 
 def _nanobot_active_skills(workspace_path: str) -> str:
@@ -386,37 +487,55 @@ def _nanobot_active_skills(workspace_path: str) -> str:
 
 
 def _nanobot_skills_summary(workspace_path: str) -> str:
-    """The progressive-loading skills summary: one line per skill
-    (name — description, path), available vs unavailable marked per
-    the frontmatter's requirements.
+    """The lib64 build's progressive-loading skills summary: grouped
+    sections (Workspace / Built-in) with the group root in the header
+    and RELATIVE SKILL.md paths per line (2026-08-12 — the old flat
+    format never matched the wire).
     """
     import os
     import shutil
-    lines: list[str] = []
-    for entry in _nanobot_skill_entries(workspace_path):
-        meta = _nanobot_skill_meta(entry["path"])
-        requires = meta.get("requires") or {}
-        missing_bins = [
-            c for c in (requires.get("bins") or []) if not shutil.which(c)
-        ]
-        missing_env = [
-            v for v in (requires.get("env") or []) if not os.environ.get(v)
-        ]
-        desc = meta.get("description") or entry["name"]
-        if not missing_bins and not missing_env:
+    entries = _nanobot_skill_entries(workspace_path)
+    if not entries:
+        return ""
+    sections: list[str] = []
+    groups = (
+        ("Workspace skills", "workspace",
+         os.path.join(workspace_path, "skills")),
+        ("Built-in skills", "builtin", _nanobot_builtin_skills_dir()),
+    )
+    for label, source, root in groups:
+        group = [e for e in entries if e["source"] == source]
+        if not group:
+            continue
+        lines = [f"### {label} (`{root}`)"]
+        for entry in group:
+            meta = _nanobot_skill_meta(entry["path"])
+            requires = meta.get("requires") or {}
+            missing_bins = [
+                c for c in (requires.get("bins") or [])
+                if not shutil.which(c, path=_NANOBOT_RUNTIME_PATH)
+            ]
+            missing_env = [
+                v for v in (requires.get("env") or [])
+                if not os.environ.get(v)
+            ]
+            desc = meta.get("description") or entry["name"]
+            suffix = ""
+            if missing_bins or missing_env:
+                missing = ", ".join(
+                    [f"CLI: {c}" for c in missing_bins]
+                    + [f"ENV: {v}" for v in missing_env],
+                )
+                suffix = (
+                    f" (unavailable: {missing})"
+                    if missing else " (unavailable)"
+                )
+            rel = os.path.relpath(entry["path"], root).replace(os.sep, "/")
             lines.append(
-                f"- **{entry['name']}** — {desc}  `{entry['path']}`",
+                f"- **{entry['name']}** — {desc}{suffix}  `{rel}`",
             )
-        else:
-            missing = ", ".join(
-                [f"CLI: {c}" for c in missing_bins]
-                + [f"ENV: {v}" for v in missing_env],
-            )
-            suffix = f" (unavailable: {missing})" if missing else " (unavailable)"
-            lines.append(
-                f"- **{entry['name']}** — {desc}{suffix}  `{entry['path']}`",
-            )
-    return "\n".join(lines)
+        sections.append("\n".join(lines))
+    return "\n\n".join(sections)
 
 
 def _nanobot_recent_history(workspace_path: str) -> str:
@@ -489,6 +608,9 @@ async def prime(port: int = 0) -> dict[str, bool]:
             )
             _LAST_PRIMED[name] = now
             results[name] = True
-        except (OSError, ValueError):
+        except (OSError, ValueError, TimeoutError):
+            # TimeoutError is NOT an OSError subclass on Python 3.14 —
+            # a stalled prime must record False, never escape (the
+            # monitor's loop would die on the uncaught raise; 2026-08-12).
             results[name] = False
     return results

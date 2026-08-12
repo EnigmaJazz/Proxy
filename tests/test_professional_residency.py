@@ -309,12 +309,16 @@ class TestDeterministicNanobotSeek:
         # identity (rendered) first
         assert assembled.startswith("## Runtime\n")
         assert "## Platform Policy (POSIX)" in assembled
-        # bootstrap blocks in the nanobot's exact order
+        # bootstrap blocks in the nanobot's exact order (lib64 build:
+        # AGENTS + SOUL + USER — NO TOOLS.md; the tool guidance is the
+        # bundled tool_contract template instead)
         assert assembled.index("## AGENTS.md") < assembled.index("## SOUL.md")
         assert assembled.index("## SOUL.md") < assembled.index("## USER.md")
-        assert assembled.index("## USER.md") < assembled.index("## TOOLS.md")
-        # memory section after the bootstrap
-        assert "## TOOLS.md" in assembled
+        assert "## TOOLS.md" not in assembled
+        # the tool contract follows the bootstrap
+        assert "# Tool Usage Notes" in assembled
+        assert assembled.index("## USER.md") < assembled.index("# Tool Usage Notes")
+        # memory section after the contract
         assert "## Long-term Memory\nMEM body" in assembled
         # registered + deterministic
         assert pc.registered_prompts().get("nanobot") == assembled

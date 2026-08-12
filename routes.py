@@ -637,6 +637,12 @@ def _inject_current_datetime(messages: list[dict[str, Any]]) -> list[dict[str, A
     return [{"role": "system", "content": stamp}] + messages
 
 
+def _dump_wire_system(system_msg: str) -> None:
+    """Write the wire system message to a local file (worker thread)."""
+    with open("/tmp/wire-system.txt", "w", encoding="utf-8") as fh:
+        fh.write(system_msg)
+
+
 async def _govern_messages(
     request: Request,
     messages: list[dict[str, Any]],
@@ -835,11 +841,19 @@ async def chat_completions(request: Request) -> Response:
         # assembly without guessing.
         if _priming_caller in ("nanobot", "AGENTIC"):
             logger.debug(
-                "Priming observation: caller=%s sys_len=%s sys_head=%r",
+                "Priming observation: caller=%s sys_len=%s",
                 _priming_caller,
                 len(_sys_msg) if isinstance(_sys_msg, str) else None,
-                (_sys_msg[:600] if isinstance(_sys_msg, str) else _sys_msg),
             )
+            if isinstance(_sys_msg, str) and _sys_msg:
+                # WIRE DUMP (diagnostic): the full system message to a
+                # local file so the primed variants can be diffed against
+                # the exact wire content (2026-08-12).  The write runs on
+                # a worker thread — Rule 3, the request path is async.
+                try:
+                    await asyncio.to_thread(_dump_wire_system, _sys_msg)
+                except (OSError, ValueError):
+                    pass
     except (OSError, ValueError, StopIteration):
         pass
 

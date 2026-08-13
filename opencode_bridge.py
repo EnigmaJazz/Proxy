@@ -62,7 +62,14 @@ _BRIDGE_SYSTEM_PROMPT = (
     "if the task is genuinely ambiguous and the decision materially changes "
     "the result, ask a clarifying question and stop — the user's answer will "
     "resume this same session and you may ask again if needed.  Otherwise "
-    "make reasonable assumptions, state them briefly, and complete the task."
+    "make reasonable assumptions, state them briefly, and complete the task.\n\n"
+    "TOOL RULES (MANDATORY): the headless tool runner can wedge indefinitely "
+    "on glob/grep/read calls (their completion never arrives, stranding the "
+    "task).  Prefer `bash` for discovery and reading — `ls`, `find`, `sed`, "
+    "`head`, `tail`, `cat` with explicit paths — and avoid glob/grep/read "
+    "where possible.  When a tool call fails with a transient error (e.g. "
+    "\"Tool execution aborted\", connection resets), retry it ONCE "
+    "immediately before giving up.\n"
 )
 
 # SDD-AUTONOMOUS system prompt: used when the client picks model
@@ -1691,7 +1698,18 @@ async def _yield_part_deltas(
                 if cmd:
                     yield ("status", f"🔧 {name}: {cmd[:120]}\n")
                 else:
-                    yield ("status", f"🔧 {name}…\n")
+                    # Non-bash tools (glob/grep/read) carry no command:
+                    # show the pattern/path so the user still sees what
+                    # the tool is doing.
+                    pattern = str(inp.get("pattern") or "") if isinstance(inp, dict) else ""
+                    if pattern:
+                        yield ("status", f"🔧 {name}: {pattern[:80]}\n")
+                    else:
+                        path = str(inp.get("filePath") or "") if isinstance(inp, dict) else ""
+                        if path:
+                            yield ("status", f"🔧 {name}: {path[:100]}\n")
+                        else:
+                            yield ("status", f"🔧 {name}…\n")
             elif state == "completed":
                 yield ("status", f"✅ {name} done\n")
             elif state == "error":
@@ -1744,6 +1762,12 @@ async def _current_running_tool(
                 cmd = str((inp or {}).get("command") or "") if isinstance(inp, dict) else ""
                 if cmd:
                     return f"🔧 {p.get('tool')}: {cmd[:120]}\n"
+                pattern = str((inp or {}).get("pattern") or "") if isinstance(inp, dict) else ""
+                if pattern:
+                    return f"🔧 {p.get('tool')}: {pattern[:80]}\n"
+                path = str((inp or {}).get("filePath") or "") if isinstance(inp, dict) else ""
+                if path:
+                    return f"🔧 {p.get('tool')}: {path[:100]}\n"
                 return f"🔧 {p.get('tool')}…\n"
     except (httpx.HTTPError, OSError, ValueError):
         return None

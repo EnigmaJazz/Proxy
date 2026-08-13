@@ -3424,9 +3424,21 @@ class _RunningToolPermissionClient(_FakeClient):
         self.permission_records: list[dict[str, Any]] = []
         self.status_type = "busy"
         self.write_tool: bool = False
+        self.grep_mode: bool = False
 
     async def get(self, url: str, **kwargs: Any) -> _FakeResp:
         if url.endswith(f"/session/{self.session_id}/message"):
+            if self.grep_mode:
+                return _FakeResp(200, [_assistant_msg([
+                    {
+                        "id": "prt_grep", "type": "tool", "tool": "grep",
+                        "state": {
+                            "status": "running",
+                            "input": {"pattern": "check.*update"},
+                            "time": {"start": 1786124255392},
+                        },
+                    },
+                ])])
             if self.write_tool:
                 return _FakeResp(200, [_assistant_msg([
                     {
@@ -3464,6 +3476,15 @@ class TestRunningToolAnnounce:
     announce the currently running tool from the persisted message list —
     the user sees WHICH command is executing instead of bare keepalives.
     """
+
+    @pytest.mark.asyncio
+    async def test_bridge_prompt_carries_tool_rules(self) -> None:
+        """The bridge prompt forbids relying on glob/grep/read (the serve's
+        tool runner wedges on them) and mandates the bash-first + retry-once
+        rules that keep the plain opencode path alive."""
+        prompt = opencode_bridge._BRIDGE_SYSTEM_PROMPT
+        assert "glob" in prompt and "grep" in prompt
+        assert "`bash`" in prompt and "retry it ONCE" in prompt
 
     @pytest.mark.asyncio
     async def test_keepalive_announces_running_tool_from_message_list(
@@ -3510,6 +3531,49 @@ class TestRunningToolAnnounce:
         tools = [t for k, t in deltas if k == "status" and "🔧" in t]
         assert any("bash" in t and "cat /etc/systemd/system/x.service" in t for t in tools), tools
         # Announced exactly once (deduped by part id).
+        assert len(tools) == 1, tools
+
+    @pytest.mark.asyncio
+    async def test_keepalive_announces_grep_pattern_from_message_list(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Non-bash tools carry no ``command`` input: the announce must
+        fall back to the pattern/filePath so the user still sees WHAT the
+        tool is doing (e.g. the grep pattern)."""
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        async def _noop(*args: Any, **kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        monkeypatch.setattr(opencode_bridge, "_recycle_serve_if_low_memory", _noop)
+        monkeypatch.setattr(opencode_bridge, "_detect_wedged_tool", lambda *a: False)
+        monkeypatch.setattr(opencode_bridge, "_EVENT_QUIET_TIMEOUT", 0.05)
+        monkeypatch.setattr(opencode_bridge, "_EVENT_FINAL_TIMEOUT", 0.05)
+        monkeypatch.setattr(opencode_bridge, "_WEDGE_CHECK_INTERVAL_S", 0.05)
+
+        client = _RunningToolPermissionClient()
+        client.grep_mode = True
+        client.stream_lines = [
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_u", "role": "user"}),
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_a", "role": "assistant"}),
+        ]
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        smap: dict[str, str] = {}
+        deltas = [
+            d async for d in opencode_chat_stream(
+                "task", session_map=smap, session_key="conv-1", timeout=1.0,
+            )
+        ]
+
+        tools = [t for k, t in deltas if k == "status" and "🔧" in t]
+        assert any("grep" in t and "check.*update" in t for t in tools), tools
         assert len(tools) == 1, tools
 
 

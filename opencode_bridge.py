@@ -180,6 +180,12 @@ _TASK_STALL_AFTER_S: float = 180.0
 # How often the stream checks the session for a wedged tool part.
 _WEDGE_CHECK_INTERVAL_S: float = 10.0
 
+# How often the stream re-announces the currently running tool command
+# from the message list (bus path).  The announce must be faster than the
+# wedge check: tools 10-60s long would otherwise run to completion
+# before the first wedge cycle and the user would never see the command.
+_ANNOUNCE_CHECK_INTERVAL_S: float = 3.0
+
 #: Fallback plugin's project-local replay log (the rate-limit-fallback
 #: plugin mirrors its log into the repo's git dir).
 _FALLBACK_REPLAY_LOG = Path(__file__).parent / ".git" / "gentle-ai" / "rate-limit-fallback.log"
@@ -1075,6 +1081,9 @@ async def opencode_chat_stream(
             asst_mid: Optional[str] = None
             text_lens: dict[str, int] = {}
             tool_state: dict[str, str] = {}
+            # Tool parts already surfaced as a 🔧 status by the polling
+            # announce (bus path) — never re-announce them.
+            announced_tool_pids: set[str] = set()
             pending_done = False
             session_busy = True  # assume working until a status event says idle
             seen_question_pids: set[str] = set()
@@ -1119,6 +1128,9 @@ async def opencode_chat_stream(
                 ev_iter = ev.aiter_lines()
                 started = time.monotonic()
                 bus_last_wedge_check = time.monotonic()
+                # First quiet timeout announces immediately (due from the
+                # start), then every _ANNOUNCE_CHECK_INTERVAL_S.
+                bus_last_announce_check = time.monotonic() - _ANNOUNCE_CHECK_INTERVAL_S
                 while True:
                     # Bounded total duration: a hung agent tool (e.g. a
                     # package-manager command stuck on a lock) leaves the
@@ -1357,6 +1369,18 @@ async def opencode_chat_stream(
                                 # destroys them all).
                                 yield ("status", "[OpenCode Bridge Error: agent tool runner wedged — session aborted. Please retry.]")
                                 return
+                        # Command-level visibility even when the SSE bus
+                        # drops running-state updates: announce the
+                        # currently running tool from the message list, on
+                        # its own faster cadence (the 10s wedge timer would
+                        # miss tools that finish within a cycle).
+                        if time.monotonic() - bus_last_announce_check >= _ANNOUNCE_CHECK_INTERVAL_S:
+                            bus_last_announce_check = time.monotonic()
+                            announce = await _current_running_tool(
+                                client, session_id, tool_state, announced_tool_pids,
+                            )
+                            if announce:
+                                yield ("status", announce)
                         # Keep the client connection alive during long tool
                         # phases (and show the agent is still working).
                         yield ("status", "⏳ still working…")
@@ -1673,6 +1697,57 @@ async def _yield_part_deltas(
             elif state == "error":
                 yield ("status", f"⚠️ {name} failed\n")
         return
+
+
+async def _current_running_tool(
+    client: httpx.AsyncClient,
+    session_id: str,
+    tool_state: dict[str, str],
+    announced: set[str],
+) -> Optional[str]:
+    """Best-effort status for the NEWEST running tool part not yet
+    announced, read from the persisted message list.
+
+    The serve's SSE bus drops tool running-state updates (upstream defect
+    family anomalyco/opencode #35066 — completions arrive, 'running'
+    events often do not), so the event-bus path never emits the 🔧 command
+    status for a long-running tool and the user sees only keepalives.
+    Polling the message list is immune to the drops.  Parts already
+    processed by the delta path (``tool_state``) are skipped — they were
+    announced on their own state transition.  Never raises; returns None
+    when nothing new is running.
+    """
+    try:
+        resp = await client.get(
+            f"{OPENCODE_SERVE_URL}/session/{session_id}/message", timeout=10.0,
+        )
+        if resp.status_code != 200:
+            return None
+        for m in reversed(resp.json()):
+            if (m.get("info") or {}).get("role") != "assistant":
+                continue
+            for p in reversed(m.get("parts") or []):
+                if p.get("type") != "tool" or p.get("tool") == "question":
+                    continue
+                pid = str(p.get("id") or "")
+                st = p.get("state") or {}
+                if st.get("status") != "running":
+                    continue
+                if pid in tool_state or pid in announced:
+                    return None
+                announced.add(pid)
+                # Also record the state in tool_state so the delta path
+                # (a later-arriving SSE running event) skips the same part
+                # instead of announcing it a second time.
+                tool_state[pid] = "running"
+                inp = st.get("input") if isinstance(st, dict) else None
+                cmd = str((inp or {}).get("command") or "") if isinstance(inp, dict) else ""
+                if cmd:
+                    return f"🔧 {p.get('tool')}: {cmd[:120]}\n"
+                return f"🔧 {p.get('tool')}…\n"
+    except (httpx.HTTPError, OSError, ValueError):
+        return None
+    return None
 
 
 async def _child_wedged(client: httpx.AsyncClient, child_id: str) -> bool:

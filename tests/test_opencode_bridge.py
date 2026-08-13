@@ -3458,6 +3458,61 @@ class _RunningToolPermissionClient(_FakeClient):
         return await super().get(url, **kwargs)
 
 
+class TestRunningToolAnnounce:
+    """Command-level visibility regression (2026-08-13): the serve's SSE
+    bus drops tool running-state updates, so the event-bus path must
+    announce the currently running tool from the persisted message list —
+    the user sees WHICH command is executing instead of bare keepalives.
+    """
+
+    @pytest.mark.asyncio
+    async def test_keepalive_announces_running_tool_from_message_list(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """With the event bus OPEN but silent (no part events — the drops),
+        the quiet-path wedge check polls the message list and surfaces the
+        running bash command as a 🔧 status chunk."""
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        async def _noop(*args: Any, **kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        monkeypatch.setattr(opencode_bridge, "_recycle_serve_if_low_memory", _noop)
+        monkeypatch.setattr(opencode_bridge, "_detect_wedged_tool", lambda *a: False)
+        monkeypatch.setattr(opencode_bridge, "_EVENT_QUIET_TIMEOUT", 0.05)
+        monkeypatch.setattr(opencode_bridge, "_EVENT_FINAL_TIMEOUT", 0.05)
+        monkeypatch.setattr(opencode_bridge, "_WEDGE_CHECK_INTERVAL_S", 0.05)
+
+        client = _RunningToolPermissionClient()
+        # Bus opens, user + assistant message arrive, then SILENCE — the
+        # running-state part event never arrives (upstream drop).
+        client.stream_lines = [
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_u", "role": "user"}),
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_a", "role": "assistant"}),
+        ]
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        smap: dict[str, str] = {}
+        # Short total timeout: the stream must end without hanging; the
+        # announce must fire before the abort.
+        deltas = [
+            d async for d in opencode_chat_stream(
+                "task", session_map=smap, session_key="conv-1", timeout=1.0,
+            )
+        ]
+
+        tools = [t for k, t in deltas if k == "status" and "🔧" in t]
+        assert any("bash" in t and "cat /etc/systemd/system/x.service" in t for t in tools), tools
+        # Announced exactly once (deduped by part id).
+        assert len(tools) == 1, tools
+
+
 class TestCompletionResolvesPermissions:
     """Root-cause regression (2026-08-07): the bridge used to pop pending
     permissions without answering them on completion, so the serve parked

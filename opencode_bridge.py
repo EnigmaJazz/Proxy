@@ -1482,6 +1482,65 @@ async def opencode_chat_stream(
             yield ("status", f"[OpenCode Bridge Network Error: {str(exc)}]")
 
 
+async def opencode_chat_stream_resilient(
+    user_text: str,
+    **kwargs: Any,
+) -> AsyncIterator[tuple[str, str]]:
+    """``opencode_chat_stream`` with one automatic retry on a fresh serve.
+
+    The headless serve's tool runner fails at a high rate (upstream defect
+    family anomalyco/opencode #35066: glob/grep/read error or wedge, and a
+    tool error can kill the session processing silently).  When the first
+    attempt ends in a bridge failure WITHOUT delivering any assistant text
+    or question, the serve is recycled (fresh runner) and the FULL task is
+    retried once — the same bounded-retry pattern the SDD cycle driver
+    uses.  A stream that delivered text or ended in a question is never
+    retried (the agent produced output or is waiting for the user); a
+    failed attempt that already delivered text surfaces its error as-is so
+    the partial result is never duplicated.  Autonomous mode (SDD cycle)
+    is never auto-retried: the cycle driver owns its recovery.  Never
+    raises; yields (kind, text) tuples exactly like the underlying stream.
+    """
+    if kwargs.get("autonomous"):
+        async for kind, payload in opencode_chat_stream(user_text, **kwargs):
+            yield kind, payload
+        return
+
+    attempt1: list[tuple[str, str]] = []
+    failed: Optional[str] = None
+    delivered = False  # any text or question surfaced to the caller
+    async for kind, payload in opencode_chat_stream(user_text, **kwargs):
+        if kind in ("text", "question"):
+            delivered = True
+            for k, p in attempt1:
+                yield k, p
+            attempt1.clear()
+            yield kind, payload
+            if kind == "question":
+                return  # agent is waiting on the user — never retry
+            continue
+        if isinstance(payload, str) and payload.startswith("[OpenCode Bridge"):
+            failed = payload
+        attempt1.append((kind, payload))
+    if failed and not delivered:
+        # The first attempt died before producing any output: recycle the
+        # serve (its tool runner is suspect) and retry the full task once.
+        logger.warning(
+            "opencode bridge attempt failed (%s) — retrying once on a fresh serve",
+            failed[:80],
+        )
+        yield (
+            "status",
+            "[OpenCode Bridge: attempt failed — retrying once on a fresh serve…]\n",
+        )
+        await _force_recycle_serve("plain bridge auto-retry")
+        async for kind, payload in opencode_chat_stream(user_text, **kwargs):
+            yield kind, payload
+        return
+    for k, p in attempt1:
+        yield k, p
+
+
 # ---------------------------------------------------------------------------
 # Escalation (mirrors llm.openrouter_cloud_escalation)
 # ---------------------------------------------------------------------------

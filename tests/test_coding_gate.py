@@ -232,7 +232,7 @@ class TestCodingDecisionGate:
         with patch(
             "routes.classify_with_frontdesk",
             new=AsyncMock(return_value=_classification()),
-        ), patch("routes.opencode_chat_stream", new=_fake_stream):
+        ), patch("routes.opencode_chat_stream_resilient", new=_fake_stream):
             response = await gate_client.post(
                 "/v1/chat/completions",
                 json={
@@ -294,7 +294,7 @@ class TestCodingDecisionGate:
                  new=AsyncMock(return_value=_classification()),
              ), \
              patch(
-                 "routes.opencode_chat_stream",
+                 "routes.opencode_chat_stream_resilient",
                  new=AsyncMock(return_value="SHOULD_NOT_RUN"),
              ):
             response = await gate_client.post(
@@ -334,7 +334,7 @@ class TestCodingDecisionGate:
         with patch(
             "routes.classify_with_frontdesk",
             new=AsyncMock(return_value=_classification()),
-        ), patch("routes.opencode_chat_stream", new=_fake_stream):
+        ), patch("routes.opencode_chat_stream_resilient", new=_fake_stream):
             response = await gate_client.post(
                 "/v1/chat/completions",
                 json={"model": "auto", "messages": messages, "stream": False},
@@ -1013,7 +1013,7 @@ class TestPinnedContinuationVsGate:
             yield ("text", "ok")
             return
 
-        monkeypatch.setattr("routes.opencode_chat_stream", _fake_stream)
+        monkeypatch.setattr("routes.opencode_chat_stream_resilient", _fake_stream)
         with patch("routes.classify_with_frontdesk",
                    new=AsyncMock(return_value=_classification("CODE"))):
             response = await gate_client.post(

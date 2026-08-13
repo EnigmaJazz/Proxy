@@ -1134,7 +1134,7 @@ class TestRoutesOpenCode:
             captured.append(text)
             yield ("text", "BRIDGE_DONE")
 
-        monkeypatch.setattr("routes.opencode_chat_stream", _fake_stream)
+        monkeypatch.setattr("routes.opencode_chat_stream_resilient", _fake_stream)
         resp = await _handle_opencode_request(
             [{"role": "user", "content": "write a test"}],
             client_stream=False,
@@ -1165,7 +1165,7 @@ class TestRoutesOpenCode:
             yield ("text", "STREAMED_")
             yield ("text", "DONE")
 
-        monkeypatch.setattr("routes.opencode_chat_stream", _fake_stream)
+        monkeypatch.setattr("routes.opencode_chat_stream_resilient", _fake_stream)
         resp = await _handle_opencode_request(
             [{"role": "user", "content": "task"}],
             client_stream=True,
@@ -1213,7 +1213,7 @@ class TestRoutesOpenCode:
             seen["autonomous"] = autonomous
             yield ("text", "SDD_CYCLE_DONE")
 
-        monkeypatch.setattr("routes.opencode_chat_stream", _fake_stream)
+        monkeypatch.setattr("routes.opencode_chat_stream_resilient", _fake_stream)
         resp = await _handle_opencode_request(
             [{"role": "user", "content": "Use SDD to add a docs file"}],
             client_stream=True,
@@ -1257,7 +1257,7 @@ class TestRoutesOpenCode:
             seen["autonomous"] = autonomous
             yield ("text", "SDD_NONSTREAM_DONE")
 
-        monkeypatch.setattr("routes.opencode_chat_stream", _fake_stream)
+        monkeypatch.setattr("routes.opencode_chat_stream_resilient", _fake_stream)
         resp = await _handle_opencode_request(
             [{"role": "user", "content": "Use SDD to add a docs file"}],
             client_stream=False,
@@ -1291,7 +1291,7 @@ class TestRoutesOpenCode:
             captured.append(text)
             yield ("text", "CMD_DONE")
 
-        monkeypatch.setattr("routes.opencode_chat_stream", _fake_stream)
+        monkeypatch.setattr("routes.opencode_chat_stream_resilient", _fake_stream)
         resp = await _handle_opencode_command(
             "/opencode implement the parser", _FakeApp(),
         )
@@ -3575,6 +3575,242 @@ class TestRunningToolAnnounce:
         tools = [t for k, t in deltas if k == "status" and "🔧" in t]
         assert any("grep" in t and "check.*update" in t for t in tools), tools
         assert len(tools) == 1, tools
+
+
+class _ResilientRetryClient(_FakeClient):
+    """Fake whose stream() pops pre-scripted line batches per call — lets
+    tests script attempt 1 to fail and attempt 2 to succeed."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.stream_batches: list[list[str]] = []
+
+    def stream(self, *args: Any, **kwargs: Any) -> _FakeStream:
+        lines = self.stream_batches.pop(0) if self.stream_batches else []
+        return _FakeStream(lines)
+
+
+class TestServeConfigTemplate:
+    """The serve template must carry the top-level permission pre-approvals:
+    the headless serve's permission ask-event delivery is broken (upstream
+    defect family #35066 — events drop, the tool parks forever), so tools
+    touching paths outside the session workspace wedged 100% of the time.
+    Config-level allow removes the ask entirely (verified live 2026-08-14:
+    read/glob/grep on ~/.local/bin completed instantly with the block, and
+    wedged without it on both 1.18.15 and 1.18.18)."""
+
+    def test_template_preallows_external_permissions(self) -> None:
+        import opencode_bridge as ob
+
+        template = open(ob.OPCODE_CONFIG_PATH, encoding="utf-8").read()
+        head = template.split('"agent"', 1)[0]
+        assert '"permission"' in head, "top-level permission block missing"
+        assert '"external_directory": "allow"' in head
+        assert '"read": "allow"' in head
+        assert '"glob": "allow"' in head
+        assert '"grep": "allow"' in head
+        assert '"bash": "allow"' in head
+        assert '"write": "allow"' in head
+        assert '"edit": "allow"' in head
+        assert '"webfetch": "allow"' in head
+
+
+class TestResilientStream:
+    """``opencode_chat_stream_resilient``: one auto-retry on a fresh serve
+    when the first attempt dies silently (the serve's tool runner fails at
+    a high rate — upstream defect family #35066); never retries after text
+    or a question, and never retries autonomous (SDD) mode.
+    """
+
+    @pytest.mark.asyncio
+    async def test_retries_once_after_silent_failure(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Attempt 1 dies with an agent error before any output; the serve
+        is recycled and the FULL task retried once, which succeeds."""
+        from opencode_bridge import opencode_chat_stream_resilient
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        async def _noop(*args: Any, **kwargs: Any) -> None:
+            return None
+
+        recycles: list[str] = []
+
+        async def _recycle(reason: str) -> None:
+            recycles.append(reason)
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        monkeypatch.setattr(opencode_bridge, "_recycle_serve_if_low_memory", _noop)
+        monkeypatch.setattr(opencode_bridge, "_force_recycle_serve", _recycle)
+
+        client = _ResilientRetryClient()
+        client.stream_batches = [
+            # Attempt 1: the first assistant message carries an error
+            # (session processing died — the upstream defect).
+            [
+                _evt("message.updated", sessionID="ses_0001",
+                     info={"id": "msg_u", "role": "user"}),
+                _evt("message.updated", sessionID="ses_0001",
+                     info={"id": "msg_a", "role": "assistant",
+                           "error": "model crashed"}),
+            ],
+            # Attempt 2: normal successful turn.
+            [*_stream_events()],
+        ]
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        smap: dict[str, str] = {}
+        deltas = [
+            d async for d in opencode_chat_stream_resilient(
+                "task", session_map=smap, session_key="conv-1",
+            )
+        ]
+
+        text = [t for k, t in deltas if k == "text"]
+        assert "Created file." in text
+        assert "Done." in text
+        retry_status = [t for k, t in deltas if k == "status" and "retrying once" in t]
+        assert len(retry_status) == 1
+        assert len(recycles) == 1
+        # One session POST per attempt — the retry ran the full task again.
+        posts = [u for u, _ in client.post_calls if u.endswith("/session")]
+        assert len(posts) == 2
+
+    @pytest.mark.asyncio
+    async def test_retry_also_fails_surfaces_second_error(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When the retry also fails, the second error is surfaced and no
+        third attempt is made."""
+        from opencode_bridge import opencode_chat_stream_resilient
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        async def _noop(*args: Any, **kwargs: Any) -> None:
+            return None
+
+        recycles: list[str] = []
+
+        async def _recycle(reason: str) -> None:
+            recycles.append(reason)
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        monkeypatch.setattr(opencode_bridge, "_recycle_serve_if_low_memory", _noop)
+        monkeypatch.setattr(opencode_bridge, "_force_recycle_serve", _recycle)
+
+        client = _ResilientRetryClient()
+        client.stream_batches = [
+            [_evt("message.updated", sessionID="ses_0001",
+                  info={"id": "msg_u", "role": "user"}),
+             _evt("message.updated", sessionID="ses_0001",
+                  info={"id": "msg_a", "role": "assistant", "error": "crashed"})],
+            [_evt("message.updated", sessionID="ses_0001",
+                  info={"id": "msg_u", "role": "user"}),
+             _evt("message.updated", sessionID="ses_0001",
+                  info={"id": "msg_a", "role": "assistant", "error": "crashed again"})],
+        ]
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        deltas = [
+            d async for d in opencode_chat_stream_resilient(
+                "task", session_map={}, session_key="conv-1",
+            )
+        ]
+        errors = [t for k, t in deltas if k == "status" and "OpenCode Bridge Error" in t]
+        assert len(errors) == 1 and "crashed again" in errors[0]
+        assert len(recycles) == 1
+        posts = [u for u, _ in client.post_calls if u.endswith("/session")]
+        assert len(posts) == 2  # never a third attempt
+
+    @pytest.mark.asyncio
+    async def test_no_retry_after_text_delivered(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A failure AFTER assistant text is surfaced as-is — a retry would
+        duplicate the partial work."""
+        from opencode_bridge import opencode_chat_stream_resilient
+
+        calls = 0
+
+        async def _fail_after_text(*args: Any, **kwargs: Any):
+            nonlocal calls
+            calls += 1
+            yield "text", "partial answer"
+            yield "status", "[OpenCode Bridge Error: wedged — session aborted. Please retry.]"
+
+        recycles: list[str] = []
+
+        async def _recycle(reason: str) -> None:
+            recycles.append(reason)
+
+        monkeypatch.setattr(opencode_bridge, "opencode_chat_stream", _fail_after_text)
+        monkeypatch.setattr(opencode_bridge, "_force_recycle_serve", _recycle)
+
+        deltas = [d async for d in opencode_chat_stream_resilient("task")]
+        assert ("text", "partial answer") in deltas
+        assert any(
+            k == "status" and "OpenCode Bridge Error" in t for k, t in deltas
+        )
+        assert calls == 1
+        assert recycles == []
+
+    @pytest.mark.asyncio
+    async def test_no_retry_after_question(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A clarifying question stops the stream and is never retried."""
+        from opencode_bridge import opencode_chat_stream_resilient
+
+        calls = 0
+
+        async def _question(*args: Any, **kwargs: Any):
+            nonlocal calls
+            calls += 1
+            yield "question", "Which source?"
+
+        recycles: list[str] = []
+
+        async def _recycle(reason: str) -> None:
+            recycles.append(reason)
+
+        monkeypatch.setattr(opencode_bridge, "opencode_chat_stream", _question)
+        monkeypatch.setattr(opencode_bridge, "_force_recycle_serve", _recycle)
+
+        deltas = [d async for d in opencode_chat_stream_resilient("task")]
+        assert deltas == [("question", "Which source?")]
+        assert calls == 1
+        assert recycles == []
+
+    @pytest.mark.asyncio
+    async def test_autonomous_mode_never_retried(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """SDD-autonomous mode is never auto-retried: the cycle driver owns
+        its recovery (a whole-cycle retry could burn hours)."""
+        from opencode_bridge import opencode_chat_stream_resilient
+
+        calls = 0
+
+        async def _fail(*args: Any, **kwargs: Any):
+            nonlocal calls
+            calls += 1
+            yield "status", "[OpenCode Bridge Error: x]"
+
+        recycles: list[str] = []
+
+        async def _recycle(reason: str) -> None:
+            recycles.append(reason)
+
+        monkeypatch.setattr(opencode_bridge, "opencode_chat_stream", _fail)
+        monkeypatch.setattr(opencode_bridge, "_force_recycle_serve", _recycle)
+
+        deltas = [d async for d in opencode_chat_stream_resilient("task", autonomous=True)]
+        assert any("OpenCode Bridge Error" in t for k, t in deltas)
+        assert calls == 1
+        assert recycles == []
 
 
 class TestCompletionResolvesPermissions:

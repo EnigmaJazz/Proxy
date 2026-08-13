@@ -69,7 +69,7 @@ from opencode_bridge import (
     _SDD_AUTONOMOUS_SYSTEM_PROMPT,
     _parse_permission_answer,
     _post_permission_response,
-    opencode_chat_stream,
+    opencode_chat_stream_resilient,
 )
 from routing import (
     RouteDecision,
@@ -2463,7 +2463,7 @@ async def _opencode_task_response(
             f"{_chg_label}: {_task_label}]_\n\n"
         )
         yield f"data: {json.dumps(_make_system_chunk(status_msg))}\n\n"
-        async for kind, text_delta in opencode_chat_stream(
+        async for kind, text_delta in opencode_chat_stream_resilient(
             task_text,
             agent=OPENCODE_AGENT,
             session_map=session_map,
@@ -2520,7 +2520,7 @@ async def _opencode_task_response(
     # handling behave identically (a plain opencode_chat here would create a
     # fresh session and orphan the pin / parked permission).
     resp_parts: list[str] = []
-    async for kind, text_delta in opencode_chat_stream(
+    async for kind, text_delta in opencode_chat_stream_resilient(
         task_text,
         agent=OPENCODE_AGENT,
         session_map=session_map,

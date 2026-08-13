@@ -982,20 +982,41 @@ async def opencode_chat_stream(
                 # pinned id would fail every retry — drop the pin and start
                 # fresh.  Only a SUCCESSFUL status fetch may trigger the
                 # drop; a transport-error fetch keeps the pin conservatively.
+                # A session's real existence must NOT be inferred from
+                # /session/status: the serve's status map only holds BUSY
+                # sessions — idle sessions are deleted from it on
+                # completion (upstream SessionStatus.set deletes on idle,
+                # observed live 2026-08-13 on 1.18.18).  A healthy idle
+                # pinned session is therefore absent from the map, and
+                # reading that absence as "session gone" dropped EVERY
+                # pin on the follow-up: each "continue" started a fresh
+                # session and the agent lost the task context
+                # ('runs a few commands and then stops').  Existence is
+                # probed with GET /session/<id> (200 = live, 404 =
+                # genuinely gone — serve recycled or dropped).  The status
+                # fetch remains only for the busy-stuck abort below.
                 fetch_ok = False
+                exists = True
+                try:
+                    get_resp = await client.get(
+                        f"{OPENCODE_SERVE_URL}/session/{session_id}", timeout=10.0,
+                    )
+                    fetch_ok = True
+                    exists = get_resp.status_code == 200
+                except (httpx.HTTPError, ValueError):
+                    pass
+                st = None
                 try:
                     st_resp = await client.get(
                         f"{OPENCODE_SERVE_URL}/session/status", timeout=10.0,
                     )
-                    st_map = st_resp.json()
-                    fetch_ok = True
-                    st = (st_map.get(session_id) or {}).get("type")
+                    st = (st_resp.json().get(session_id) or {}).get("type")
                 except (httpx.HTTPError, ValueError):
                     st = None
-                if fetch_ok and session_id not in st_map:
-                    # Stale pin: a successful status fetch no longer lists
-                    # the pinned id.  The session is gone — no abort POST is
-                    # needed (aborting a nonexistent session adds noise).
+                if fetch_ok and not exists:
+                    # Stale pin: a successful existence probe shows the
+                    # session is gone — no abort POST is needed (aborting
+                    # a nonexistent session adds noise).
                     logger.info(
                         "pinned session %s no longer on serve — dropping pin and starting fresh",
                         session_id[:16],

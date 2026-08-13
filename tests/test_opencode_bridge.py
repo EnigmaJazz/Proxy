@@ -89,6 +89,12 @@ class _FakeClient:
         # N-message-POST transport failure (REQ-4 blocking respawn tests).
         self.status_map: Optional[dict[str, Any]] = None
         self.fail_post_times: int = 0
+        # Resume-path existence probe: GET /session/<id> returns this
+        # status (200 = session live, 404 = gone).  The REAL serve only
+        # lists BUSY sessions in /session/status (idle sessions are
+        # deleted from the map on completion), so the default models the
+        # live-session case: 200.
+        self.session_get_status: int = 200
 
     async def __aenter__(self) -> "_FakeClient":
         return self
@@ -117,6 +123,11 @@ class _FakeClient:
             if self.status_map is not None:
                 return _FakeResp(200, self.status_map)
             return _FakeResp(200, {self.session_id: {"type": "idle"}})
+        import re as _re
+
+        if _re.search(r"/session/[^/]+$", url):
+            # GET /session/<id> — the resume-path existence probe.
+            return _FakeResp(self.session_get_status, {})
         if url.endswith("/permission"):
             # Blocking-path permission poll (opencode_chat hardening).
             return _FakeResp(200, self.permission_records)
@@ -854,17 +865,18 @@ class TestStalePinSelfHeal:
         return True
 
     @pytest.mark.asyncio
-    async def test_stale_pin_dropped_when_status_lacks_id(
+    async def test_stale_pin_dropped_when_existence_probe_404s(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """REQ-2 Scenario-1: a successful status fetch WITHOUT the pinned id
+        """REQ-2 Scenario-1: a successful GET /session/<id> probe returning
+        404 (the session is genuinely gone — serve recycled or dropped)
         drops the pin and POSTs a fresh /session; no abort is fired (the
         session is gone)."""
         from opencode_bridge import opencode_chat_stream
 
         monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", self._running)
         client = _FakeClient()
-        client.status_map = {}  # serve lists NO sessions
+        client.session_get_status = 404  # existence probe: session gone
         client.stream_lines = _stream_events()
         monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
 
@@ -891,17 +903,17 @@ class TestStalePinSelfHeal:
         )
 
     @pytest.mark.asyncio
-    async def test_pin_kept_on_status_fetch_transport_error(
+    async def test_pin_kept_on_existence_probe_transport_error(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """REQ-2 Scenario-2: a transport-error status fetch keeps the pin —
-        no fresh /session POST; the pinned session is used and the stream
-        completes."""
+        """REQ-2 Scenario-2: a transport-error existence probe keeps the
+        pin — no fresh /session POST; the pinned session is used and the
+        stream completes."""
         from opencode_bridge import opencode_chat_stream
 
         monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", self._running)
         client = _FakeClient()
-        client.raise_timeout_on = "get"  # status fetch raises ReadTimeout
+        client.raise_timeout_on = "get"  # probe raises ReadTimeout
         client.stream_lines = _stream_events()
         monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
 
@@ -918,6 +930,48 @@ class TestStalePinSelfHeal:
         assert "Done." in text
         assert not any(
             url.endswith("/session") for url, _ in client.post_calls
+        )
+        assert smap == {"conv": "ses_0001"}
+
+    @pytest.mark.asyncio
+    async def test_idle_pinned_session_kept_when_status_map_empty(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """REGRESSION (2026-08-13): the serve's /session/status map only
+        lists BUSY sessions — idle sessions are deleted from it on
+        completion (upstream SessionStatus.set deletes on idle).  An
+        empty status map therefore does NOT mean the pinned session is
+        gone: the follow-up must resume the SAME session (no fresh POST,
+        no abort, pin kept).  This is the production failure behind
+        'runs a few commands and then stops' — every "continue" created
+        a fresh session and the agent lost the task context."""
+        from opencode_bridge import opencode_chat_stream
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", self._running)
+        client = _FakeClient()
+        # The real serve's status map: empty while the pinned session is
+        # idle (it only ever holds busy sessions).
+        client.status_map = {}
+        client.stream_lines = _stream_events()
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        smap: dict[str, str] = {"conv": "ses_0001"}
+        deltas = [
+            d async for d in opencode_chat_stream(
+                "answer", session_map=smap, session_key="conv",
+            )
+        ]
+
+        text = [t for k, t in deltas if k == "text"]
+        assert "Created file." in text
+        assert "Done." in text
+        # The pinned session carried the stream: no fresh /session POST,
+        # no abort, and the pin survives for the next follow-up.
+        assert not any(
+            url.endswith("/session") for url, _ in client.post_calls
+        )
+        assert not any(
+            url.endswith("/abort") for url, _ in client.post_calls
         )
         assert smap == {"conv": "ses_0001"}
 

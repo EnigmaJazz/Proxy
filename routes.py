@@ -59,6 +59,7 @@ from context_governance import (
     strip_proxy_status,
 )
 from search_enrichment import enrich_thin_search_results
+from image_downscale import downscale_images
 from llm import (
     stream_llm,
     openrouter_cloud_escalation,
@@ -676,6 +677,13 @@ async def _govern_messages(
     # per request with ``X-Proxy-Search-Enrichment: off``.
     if request.headers.get("x-proxy-search-enrichment", "").strip().lower() != "off":
         messages = await enrich_thin_search_results(messages)
+    # Outbound image downscaling (R1 carve-out): a 3000×4000 image crashed
+    # llama-professional with a Vulkan device-lost core dump (2026-08-12).
+    # Oversized images are downscaled on the OUTBOUND copy only; the
+    # client's stored conversation and the DB audit copy are never touched.
+    # Opt out per request with ``X-Proxy-Image-Downscale: off``.
+    if request.headers.get("x-proxy-image-downscale", "").strip().lower() != "off":
+        messages = await downscale_images(messages)
     header = request.headers.get("x-proxy-context-governance", "")
     if header.strip().lower() == "off":
         return messages

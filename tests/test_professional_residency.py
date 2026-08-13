@@ -73,6 +73,10 @@ class TestEnsureProfessionalResident:
         ctrl.active_heavy_model = "coder"
         start_mock = AsyncMock()
         is_active_mock = AsyncMock()
+        # The recorded model is verified live (liveness probe) before the
+        # recorded state is trusted — a genuinely serving model still owns
+        # the GPU and the residency check must not fight it.
+        monkeypatch.setattr(ctrl, "probe_model_port", AsyncMock(return_value=True))
         monkeypatch.setattr(ctrl, "is_active", is_active_mock)
         monkeypatch.setattr(ctrl, "start_service", start_mock)
 
@@ -81,6 +85,45 @@ class TestEnsureProfessionalResident:
         start_mock.assert_not_awaited()
         is_active_mock.assert_not_awaited()
         assert ctrl.active_heavy_model == "coder"
+
+    @pytest.mark.asyncio
+    async def test_stale_recorded_state_dead_port_starts_professional(
+        self, systemd: tuple[Any, Any], monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Recorded 'professional' is NOT serving (external stop, e.g. an
+        ``unlock.sh`` ``systemctl isolate``) → clear the stale state and
+        start the service (2026-08-12 incident regression)."""
+        _, ctrl = systemd
+        ctrl.active_heavy_model = "professional"
+        started: list[str] = []
+        monkeypatch.setattr(ctrl, "probe_model_port", AsyncMock(return_value=False))
+        monkeypatch.setattr(ctrl, "is_active", AsyncMock(return_value=False))
+        monkeypatch.setattr(ctrl, "start_service", _recorder(started))
+
+        await ctrl.ensure_professional_resident(gpu_vram_used_gb=10.0)
+
+        assert started == ["professional"]
+        assert ctrl.active_heavy_model == "professional"
+
+    @pytest.mark.asyncio
+    async def test_stale_recorded_state_live_port_no_restart(
+        self, systemd: tuple[Any, Any], monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Recorded 'professional' is genuinely serving (port alive) →
+        idempotent: no restart, recorded state preserved."""
+        _, ctrl = systemd
+        ctrl.active_heavy_model = "professional"
+        start_mock = AsyncMock()
+        is_active_mock = AsyncMock()
+        monkeypatch.setattr(ctrl, "probe_model_port", AsyncMock(return_value=True))
+        monkeypatch.setattr(ctrl, "is_active", is_active_mock)
+        monkeypatch.setattr(ctrl, "start_service", start_mock)
+
+        await ctrl.ensure_professional_resident(gpu_vram_used_gb=10.0)
+
+        start_mock.assert_not_awaited()
+        is_active_mock.assert_not_awaited()
+        assert ctrl.active_heavy_model == "professional"
 
     @pytest.mark.asyncio
     async def test_does_not_load_when_gpu_busy(

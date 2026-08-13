@@ -759,6 +759,20 @@ PROFESSIONAL_RESIDENT_ENABLED: bool = True     # kill toggle for residency
 PROFESSIONAL_RESIDENT_CHECK_S: float = 60.0    # how often the monitor checks
 GPU_BUSY_VRAM_GB: float = 22.0                 # vram_used_gb >= this → GPU busy with OTHER work
 
+# ---------------------------------------------------------------------------
+# Outbound image downscaling (R1 carve-out)
+#
+# A 3000×4000 image core-dumped llama-professional (Vulkan device lost,
+# 2026-08-12) — no downscaling existed anywhere.  Oversized images are
+# downscaled on the OUTBOUND model-copy only (the client's stored
+# conversation and the DB audit copy are never touched).  Opt out per
+# request with ``X-Proxy-Image-Downscale: off``.
+# ---------------------------------------------------------------------------
+IMAGE_DOWNSCALE_MAX_LONG_SIDE: int = 2048      # px — long-side cap for the vision model
+IMAGE_DOWNSCALE_JPEG_QUALITY: int = 85         # re-encode quality
+IMAGE_DOWNSCALE_MAX_FETCH_BYTES: int = 10 * 1024 * 1024  # remote fetch cap (10 MiB)
+IMAGE_DOWNSCALE_FETCH_TIMEOUT: float = 5.0     # seconds for a remote image fetch
+
 # TCP health-check timeout (seconds)
 TCP_TIMEOUT: float = 5.0
 

@@ -75,6 +75,7 @@ from constants import (
     PROJECT_ROOT,
     DB_PATH,
     SENSOR_INTERVAL,
+    HEAVY_MODELS,
 )
 from database import Database
 from systemd import SystemdController
@@ -415,18 +416,12 @@ async def queue_worker(state: AppState) -> None:
                 target_model = "professional"
 
             # ---- Hot-swap if needed -----------------------------------------
-            current_heavy = systemd.active_heavy_model
-            needed_port = await systemd.get_port(target_model)
-
-            if current_heavy != target_model and target_model in (
-                "professional", "coder", "creative", "scholar", "architect",
-            ):
-                logger.info("Hot-swapping GPU from %s to %s", current_heavy, target_model)
-                await systemd.hot_swap(
-                    from_domain=current_heavy or "",
-                    to_domain=target_model,
-                )
-                state.active_heavy_model = target_model
+            # Liveness-probed: when the recorded state says the target is
+            # already active, the port is probed first — an external stop
+            # (unlock.sh ``systemctl isolate``) can kill the service while
+            # the record stays stale, and without the probe the job would
+            # stream to a dead port (2026-08-12, 1.5h of non-restart).
+            await _ensure_heavy_model_serving(systemd, target_model, state)
 
             # ---- This is a queued job — update DB state and stream ----------
             # For now, queued jobs complete in the queue worker
@@ -456,6 +451,49 @@ async def queue_worker(state: AppState) -> None:
                 pending = await db.get_pending_jobs()
                 if not pending and systemd:
                     await _cleanup_idle_heavy(systemd, state)
+
+
+async def _ensure_heavy_model_serving(
+    systemd: SystemdController,
+    target_model: str,
+    state: AppState,
+) -> None:
+    """Ensure *target_model* is actually serving before a queued job streams.
+
+    The queue worker trusts ``systemd.active_heavy_model`` when deciding
+    whether a hot-swap is needed.  That record can go STALE: an external
+    stop (e.g. an ``unlock.sh`` ``systemctl isolate``) kills the service
+    while the proxy still believes it is loaded, so ``current_heavy ==
+    target_model`` skips the start and the job streams to a dead port
+    (2026-08-12 incident — llama-professional stayed down 1.5h).
+
+    When the recorded state says the target is already the active heavy
+    model, probe its port: a dead port means the record is stale, so the
+    model is treated as stopped and the hot-swap/start path runs.
+    Lightweight models are never probed or swapped (unchanged behavior).
+    """
+    if target_model not in HEAVY_MODELS:
+        return
+    current_heavy = systemd.active_heavy_model
+    needed_port = await systemd.get_port(target_model)
+
+    if current_heavy == target_model and not await systemd.probe_model_port(
+        needed_port,
+    ):
+        logger.warning(
+            "Recorded heavy model '%s' is not serving on port %d — "
+            "treating it as stopped and re-starting",
+            target_model, needed_port,
+        )
+        current_heavy = None
+
+    if current_heavy != target_model:
+        logger.info("Hot-swapping GPU from %s to %s", current_heavy, target_model)
+        await systemd.hot_swap(
+            from_domain=current_heavy or "",
+            to_domain=target_model,
+        )
+        state.active_heavy_model = target_model
 
 
 async def _cleanup_idle_heavy(

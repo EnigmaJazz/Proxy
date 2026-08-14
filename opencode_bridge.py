@@ -144,6 +144,13 @@ _SDD_AUTONOMOUS_SYSTEM_PROMPT = (
     "the LOCAL model (apply's local writer), delegate ONE FILE at a time "
     "— one task per file — for big tasks; never bundle multiple files "
     "into one local-model task (the local context window is limited).\n"
+    "- CONTEXT DISCIPLINE (MANDATORY): your session context accumulates "
+    "across phases and cannot be reset mid-cycle.  Keep it small: never "
+    "re-read a file you already hold; reference artifact paths "
+    "(openspec/changes/<change>/...) instead of pasting file contents back "
+    "into context; when an artifact is large, read only the sections you "
+    "need.  The artifact files on disk are the durable state — your "
+    "context is a working cache, not the record.\n"
     "- TOOL RETRY (MANDATORY): when a tool call fails with a transient "
     "error (e.g. \"Tool execution aborted\", connection reset), retry the "
     "tool ONCE immediately before giving up - the serve's tool runner "
@@ -183,6 +190,16 @@ _TOOL_WEDGE_AFTER_S: float = 300.0
 #: per sub-agent phase).  The 120s tool threshold would abort healthy
 #: phases at the first sub-agent lull, so task parts get their own,
 #: much longer window (2026-08-09).
+_SESSION_CONTEXT_CAP_TOKENS: int = 60_000
+
+
+#: A session's context CANNOT be reset by the agent inside it (the
+#: professional-as-subagent has no tools to shed history).  The bridge is
+#: the only reset point: a pinned session whose estimated context exceeds
+#: _SESSION_CONTEXT_CAP_TOKENS is dropped on the next resume and a fresh
+#: session starts — the durable state lives in the artifact/repo files
+#: (2026-08-14, user-directed after the weight_loss cycle hit 114k tokens
+#: and paid a 7.5-minute full re-prefill).
 _TASK_WEDGE_AFTER_S: float = 600.0
 
 #: STALL-AWARE ABORT (2026-08-11): a task part running this long whose
@@ -1114,11 +1131,24 @@ async def opencode_chat_stream(
                 # stale question that kills the stream.  Best-effort.  The
                 # seeding also records running-question start times (the
                 # orphan check below uses them — no extra message-list GET,
-                # so the seeded read stays the FIRST one).
-                await _seed_resumed_session_state(
+                # so the seeded read stays the FIRST one) and returns a
+                # rough context-token estimate for the bridge-level reset:
+                # an over-cap session cannot shed its own history, so the
+                # next resume starts fresh (durable state lives in the
+                # artifact files).
+                est = await _seed_resumed_session_state(
                     client, session_id, user_mids, text_lens,
                     tool_state, seen_question_pids, running_question_times,
                 )
+                if est > _SESSION_CONTEXT_CAP_TOKENS:
+                    logger.info(
+                        "pinned session %s over the context cap (%d tokens) "
+                        "— starting fresh", session_id[:16], est,
+                    )
+                    if session_map is not None and session_key:
+                        session_map.pop(session_key, None)
+                    session_id = None
+                    resumed = False
             # A pending QUESTION from the previous turn: the agent is
             # waiting on the user (the question tool parks the current
             # step).  The user's message IS the answer — post it to the
@@ -2213,6 +2243,36 @@ async def _session_busy_on_current_serve(
     return False
 
 
+async def _session_over_context_cap(
+    client: httpx.AsyncClient, session_id: str,
+) -> bool:
+    """Rough token estimate of a session's accumulated context.
+
+    Text/reasoning parts only, ~4 chars per token.  The agent inside the
+    session cannot reset its own context (no tools), so the bridge resets
+    it: a pinned session whose estimate exceeds the cap is dropped on the
+    next resume and a fresh session starts.  Never raises; any fetch
+    failure keeps the pin (False).
+    """
+    try:
+        resp = await client.get(
+            f"{OPENCODE_SERVE_URL}/session/{session_id}/message", timeout=10.0,
+        )
+        if resp.status_code != 200:
+            return False
+        body = resp.json()
+        if not isinstance(body, list):
+            return False
+        total = 0
+        for m in body:
+            for p in m.get("parts") or []:
+                if p.get("type") in ("text", "reasoning"):
+                    total += len(str(p.get("text") or "")) // 4
+        return total > _SESSION_CONTEXT_CAP_TOKENS
+    except (httpx.HTTPError, OSError, ValueError):
+        return False
+
+
 async def _seed_resumed_session_state(
     client: httpx.AsyncClient,
     session_id: str,
@@ -2236,17 +2296,21 @@ async def _seed_resumed_session_state(
     ``running_question_times`` (optional list) collects the start times of
     any question tool parts still parked in "running" — the orphaned-
     question check uses them without a second message-list GET.
+
+    Returns the estimated context size in tokens (text/reasoning chars /
+    4, 0 when the fetch failed) — the bridge-level context cap check.
     """
+    total_chars = 0
     try:
         resp = await client.get(
             f"{OPENCODE_SERVE_URL}/session/{session_id}/message", timeout=10.0,
         )
         if resp.status_code != 200:
-            return
+            return 0
         body = resp.json()
         if not isinstance(body, list):
             # Malformed/dict bodies (e.g. an error object) must not raise.
-            return
+            return 0
         for m in body:
             role = (m.get("info") or {}).get("role")
             if role == "assistant":
@@ -2258,6 +2322,7 @@ async def _seed_resumed_session_state(
                     ptype = p.get("type")
                     if ptype in ("text", "reasoning"):
                         text = str(p.get("text") or "")
+                        total_chars += len(text)
                         if text:
                             text_lens[pid] = len(text)
                     elif ptype == "tool":
@@ -2272,7 +2337,8 @@ async def _seed_resumed_session_state(
                                 if s is not None:
                                     running_question_times.append(float(s))
     except (httpx.HTTPError, OSError, ValueError):
-        return
+        return 0
+    return total_chars // 4
 
 
 async def _poll_session_deltas(

@@ -4691,3 +4691,48 @@ class TestStallAwareChildWedge:
                       "time": {"start": int(_t.time() * 1000) - 5_000}},
         }]}]
         assert await opencode_bridge._detect_wedged_tool(client, "ses_parent") is False
+
+
+class TestContextCapReset:
+    """The bridge-level context reset: a pinned session whose seeded
+    history exceeds the cap is dropped on resume and a fresh session
+    starts (the agent inside cannot shed its own context)."""
+
+    @pytest.mark.asyncio
+    async def test_over_cap_session_resets_fresh(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+
+        old_msg = _assistant_msg([
+            {"id": "prt_big", "messageID": "msg_old", "type": "text",
+             "text": "x" * 300_000},  # ~75k tokens — over the 60k cap
+        ])
+        old_msg["id"] = "msg_old"
+        new_msg = _assistant_msg([
+            {"id": "prt_new", "messageID": "msg_new", "type": "text",
+             "text": "fresh start answer"},
+        ])
+        new_msg["id"] = "msg_new"
+
+        client = _SeedPollClient()
+        client.seed_messages = [old_msg]
+        client.poll_messages = [new_msg]
+        client.stream_lines = []
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        smap: dict[str, str] = {"conv-1": "ses_0001"}
+        deltas = [d async for d in opencode_chat_stream(
+            "continue", session_map=smap, session_key="conv-1",
+        )]
+        joined = "".join(t for _, t in deltas)
+        # The old context is gone (no replay) and the new turn streams.
+        assert "x" * 100 not in joined
+        assert "fresh start answer" in joined
+        # The pin was dropped and a fresh session was created.
+        assert any(u.endswith("/session") for u, _ in client.post_calls)

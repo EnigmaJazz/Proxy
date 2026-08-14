@@ -1264,9 +1264,10 @@ async def opencode_chat_stream(
                         # st == "idle" check below alone never returns and
                         # the bridge burns the full OPENCODE_SERVE_TIMEOUT.
                         # Completion is detectable from the message list: a
-                        # step-finish with no new content across two
-                        # consecutive poll cycles means the agent is done.
-                        finish_quiet_cycles = 0
+                        # step-finish with no new content across the idle
+                        # grace window means the agent is done (multi-step
+                        # turns pause between steps — see _IDLE_GRACE_S).
+                        idle_since: Optional[float] = None
                         while True:
                             if time.monotonic() - started > timeout:
                                 logger.error(
@@ -1294,6 +1295,7 @@ async def opencode_chat_stream(
                                 yield delta
                                 cycle_content = True
                                 last_emit = time.monotonic()
+                                idle_since = None  # the agent is working
                             # A RUNNING tool in the newest assistant
                             # message means the agent is still working — a
                             # freshly started tool produces no content delta
@@ -1325,17 +1327,30 @@ async def opencode_chat_stream(
                                 except (httpx.HTTPError, OSError, ValueError):
                                     pass
                                 if still_running:
-                                    finish_quiet_cycles = 0
+                                    idle_since = None
                                     # Do not emit "done" — the agent is mid
                                     # tool; keep the stream alive.
                                     cycle_content = True
                             # Multi-step agents pause between steps; a
                             # finished session shows a step-finish then goes
-                            # quiet.  Two consecutive cycles with a step-
-                            # finish and zero new content = done.
-                            if pending_done and not cycle_content:
-                                finish_quiet_cycles += 1
-                                if finish_quiet_cycles >= 2:
+                            # quiet.  UNIFIED idle grace: a finished step OR
+                            # an idle session, with zero new content across
+                            # the grace window = done (the model's inter-step
+                            # generation takes 5-40s on this hardware, and
+                            # the serve can briefly report idle between
+                            # steps).  New content or a busy status resets
+                            # the timer.
+                            try:
+                                st_resp = await client.get(
+                                    f"{OPENCODE_SERVE_URL}/session/status", timeout=10.0,
+                                )
+                                st = (st_resp.json().get(session_id) or {}).get("type")
+                            except (httpx.HTTPError, ValueError):
+                                st = None
+                            if (pending_done or st == "idle") and not cycle_content:
+                                if idle_since is None:
+                                    idle_since = time.monotonic()
+                                elif time.monotonic() - idle_since > _IDLE_GRACE_S:
                                     # The agent looks done, but it may be
                                     # parked on a permission the bridge
                                     # never answered.  Resolve it BEFORE
@@ -1353,25 +1368,7 @@ async def opencode_chat_stream(
                                             return
                                     return
                             else:
-                                finish_quiet_cycles = 0
-                            try:
-                                st_resp = await client.get(
-                                    f"{OPENCODE_SERVE_URL}/session/status", timeout=10.0,
-                                )
-                                st = (st_resp.json().get(session_id) or {}).get("type")
-                            except (httpx.HTTPError, ValueError):
-                                st = None
-                            if st == "idle":
-                                pending_perm = await _detect_pending_permission(client, session_id)
-                                if pending_perm:
-                                    question = await _handle_permission_event(
-                                        client, session_id, pending_perm,
-                                        pending_permissions, autonomous=autonomous,
-                                    )
-                                    if question:
-                                        yield ("question", question)
-                                        return
-                                return
+                                idle_since = None
                             # Real agent work with no new parts (long bash
                             # run, model generation) must not read as a
                             # dead stream: emit a keepalive after quiet.

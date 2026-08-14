@@ -3884,6 +3884,12 @@ class TestIdleGrace:
         ]
         # The next step's narration was delivered despite the idle event.
         assert ("text", "next step narration") in deltas, deltas
+        # No misleading "still working" keepalives once the grace is
+        # counting (the agent finished; the stream is waiting out the
+        # grace) — the tail is silent.
+        assert not any(
+            k == "status" and "still working" in t for k, t in deltas
+        ), deltas
 
 
 class TestResilientStream:

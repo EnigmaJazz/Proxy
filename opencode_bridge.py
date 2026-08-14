@@ -1371,8 +1371,17 @@ async def opencode_chat_stream(
                                 idle_since = None
                             # Real agent work with no new parts (long bash
                             # run, model generation) must not read as a
-                            # dead stream: emit a keepalive after quiet.
-                            if time.monotonic() - last_emit > _EVENT_QUIET_TIMEOUT:
+                            # dead stream: emit a keepalive after quiet —
+                            # UNLESS the idle grace is counting (the agent
+                            # finished; the stream is only waiting out the
+                            # grace — see the bus-path guard).
+                            if (
+                                time.monotonic() - last_emit > _EVENT_QUIET_TIMEOUT
+                                and not (
+                                    (pending_done or st == "idle")
+                                    and not cycle_content
+                                )
+                            ):
                                 yield (
                                     "status",
                                     "⏳ still working… "
@@ -1500,8 +1509,14 @@ async def opencode_chat_stream(
                             yield delta
                             idle_grace_started = None  # the agent is working
                         # Keep the client connection alive during long tool
-                        # phases (and show the agent is still working).
-                        yield ("status", "⏳ still working…")
+                        # phases (and show the agent is still working).  The
+                        # idle-grace tail is NOT work — the agent finished
+                        # and the stream is waiting out the 45s grace — so
+                        # stop the "still working" keepalives there (the
+                        # frontend's 90s stall-killer is longer than the
+                        # grace).
+                        if not (pending_done and not session_busy):
+                            yield ("status", "⏳ still working…")
                         continue
                     if not line.startswith("data: "):
                         continue

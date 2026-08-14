@@ -439,6 +439,7 @@ async def call_model(
             "temperature": 0.0,
             "json_schema": {
                 "type": "object",
+                "required": ["difficulty", "recommendation", "reason"],
                 "properties": {
                     "difficulty": {"type": "string"},
                     "recommendation": {"type": "string"},

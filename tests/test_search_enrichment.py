@@ -326,7 +326,9 @@ class TestDateTimeInjection:
     async def test_govern_wiring_opt_out(self) -> None:
         from routes import _govern_messages
         import types as _types
-        request = _types.SimpleNamespace(headers={"x-proxy-date-time": "off"})
+        request = _types.SimpleNamespace(
+            headers={"x-proxy-date-time": "off", "x-proxy-repo-context": "off"},
+        )
         msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
         out = await _govern_messages(request, msgs, model_key="professional", max_tokens=4096)
         assert out[0]["content"] == "sys"

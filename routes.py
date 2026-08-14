@@ -601,6 +601,113 @@ async def list_models(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
+#: Module-level registry of the most recent completed opencode tasks
+#: (summary + repo snapshot), consumed by the professional's repo-context
+#: injection (_repo_context_block).  The capture runs from stream
+#: generators (_opencode_task_response) that hold no app.state handle, so
+#: threading app state through would couple the task response to the
+#: FastAPI app — accepted project exception (2026-08-14, mirrors the
+#: prompt_cache F6 carve-out).  Small, per-process; dies with the process.
+_RECENT_OPENCODE_WORK: list[dict[str, Any]] = []
+_MAX_RECENT_WORK = 2
+
+
+def _capture_opencode_work(text_parts: list[str]) -> None:
+    """Snapshot a completed opencode task for the local model's repo
+    context: the final summary text plus the working-tree state at task
+    end (the agent's files land in the repo, and a future professional
+    conversation has no other way to see them — the model has no tools).
+    Runs in a worker thread (git calls are blocking).  Never raises.
+    """
+    summary = "".join(text_parts).strip()
+    if not summary:
+        return
+    repo = Path(__file__).resolve().parent
+    status = diffstat = log = ""
+    try:
+        status = subprocess.check_output(
+            ["git", "-C", str(repo), "status", "--short"],
+            text=True, timeout=10,
+        ).strip()
+        diffstat = subprocess.check_output(
+            ["git", "-C", str(repo), "diff", "--stat"],
+            text=True, timeout=10,
+        ).strip()
+        log = subprocess.check_output(
+            ["git", "-C", str(repo), "log", "--oneline", "-3"],
+            text=True, timeout=10,
+        ).strip()
+    except (subprocess.SubprocessError, OSError):
+        pass
+    _RECENT_OPENCODE_WORK.append({
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "summary": summary[:1200],
+        "status": status,
+        "diffstat": diffstat,
+        "log": log,
+    })
+    del _RECENT_OPENCODE_WORK[_MAX_RECENT_WORK:]
+
+
+def _repo_context_block() -> str:
+    """Compact repo-state block for the professional's system message: the
+    most recent opencode tasks (summary + files) plus the current
+    working-tree/commit state.  Bounded (<~2k tokens); the live git calls
+    are cheap and the block is cache-stable between repo changes.
+    """
+    parts: list[str] = []
+    for entry in _RECENT_OPENCODE_WORK[-_MAX_RECENT_WORK:]:
+        parts.append(
+            f"[Recent OpenCode task ({entry['time']})]\n{entry['summary']}"
+        )
+        if entry["status"]:
+            parts.append(f"Files it changed:\n{entry['status']}")
+        if entry["diffstat"]:
+            parts.append(entry["diffstat"])
+    repo = Path(__file__).resolve().parent
+    status = log = ""
+    try:
+        status = subprocess.check_output(
+            ["git", "-C", str(repo), "status", "--short"],
+            text=True, timeout=5,
+        ).strip()
+        log = subprocess.check_output(
+            ["git", "-C", str(repo), "log", "--oneline", "-5"],
+            text=True, timeout=5,
+        ).strip()
+    except (subprocess.SubprocessError, OSError):
+        pass
+    if status:
+        parts.append(f"[Current working tree]\n{status}")
+    if log:
+        parts.append(f"[Recent commits]\n{log}")
+    return "\n\n".join(parts) if parts else ""
+
+
+async def _inject_repo_context(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Append the repo-context block to the OUTBOUND system message.
+
+    R1 carve-out (2026-08-14, user-requested): the local model has no
+    tools and no visibility of the opencode agents' work, so a future
+    conversation can't pick up the code.  The block is APPENDED (the
+    stable system prefix stays KV-cache-visible; only the delta
+    re-prefills) and is cache-stable between repo changes.  Never
+    touches the client's stored conversation or the DB audit copy.
+    Opt out per request with ``X-Proxy-Repo-Context: off``.
+    """
+    block = await asyncio.to_thread(_repo_context_block)
+    if not block:
+        return messages
+    messages = list(messages)
+    for i, m in enumerate(messages):
+        if m.get("role") == "system" and isinstance(m.get("content"), str):
+            messages[i] = {**m, "content": m["content"] + "\n\n" + block}
+            return messages
+    return [{"role": "system", "content": block}] + messages
+
+
 def _inject_current_datetime(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Append the current DATE to the OUTBOUND copy's system message
     (date-only — the clock time broke the KV-cache prefix every request).
@@ -669,6 +776,13 @@ async def _govern_messages(
     # message.  Opt out per request with ``X-Proxy-Date-Time: off``.
     if request.headers.get("x-proxy-date-time", "").strip().lower() != "off":
         messages = _inject_current_datetime(messages)
+    # Repo-context injection (R1 carve-out, user-requested 2026-08-14):
+    # the local model has no tools and no visibility of the opencode
+    # agents' work; append the recent-task summaries + working-tree state
+    # to the OUTBOUND system message.  Opt out per request with
+    # ``X-Proxy-Repo-Context: off``.
+    if request.headers.get("x-proxy-repo-context", "").strip().lower() != "off":
+        messages = await _inject_repo_context(messages)
     # Search-result enrichment (explicit user-approved R1 carve-out
     # extension): frontends execute search_web themselves and often return
     # thin SEO snippets; when that happens, append the proxy's own rich
@@ -2463,6 +2577,7 @@ async def _opencode_task_response(
             f"{_chg_label}: {_task_label}]_\n\n"
         )
         yield f"data: {json.dumps(_make_system_chunk(status_msg))}\n\n"
+        _resp_text: list[str] = []
         async for kind, text_delta in opencode_chat_stream_resilient(
             task_text,
             agent=OPENCODE_AGENT,
@@ -2474,6 +2589,8 @@ async def _opencode_task_response(
             timeout=timeout,
             autonomous=autonomous,
         ):
+            if kind == "text" and text_delta:
+                _resp_text.append(text_delta)
             stop_after = False
             if not text_delta:
                 continue
@@ -2511,6 +2628,16 @@ async def _opencode_task_response(
             if stop_after:
                 break
         yield "data: [DONE]\n\n"
+        # Record the completed opencode task for the local model's repo
+        # context (2026-08-14): a future professional conversation has no
+        # visibility of the agent's work unless it is captured here — the
+        # session text is out of reach and the model has no tools.
+        # Best-effort: capture failures must never break the stream.
+        if _resp_text:
+            try:
+                await asyncio.to_thread(_capture_opencode_work, _resp_text)
+            except Exception:
+                logger.exception("capturing opencode work failed")
 
     if client_stream:
         return StreamingResponse(_stream(), media_type="text/event-stream")

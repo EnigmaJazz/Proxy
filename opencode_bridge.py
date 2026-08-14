@@ -993,6 +993,19 @@ async def opencode_chat_stream(
                 session_map.get(session_key)
                 if session_map and session_key else None
             )
+            # Set when the user's message answered a pending question (the
+            # resume path posts it as a question reply, so no prompt POST).
+            skip_prompt = False
+            # A pending question request owned by the pinned session (the
+            # agent's question tool is waiting on the user).  Detected
+            # BEFORE the busy check: a question session is legitimately
+            # busy and must never be aborted as stuck.
+            pending_question_id: Optional[str] = None
+            pending_question_count = 0
+            if session_id:
+                pending_question_id, pending_question_count = await _find_pending_question(
+                    client, session_id,
+                )
             if session_id:
                 # Follow-up in the same conversation: reuse the pinned agent
                 # session so it retains its tool state and context.  But a
@@ -1047,11 +1060,13 @@ async def opencode_chat_stream(
                     if session_map is not None and session_key:
                         session_map.pop(session_key, None)
                     session_id = None
-                elif st == "busy" and not just_approved_permission:
+                elif st == "busy" and not just_approved_permission and not pending_question_id:
                     # A session that just resumed after a permission
                     # approval is legitimately busy executing the approved
                     # tool (or generating its summary) — do NOT abort it.
                     # Only a busy session with NO such resume is stuck.
+                    # Same for a session with a pending question (the agent
+                    # is waiting on the user, not stuck).
                     logger.warning(
                         "pinned session %s is busy (likely stuck) — aborting and starting fresh",
                         session_id[:16],
@@ -1066,6 +1081,64 @@ async def opencode_chat_stream(
             # NOT from a fresh POST /session below — only resumed sessions
             # seed the poll-state with pre-existing history.
             resumed = session_id is not None
+            user_mids: set[str] = set()
+            asst_mid: Optional[str] = None
+            text_lens: dict[str, int] = {}
+            tool_state: dict[str, str] = {}
+            # Tool parts already surfaced as a 🔧 status by the polling
+            # announce (bus path) — never re-announce them.
+            announced_tool_pids: set[str] = set()
+            pending_done = False
+            session_busy = True  # assume working until a status event says idle
+            seen_question_pids: set[str] = set()
+            running_question_times: list[float] = []
+            if resumed:
+                # Seed part state for the resumed conversation so the
+                # polling fallback never replays history or re-surfaces a
+                # stale question that kills the stream.  Best-effort.  The
+                # seeding also records running-question start times (the
+                # orphan check below uses them — no extra message-list GET,
+                # so the seeded read stays the FIRST one).
+                await _seed_resumed_session_state(
+                    client, session_id, user_mids, text_lens,
+                    tool_state, seen_question_pids, running_question_times,
+                )
+            # A pending QUESTION from the previous turn: the agent is
+            # waiting on the user (the question tool parks the current
+            # step).  The user's message IS the answer — post it to the
+            # serve's question reply endpoint so the tool completes and
+            # the agent continues with the answer in context.  Posting
+            # the answer as a new prompt instead leaves the step
+            # blocked forever (observed live 2026-08-14: a
+            # 'notification channel' question stayed running 8+ minutes
+            # across 5 user messages that all only got keepalives).
+            if session_id:
+                if pending_question_id and pending_question_count:
+                    await _post_question_answer(
+                        client, session_id, pending_question_id, user_text,
+                        pending_question_count,
+                    )
+                    skip_prompt = True
+                elif (
+                    running_question_times
+                    and time.time() * 1000 - max(running_question_times) > 60_000
+                ):
+                    # The question part is parked in "running" but the
+                    # serve holds NO pending request for it — the
+                    # question is orphaned (serve recycled or the ask
+                    # was lost) and can never be answered.  Abort and
+                    # start fresh; the resilient wrapper retries the
+                    # full task.
+                    logger.warning(
+                        "orphaned pending question in session %s — aborting and starting fresh",
+                        session_id[:16],
+                    )
+                    await _abort_stream_session_best_effort(
+                        client, session_id,
+                        session_map=session_map, session_key=session_key,
+                        pending_permissions=pending_permissions,
+                    )
+                    session_id = None
             if not session_id:
                 resp = await client.post(
                     f"{OPENCODE_SERVE_URL}/session",
@@ -1092,36 +1165,19 @@ async def opencode_chat_stream(
                     "providerID": provider_id,
                     "variant": "default",
                 }
-
-            user_mids: set[str] = set()
-            asst_mid: Optional[str] = None
-            text_lens: dict[str, int] = {}
-            tool_state: dict[str, str] = {}
-            # Tool parts already surfaced as a 🔧 status by the polling
-            # announce (bus path) — never re-announce them.
-            announced_tool_pids: set[str] = set()
-            pending_done = False
-            session_busy = True  # assume working until a status event says idle
-            seen_question_pids: set[str] = set()
-            if resumed:
-                # Seed part state for the resumed conversation so the
-                # polling fallback never replays history or re-surfaces a
-                # stale question that kills the stream.  Best-effort.
-                await _seed_resumed_session_state(
-                    client, session_id, user_mids, text_lens,
-                    tool_state, seen_question_pids,
-                )
             # Open the event bus BEFORE sending the message: the bus is
             # fire-and-forget (no replay), so connecting after prompt_async
             # misses the early events (user message, assistant start, first
             # reasoning/tool parts) and the stream would look empty.
             async with client.stream("GET", f"{OPENCODE_SERVE_URL}/event") as ev:
-                async_resp = await client.post(
-                    f"{OPENCODE_SERVE_URL}/session/{session_id}/prompt_async",
-                    json=payload,
-                    timeout=30.0,
-                )
-                if async_resp.status_code != 204:
+                async_resp = None
+                if not skip_prompt:
+                    async_resp = await client.post(
+                        f"{OPENCODE_SERVE_URL}/session/{session_id}/prompt_async",
+                        json=payload,
+                        timeout=30.0,
+                    )
+                if async_resp is not None and async_resp.status_code != 204:
                     # Session was created and pinned before this POST — do
                     # not leak it on a failed prompt.
                     await _abort_stream_session_best_effort(
@@ -1508,6 +1564,68 @@ async def opencode_chat_stream(
                     pending_permissions=pending_permissions,
                 )
             yield ("status", f"[OpenCode Bridge Network Error: {str(exc)}]")
+
+
+async def _find_pending_question(
+    client: httpx.AsyncClient,
+    session_id: str,
+) -> tuple[Optional[str], int]:
+    """Look up a pending question request owned by ``session_id``.
+
+    The agent's question tool parks the session's current step until the
+    user answers (POST /question/<id>/reply).  The serve keeps pending
+    question requests in memory and lists them at GET /question; the
+    entry carries the request id needed for the reply.  Never raises;
+    returns (request_id, question_count) or (None, 0).
+    """
+    try:
+        resp = await client.get(f"{OPENCODE_SERVE_URL}/question", timeout=10.0)
+        if resp.status_code != 200:
+            return None, 0
+        for entry in resp.json():
+            if entry.get("sessionID") == session_id:
+                qs = entry.get("questions") or []
+                return str(entry.get("id") or ""), len(qs)
+    except (httpx.HTTPError, OSError, ValueError):
+        pass
+    return None, 0
+
+
+async def _post_question_answer(
+    client: httpx.AsyncClient,
+    session_id: str,
+    question_id: str,
+    answer: str,
+    question_count: int,
+) -> bool:
+    """POST the user's answer to the serve's question reply endpoint.
+
+    The question tool completes with the answer and the agent continues
+    with it in context.  Returns True when the serve accepted the reply.
+    """
+    try:
+        resp = await client.post(
+            f"{OPENCODE_SERVE_URL}/question/{question_id}/reply",
+            json={"answers": [[answer] for _ in range(max(1, question_count))]},
+            timeout=15.0,
+        )
+        if 200 <= resp.status_code < 300:
+            logger.info(
+                "Answered pending question %s for session %s",
+                question_id[:16], session_id[:16],
+            )
+            return True
+        logger.warning(
+            "Question reply %s -> HTTP %s (session %s)",
+            question_id[:16], resp.status_code, session_id[:16],
+        )
+    except (httpx.HTTPError, OSError, ValueError):
+        logger.warning(
+            "Question reply failed for session %s", session_id[:16], exc_info=True,
+        )
+    return False
+
+
 
 
 async def opencode_chat_stream_resilient(
@@ -2055,6 +2173,7 @@ async def _seed_resumed_session_state(
     text_lens: dict[str, int],
     tool_state: dict[str, str],
     seen_question_pids: set[str],
+    running_question_times: Optional[list[float]] = None,
 ) -> None:
     """Best-effort seed of per-call part state for a RESUMED pinned session.
 
@@ -2066,6 +2185,10 @@ async def _seed_resumed_session_state(
     question part ids) once before the prompt lets the polling deltas
     suppress everything that existed BEFORE this request.  Never raises:
     a failed seed degrades to the current replay behavior.
+
+    ``running_question_times`` (optional list) collects the start times of
+    any question tool parts still parked in "running" — the orphaned-
+    question check uses them without a second message-list GET.
     """
     try:
         resp = await client.get(
@@ -2096,6 +2219,11 @@ async def _seed_resumed_session_state(
                             tool_state[pid] = status
                         if p.get("tool") == "question" and pid:
                             seen_question_pids.add(pid)
+                            if running_question_times is not None and status == "running":
+                                start = (p.get("state") or {}).get("time") or {}
+                                s = start.get("start")
+                                if s is not None:
+                                    running_question_times.append(float(s))
     except (httpx.HTTPError, OSError, ValueError):
         return
 

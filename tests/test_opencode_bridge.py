@@ -3683,6 +3683,124 @@ class TestCatchUpPoll:
         assert ("text", "I will now inspect the log.") in deltas, deltas
 
 
+class _QuestionClient(_FakeClient):
+    """Fake with scripted pending-question responses."""
+
+    def __init__(self, question_entry: Optional[dict[str, Any]]) -> None:
+        super().__init__()
+        self.question_entry = question_entry
+        self.orphan_part = False  # running question part with an OLD start
+
+    async def get(self, url: str, **kwargs: Any) -> _FakeResp:
+        if url.endswith("/question"):
+            return _FakeResp(200, [self.question_entry] if self.question_entry else [])
+        if self.orphan_part and url.endswith(f"/session/{self.session_id}/message"):
+            return _FakeResp(200, [_assistant_msg([
+                {
+                    "id": "prt_q", "type": "tool", "tool": "question",
+                    "state": {
+                        "status": "running",
+                        "input": {"questions": [{"question": "Which channel?"}]},
+                        "time": {"start": (time.time() - 120) * 1000},
+                    },
+                },
+            ])])
+        return await super().get(url, **kwargs)
+
+
+class TestPendingQuestion:
+    """The bridge must ANSWER a pending question on resume (the user's
+    message is the answer, posted to /question/<id>/reply) instead of
+    posting it as a new prompt into the blocked step — and must abort an
+    ORPHANED question (running part with no serve-side pending request)
+    that can never be answered.  Both observed live 2026-08-14: a
+    'notification channel' question stayed running 8+ minutes across 5
+    user messages that only got keepalives."""
+
+    @pytest.mark.asyncio
+    async def test_resume_answers_pending_question(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        async def _noop(*args: Any, **kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        monkeypatch.setattr(opencode_bridge, "_recycle_serve_if_low_memory", _noop)
+        monkeypatch.setattr(opencode_bridge, "_EVENT_QUIET_TIMEOUT", 0.05)
+        monkeypatch.setattr(opencode_bridge, "_EVENT_FINAL_TIMEOUT", 0.05)
+
+        client = _QuestionClient({
+            "id": "q_0001", "sessionID": "ses_0001",
+            "questions": [{"question": "Which channel?"}],
+        })
+        client.stream_lines = []
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        smap: dict[str, str] = {"conv-1": "ses_0001"}
+        _ = [
+            d async for d in opencode_chat_stream(
+                "ntfy", session_map=smap, session_key="conv-1", timeout=0.5,
+            )
+        ]
+
+        reply_posts = [
+            (u, b) for u, b in client.post_calls
+            if u.endswith("/question/q_0001/reply")
+        ]
+        assert len(reply_posts) == 1, client.post_calls
+        assert reply_posts[0][1] == {"answers": [["ntfy"]]}
+        # The answer is the question reply — NO new prompt is posted into
+        # the blocked session.
+        assert not any("/prompt_async" in u for u, _ in client.post_calls)
+
+    @pytest.mark.asyncio
+    async def test_resume_aborts_orphaned_question_and_starts_fresh(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        async def _noop(*args: Any, **kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        monkeypatch.setattr(opencode_bridge, "_recycle_serve_if_low_memory", _noop)
+        monkeypatch.setattr(opencode_bridge, "_EVENT_QUIET_TIMEOUT", 0.05)
+        monkeypatch.setattr(opencode_bridge, "_EVENT_FINAL_TIMEOUT", 0.05)
+
+        client = _QuestionClient(None)  # no serve-side pending request
+        client.orphan_part = True
+        client.stream_lines = [*_stream_events()]  # fresh session runs fine
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        smap: dict[str, str] = {"conv-1": "ses_0001"}
+        deltas = [
+            d async for d in opencode_chat_stream(
+                "redo the task", session_map=smap, session_key="conv-1", timeout=2.0,
+            )
+        ]
+
+        # The orphaned session was aborted (and the pin re-set to the
+        # fresh session by the create path below).
+        assert any(u.endswith("/session/ses_0001/abort") for u, _ in client.post_calls)
+        # The task was re-run on a fresh session with the user text.
+        prompts = [b for u, b in client.post_calls if "/prompt_async" in u]
+        assert len(prompts) == 1
+        assert any(
+            (p.get("parts") or [{}])[0].get("text") == "redo the task"
+            for p in prompts
+        )
+        text = [t for k, t in deltas if k == "text"]
+        assert "Created file." in text and "Done." in text
+
+
 class TestResilientStream:
     """``opencode_chat_stream_resilient``: one auto-retry on a fresh serve
     when the first attempt dies silently (the serve's tool runner fails at

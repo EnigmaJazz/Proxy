@@ -195,6 +195,12 @@ OPENCODE_WORKSPACE_DIR: str = _machine(
 # hosts the OpenSpec SDD store) instead of the scratch workspace.
 OPENCODE_BRIDGE_DIRECTORY: str = _machine("OPENCODE_BRIDGE_DIRECTORY", _REPO_ROOT)
 
+# Directory the SDD-AUTONOMOUS sessions run in.  The full-SDD-cycle path
+# operates on the OpenSpec store + repo, which lives in the proxy repo
+# (NOT the nanobot workspace the plain bridge sessions use).  Machine
+# override via local_config.OPENCODE_SDD_DIRECTORY.
+OPENCODE_SDD_DIRECTORY: str = _machine("OPENCODE_SDD_DIRECTORY", _REPO_ROOT)
+
 # Absolute path to the opencode binary.  systemd services run with a
 # minimal PATH that does not include ~/.opencode/bin, so the bridge spawn
 # must not rely on PATH resolution.

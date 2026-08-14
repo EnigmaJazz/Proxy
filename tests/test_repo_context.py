@@ -4,15 +4,37 @@ The professional model has no tools and no visibility of the opencode
 agents' work (the session text is out of reach), so a future
 conversation can't pick up the code.  The proxy captures completed
 opencode tasks (summary + working-tree snapshot) and appends a compact
-repo-state block to the OUTBOUND system message (R1 carve-out,
-2026-08-14).  Opt out per request with ``X-Proxy-Repo-Context: off``.
+repo-state block (including the work files' CONTENT) to the OUTBOUND
+system message (R1 carve-out, 2026-08-14).  The block reads the bridge
+directory (OPENCODE_BRIDGE_DIRECTORY — the nanobot workspace).  Opt
+out per request with ``X-Proxy-Repo-Context: off``.
 """
 from __future__ import annotations
 
+import subprocess
 import types
 from typing import Any
 
 import pytest
+
+
+@pytest.fixture
+def work_repo(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
+    """A real temp git repo standing in for the bridge directory (the
+    nanobot workspace).  routes.OPENCODE_BRIDGE_DIRECTORY is patched to it
+    so the capture/block/content reads are hermetic."""
+    import routes
+
+    repo = tmp_path / "work"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "t"], check=True)
+    (repo / "base.py").write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+    monkeypatch.setattr(routes, "OPENCODE_BRIDGE_DIRECTORY", str(repo))
+    return repo
 
 
 def _govern(msgs: list[dict[str, Any]], headers: dict[str, str]) -> Any:
@@ -26,9 +48,10 @@ def _govern(msgs: list[dict[str, Any]], headers: dict[str, str]) -> Any:
 class TestRepoContextCapture:
     """Completed opencode tasks are captured with their repo snapshot."""
 
-    def test_capture_stores_summary_and_tree(self) -> None:
+    def test_capture_stores_summary_and_tree(self, work_repo: Any) -> None:
         import routes
 
+        (work_repo / "work.py").write_text("def work(): pass\n", encoding="utf-8")
         routes._RECENT_OPENCODE_WORK.clear()
         try:
             routes._capture_opencode_work(
@@ -39,7 +62,7 @@ class TestRepoContextCapture:
             assert "The task is complete." in entry["summary"]
             # The working-tree snapshot reflects the agent's files (the
             # repo is the shared artifact between the two pathways).
-            assert "scripts/monitor_local_model_tokens.py" in entry["status"]
+            assert "work.py" in entry["status"]
         finally:
             routes._RECENT_OPENCODE_WORK.clear()
 
@@ -70,7 +93,7 @@ class TestRepoContextInjection:
     position), with the per-request opt-out."""
 
     @pytest.mark.asyncio
-    async def test_appended_by_default(self) -> None:
+    async def test_appended_by_default(self, work_repo: Any) -> None:
         import routes
 
         routes._RECENT_OPENCODE_WORK.clear()
@@ -91,7 +114,7 @@ class TestRepoContextInjection:
             routes._RECENT_OPENCODE_WORK.clear()
 
     @pytest.mark.asyncio
-    async def test_opt_out(self) -> None:
+    async def test_opt_out(self, work_repo: Any) -> None:
         import routes
 
         routes._RECENT_OPENCODE_WORK.clear()
@@ -108,7 +131,7 @@ class TestRepoContextInjection:
 
     @pytest.mark.asyncio
     async def test_quiet_without_captured_work_still_injects_live_state(
-        self,
+        self, work_repo: Any,
     ) -> None:
         import routes
 
@@ -169,3 +192,11 @@ class TestRepoContentSection:
         # the section stays quiet for tracked modifications.
         out = self._section("M ROUTER-LOG.md", tmp_path)
         assert out == ""
+
+    def test_nanobot_internal_state_skipped(self, tmp_path: Any) -> None:
+        (tmp_path / "memory").mkdir()
+        (tmp_path / "memory" / "history.jsonl").write_text("private", encoding="utf-8")
+        (tmp_path / "SOUL.md").write_text("soul content", encoding="utf-8")
+        out = self._section("?? memory/history.jsonl\n?? SOUL.md", tmp_path)
+        assert "history.jsonl" not in out
+        assert "[File: SOUL.md]" in out

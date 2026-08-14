@@ -49,6 +49,8 @@ from constants import (
     MODEL_LABELS,
     OPENCODE_AGENT,
     OPENCODE_SDD_TIMEOUT,
+    OPENCODE_SDD_DIRECTORY,
+    OPENCODE_BRIDGE_DIRECTORY,
     OPENCODE_SERVE_TIMEOUT,
     RUNTIME_CONTEXT_WINDOWS,
     get_logger,
@@ -622,7 +624,7 @@ def _capture_opencode_work(text_parts: list[str]) -> None:
     summary = "".join(text_parts).strip()
     if not summary:
         return
-    repo = Path(__file__).resolve().parent
+    repo = Path(OPENCODE_BRIDGE_DIRECTORY)
     status = diffstat = log = ""
     try:
         status = subprocess.check_output(
@@ -667,7 +669,7 @@ def _repo_context_block() -> str:
             parts.append(f"Files it changed:\n{entry['status']}")
         if entry["diffstat"]:
             parts.append(entry["diffstat"])
-    repo = Path(__file__).resolve().parent
+    repo = Path(OPENCODE_BRIDGE_DIRECTORY)
     status = log = ""
     try:
         status = subprocess.check_output(
@@ -697,6 +699,14 @@ _MAX_FILE_LINES = 400
 _MAX_DIFF_LINES = 300
 _MAX_CONTENT_LINES = 800
 
+#: Nanobot-internal state dirs in the workspace — never injected into the
+#: model's system prompt (noise + the conversation memory is private to
+#: nanobot).  The shared context is SOUL.md/USER.md/AGENTS.md and the
+#: agents' real work files.
+_NANOBOT_INTERNAL_PREFIXES = (
+    ".nanobot/", "memory/", "logs/", "media/", "backups/", "history/",
+)
+
 
 def _repo_content_section(
     status: str,
@@ -706,15 +716,15 @@ def _repo_content_section(
     local model can understand and edit them: untracked files in full
     (they have no diff), tracked modifications as working-tree diffs.
     Bounded per file and by a total line budget; oversized/binary files
-    are skipped.
+    and nanobot-internal state dirs are skipped.
     """
-    repo = repo or Path(__file__).resolve().parent
+    repo = repo or Path(OPENCODE_BRIDGE_DIRECTORY)
     lines_out: list[str] = []
     budget = _MAX_CONTENT_LINES
     for line in status.splitlines():
         st, _, path = line.partition(" ")
         path = path.strip()
-        if not path:
+        if not path or any(path.startswith(p) for p in _NANOBOT_INTERNAL_PREFIXES):
             continue
         full = repo / path
         if st.startswith("??"):
@@ -2617,6 +2627,7 @@ async def _opencode_task_response(
     system_prompt: str = _BRIDGE_SYSTEM_PROMPT,
     timeout: float = OPENCODE_SERVE_TIMEOUT,
     autonomous: bool = False,
+    directory: Optional[str] = None,
 ) -> Response:
     """Run a task through the opencode bridge and return the response.
 
@@ -2639,6 +2650,14 @@ async def _opencode_task_response(
         )
 
     async def _stream() -> AsyncIterator[str]:
+        # The SDD-autonomous path operates on the OpenSpec store in the
+        # proxy repo, NOT the nanobot workspace the plain bridge sessions
+        # use — default the directory per mode.
+        stream_directory = directory
+        if stream_directory is None:
+            stream_directory = (
+                OPENCODE_SDD_DIRECTORY if autonomous else OPENCODE_BRIDGE_DIRECTORY
+            )
         # The status line carries the TASK's identity so the stream can be
         # discriminated from any other task asked in the meantime: the SDD
         # change name (when the task text declares one) plus the task's
@@ -2663,6 +2682,7 @@ async def _opencode_task_response(
             system_prompt=system_prompt,
             timeout=timeout,
             autonomous=autonomous,
+            directory=stream_directory,
         ):
             if kind == "text" and text_delta:
                 _resp_text.append(text_delta)
@@ -2722,6 +2742,11 @@ async def _opencode_task_response(
     # handling behave identically (a plain opencode_chat here would create a
     # fresh session and orphan the pin / parked permission).
     resp_parts: list[str] = []
+    stream_directory = directory
+    if stream_directory is None:
+        stream_directory = (
+            OPENCODE_SDD_DIRECTORY if autonomous else OPENCODE_BRIDGE_DIRECTORY
+        )
     async for kind, text_delta in opencode_chat_stream_resilient(
         task_text,
         agent=OPENCODE_AGENT,
@@ -2732,6 +2757,7 @@ async def _opencode_task_response(
         system_prompt=system_prompt,
         timeout=timeout,
         autonomous=autonomous,
+        directory=stream_directory,
     ):
         if kind == "text" and text_delta:
             resp_parts.append(text_delta)

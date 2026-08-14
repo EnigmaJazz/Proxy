@@ -1130,6 +1130,7 @@ class TestRoutesOpenCode:
             system_prompt: str = "",
             timeout: float = 600.0,
             autonomous: bool = False,
+            directory: Optional[str] = None,
         ) -> AsyncIterator[tuple[str, str]]:
             captured.append(text)
             yield ("text", "BRIDGE_DONE")
@@ -1161,6 +1162,7 @@ class TestRoutesOpenCode:
             system_prompt: str = "",
             timeout: float = 600.0,
             autonomous: bool = False,
+            directory: Optional[str] = None,
         ) -> AsyncIterator[tuple[str, str]]:
             yield ("text", "STREAMED_")
             yield ("text", "DONE")
@@ -1207,6 +1209,7 @@ class TestRoutesOpenCode:
             system_prompt: str = "",
             timeout: float = 600.0,
             autonomous: bool = False,
+            directory: Optional[str] = None,
         ) -> AsyncIterator[tuple[str, str]]:
             seen["system_prompt"] = system_prompt
             seen["timeout"] = timeout
@@ -1251,6 +1254,7 @@ class TestRoutesOpenCode:
             system_prompt: str = "",
             timeout: float = 600.0,
             autonomous: bool = False,
+            directory: Optional[str] = None,
         ) -> AsyncIterator[tuple[str, str]]:
             seen["system_prompt"] = system_prompt
             seen["timeout"] = timeout
@@ -1287,6 +1291,7 @@ class TestRoutesOpenCode:
             system_prompt: str = "",
             timeout: float = 600.0,
             autonomous: bool = False,
+            directory: Optional[str] = None,
         ) -> AsyncIterator[tuple[str, str]]:
             captured.append(text)
             yield ("text", "CMD_DONE")

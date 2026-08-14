@@ -788,6 +788,7 @@ async def opencode_chat(
     timeout: float = OPENCODE_SERVE_TIMEOUT,
     system_prompt: str = _BRIDGE_SYSTEM_PROMPT,
     autonomous: bool = False,
+    directory: Optional[str] = None,
 ) -> str:
     """Send a task to headless opencode and return the assistant text.
 
@@ -817,6 +818,7 @@ async def opencode_chat(
             client, user_text, agent=agent, model_id=model_id,
             provider_id=provider_id, timeout=timeout,
             system_prompt=system_prompt, autonomous=autonomous,
+            directory=directory,
         )
         if not network_failed:
             return text
@@ -830,6 +832,7 @@ async def opencode_chat(
             client, user_text, agent=agent, model_id=model_id,
             provider_id=provider_id, timeout=timeout,
             system_prompt=system_prompt, autonomous=autonomous,
+            directory=directory,
         )
         return text
 
@@ -844,6 +847,7 @@ async def _opencode_chat_attempt(
     timeout: float,
     system_prompt: str,
     autonomous: bool,
+    directory: Optional[str] = None,
 ) -> tuple[str, bool]:
     """One blocking attempt: create session, POST with permission polling,
     extract text.
@@ -857,7 +861,7 @@ async def _opencode_chat_attempt(
         # ---- 1. Create a fresh session --------------------------------
         resp = await client.post(
             f"{OPENCODE_SERVE_URL}/session",
-            params={"directory": OPENCODE_BRIDGE_DIRECTORY},
+            params={"directory": directory or OPENCODE_BRIDGE_DIRECTORY},
             timeout=30.0,
         )
         if resp.status_code != 200:
@@ -960,6 +964,7 @@ async def opencode_chat_stream(
     system_prompt: str = _BRIDGE_SYSTEM_PROMPT,
     timeout: float = OPENCODE_SERVE_TIMEOUT,
     autonomous: bool = False,
+    directory: Optional[str] = None,
 ) -> AsyncIterator[tuple[str, str]]:
     """Stream a task through headless opencode, yielding assistant content live.
 
@@ -1153,7 +1158,7 @@ async def opencode_chat_stream(
             if not session_id:
                 resp = await client.post(
                     f"{OPENCODE_SERVE_URL}/session",
-                    params={"directory": OPENCODE_BRIDGE_DIRECTORY},
+                    params={"directory": directory or OPENCODE_BRIDGE_DIRECTORY},
                     timeout=30.0,
                 )
                 if resp.status_code != 200:

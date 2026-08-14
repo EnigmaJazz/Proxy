@@ -34,9 +34,10 @@ PROJECT_ROOT: Path = Path(__file__).resolve().parent
 RUNTIME_CONTEXT_WINDOWS: dict[str, int] = {
     "frontdesk": 12_288,
     "chatter": 32_768,
-    # The Nail cutover (2026-08-13) lowered the professional's server
-    # context to 65536 (VRAM-bound); 131072 was the pre-cutover value.
-    "professional": 65_536,
+    # 131072 since 2026-08-14: the context bump (-c 131072, KV quants
+    # unchanged) fits because --fit on rebalances model layers to CPU;
+    # load-time VRAM ~12.5GB of 12.87GB.  65536 was the pre-bump value.
+    "professional": 131_072,
     "scholar": 32_768,
     "creative": 32_768,
     "architect": 32_768,

@@ -651,9 +651,12 @@ def _capture_opencode_work(text_parts: list[str]) -> None:
 
 def _repo_context_block() -> str:
     """Compact repo-state block for the professional's system message: the
-    most recent opencode tasks (summary + files) plus the current
-    working-tree/commit state.  Bounded (<~2k tokens); the live git calls
-    are cheap and the block is cache-stable between repo changes.
+    most recent opencode tasks (summary + files), the CONTENT of the work
+    files (untracked files in full, tracked changes as diffs — the model
+    has no tools, so this is its only way to read and edit them), plus the
+    current working-tree/commit state.  Bounded (per-file line caps + a
+    total budget); the live git/file reads are cheap and the block is
+    cache-stable between repo changes.
     """
     parts: list[str] = []
     for entry in _RECENT_OPENCODE_WORK[-_MAX_RECENT_WORK:]:
@@ -678,10 +681,82 @@ def _repo_context_block() -> str:
     except (subprocess.SubprocessError, OSError):
         pass
     if status:
+        content_section = _repo_content_section(status, repo=repo)
+        if content_section:
+            parts.append(
+                "[OpenCode work files — read them to understand and edit the code]"
+            )
+            parts.append(content_section)
         parts.append(f"[Current working tree]\n{status}")
     if log:
         parts.append(f"[Recent commits]\n{log}")
     return "\n\n".join(parts) if parts else ""
+
+
+_MAX_FILE_LINES = 400
+_MAX_DIFF_LINES = 300
+_MAX_CONTENT_LINES = 800
+
+
+def _repo_content_section(
+    status: str,
+    repo: Optional[Path] = None,
+) -> str:
+    """Read the opencode work files into the repo-context block so the
+    local model can understand and edit them: untracked files in full
+    (they have no diff), tracked modifications as working-tree diffs.
+    Bounded per file and by a total line budget; oversized/binary files
+    are skipped.
+    """
+    repo = repo or Path(__file__).resolve().parent
+    lines_out: list[str] = []
+    budget = _MAX_CONTENT_LINES
+    for line in status.splitlines():
+        st, _, path = line.partition(" ")
+        path = path.strip()
+        if not path:
+            continue
+        full = repo / path
+        if st.startswith("??"):
+            try:
+                if not full.is_file() or full.stat().st_size > 200_000:
+                    continue
+                content = full.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            clines = content.splitlines()
+            capped = clines[:_MAX_FILE_LINES]
+            lines_out.append(f"[File: {path}]")
+            lines_out.extend(capped)
+            if len(clines) > len(capped):
+                lines_out.append(
+                    f"... ({len(clines) - len(capped)} more lines truncated)"
+                )
+            budget -= len(capped) + 2
+        elif st.strip().startswith(("M", "A")):
+            try:
+                diff = subprocess.check_output(
+                    ["git", "-C", str(repo), "diff", "--", path],
+                    text=True, timeout=10,
+                )
+                if path not in diff:
+                    diff = subprocess.check_output(
+                        ["git", "-C", str(repo), "diff", "--cached", "--", path],
+                        text=True, timeout=10,
+                    )
+            except subprocess.SubprocessError:
+                diff = ""
+            dl = diff.splitlines()
+            if dl:
+                capped = dl[:_MAX_DIFF_LINES]
+                lines_out.append(f"[Diff: {path}]")
+                lines_out.extend(capped)
+                budget -= len(capped) + 2
+        if budget <= 0:
+            lines_out.append("... (file-content budget exhausted)")
+            break
+    return "\n".join(lines_out)
+
 
 
 async def _inject_repo_context(

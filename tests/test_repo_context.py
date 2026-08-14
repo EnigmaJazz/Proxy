@@ -122,3 +122,50 @@ class TestRepoContextInjection:
             assert "[Recent commits]" in out[0]["content"]
         finally:
             routes._RECENT_OPENCODE_WORK.clear()
+
+
+class TestRepoContentSection:
+    """The work files' CONTENT lands in the block — the local model's only
+    way to read and edit them (it has no tools)."""
+
+    def _section(self, status: str, repo: Any) -> str:
+        from routes import _repo_content_section
+        return _repo_content_section(status, repo=repo)
+
+    def test_untracked_file_content_included(self, tmp_path: Any) -> None:
+        f = tmp_path / "scripts"
+        f.mkdir()
+        (f / "monitor.py").write_text(
+            "#!/usr/bin/env python3\n\ndef main() -> None:\n    print('hi')\n",
+            encoding="utf-8",
+        )
+        out = self._section("?? scripts/monitor.py", tmp_path)
+        assert "[File: scripts/monitor.py]" in out
+        assert "def main() -> None:" in out
+        assert "print('hi')" in out
+
+    def test_oversized_untracked_file_skipped(self, tmp_path: Any) -> None:
+        f = tmp_path / "scripts"
+        f.mkdir()
+        big = f / "huge.bin"
+        big.write_bytes(b"\x00" * 300_000)
+        out = self._section("?? scripts/huge.bin", tmp_path)
+        assert out == ""
+
+    def test_truncation_marker(self, tmp_path: Any) -> None:
+        f = tmp_path / "scripts"
+        f.mkdir()
+        long_file = f / "long.py"
+        long_file.write_text(
+            "\n".join(f"line {i}" for i in range(500)), encoding="utf-8",
+        )
+        out = self._section("?? scripts/long.py", tmp_path)
+        assert "more lines truncated" in out
+        assert "line 399" in out
+        assert "line 499" not in out
+
+    def test_modified_tracked_file_diff_included(self, tmp_path: Any) -> None:
+        # tmp_path is not a git repo — the diff call fails gracefully and
+        # the section stays quiet for tracked modifications.
+        out = self._section("M ROUTER-LOG.md", tmp_path)
+        assert out == ""

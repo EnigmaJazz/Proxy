@@ -34,11 +34,14 @@ PROJECT_ROOT: Path = Path(__file__).resolve().parent
 RUNTIME_CONTEXT_WINDOWS: dict[str, int] = {
     "frontdesk": 12_288,
     "chatter": 32_768,
-    "professional": 131_072,
+    # The Nail cutover (2026-08-13) lowered the professional's server
+    # context to 65536 (VRAM-bound); 131072 was the pre-cutover value.
+    "professional": 65_536,
     "scholar": 32_768,
     "creative": 32_768,
     "architect": 32_768,
-    "coder": 32_768,
+    # The Qwen3.8 cutover aligns the coder's -c with the professional.
+    "coder": 65_536,
 }
 
 # ---------------------------------------------------------------------------

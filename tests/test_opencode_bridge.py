@@ -3490,6 +3490,8 @@ class TestRunningToolAnnounce:
         assert "WORK CONTINUITY" in prompt
         assert "Never end your turn after a step" in prompt
         assert "continue-pings" in prompt
+        assert "NARRATE" in prompt
+        assert "Never run a tool in silence" in prompt
 
     @pytest.mark.asyncio
     async def test_keepalive_announces_running_tool_from_message_list(
@@ -3618,6 +3620,67 @@ class TestServeConfigTemplate:
         assert '"write": "allow"' in head
         assert '"edit": "allow"' in head
         assert '"webfetch": "allow"' in head
+
+
+class _DroppedTextClient(_FakeClient):
+    """Bus stays open and silent; the message list carries a text part
+    whose SSE event never arrived (the upstream drop)."""
+
+    async def get(self, url: str, **kwargs: Any) -> _FakeResp:
+        if url.endswith(f"/session/{self.session_id}/message"):
+            return _FakeResp(200, [_assistant_msg([
+                {"id": "prt_txt", "type": "text",
+                 "text": "I will now inspect the log."},
+            ])])
+        if url.endswith("/permission"):
+            return _FakeResp(200, [])
+        return await super().get(url, **kwargs)
+
+
+class TestCatchUpPoll:
+    """While the SSE bus is open, dropped part events (upstream #35066)
+    must be caught up from the message list so the user receives the
+    agent's narration live instead of on the next continue."""
+
+    @pytest.mark.asyncio
+    async def test_quiet_path_delivers_dropped_text_from_message_list(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        async def _noop(*args: Any, **kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        monkeypatch.setattr(opencode_bridge, "_recycle_serve_if_low_memory", _noop)
+        monkeypatch.setattr(opencode_bridge, "_detect_wedged_tool", lambda *a: False)
+        monkeypatch.setattr(opencode_bridge, "_EVENT_QUIET_TIMEOUT", 0.05)
+        monkeypatch.setattr(opencode_bridge, "_EVENT_FINAL_TIMEOUT", 0.05)
+        monkeypatch.setattr(opencode_bridge, "_WEDGE_CHECK_INTERVAL_S", 0.05)
+        monkeypatch.setattr(opencode_bridge, "_ANNOUNCE_CHECK_INTERVAL_S", 0.05)
+
+        client = _DroppedTextClient()
+        # User + assistant message events arrive, the TEXT part's event
+        # never does; the bus stays open (silence).
+        client.stream_lines = [
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_u", "role": "user"}),
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_a", "role": "assistant"}),
+        ]
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        smap: dict[str, str] = {}
+        deltas = [
+            d async for d in opencode_chat_stream(
+                "task", session_map=smap, session_key="conv-1", timeout=1.0,
+            )
+        ]
+
+        assert ("text", "I will now inspect the log.") in deltas, deltas
 
 
 class TestResilientStream:

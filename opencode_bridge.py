@@ -68,6 +68,10 @@ _BRIDGE_SYSTEM_PROMPT = (
     "clarifying question (the user CAN answer in their next message and "
     "the same session resumes).  When the task is ambiguous, make "
     "reasonable assumptions, state them briefly, and continue.\n\n"
+    "NARRATE (MANDATORY): before each step, tell the user in one short "
+    "sentence what you are doing and why; after each step, tell them what "
+    "happened in one short sentence.  Never run a tool in silence — a "
+    "silent tool run looks like a dead stream to the user.\n\n"
     "TOOL RULES (MANDATORY): the headless tool runner can wedge indefinitely "
     "on glob/grep/read calls (their completion never arrives, stranding the "
     "task).  Prefer `bash` for discovery and reading — `ls`, `find`, `sed`, "
@@ -1393,6 +1397,25 @@ async def opencode_chat_stream(
                             )
                             if announce:
                                 yield ("status", announce)
+                        # Catch-up poll: the serve's SSE drops events
+                        # (upstream #35066 — text and tool deltas vanish
+                        # while the bus stays open), so the user missed the
+                        # agent's narration until the next poll/continue.
+                        # The message list holds the parts; poll on quiet
+                        # timeouts (deduped by part id/length) and deliver
+                        # them live.  New content also keeps the stream
+                        # open while the agent keeps working.
+                        async for delta in _poll_session_deltas(
+                            client, session_id, user_mids, text_lens, tool_state,
+                            seen_question_pids,
+                        ):
+                            if delta[0] == "question":
+                                yield delta
+                                return
+                            if delta[0] == "_step_finish":
+                                pending_done = True
+                                continue
+                            yield delta
                         # Keep the client connection alive during long tool
                         # phases (and show the agent is still working).
                         yield ("status", "⏳ still working…")

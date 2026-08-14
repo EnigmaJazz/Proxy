@@ -3480,11 +3480,16 @@ class TestRunningToolAnnounce:
     @pytest.mark.asyncio
     async def test_bridge_prompt_carries_tool_rules(self) -> None:
         """The bridge prompt forbids relying on glob/grep/read (the serve's
-        tool runner wedges on them) and mandates the bash-first + retry-once
-        rules that keep the plain opencode path alive."""
+        tool runner wedges on them), mandates the bash-first + retry-once
+        rules, and requires work CONTINUITY (the model otherwise ends its
+        turn after every step and the user must ping \"continue\" ~65 times
+        per task — observed live 2026-08-14)."""
         prompt = opencode_bridge._BRIDGE_SYSTEM_PROMPT
         assert "glob" in prompt and "grep" in prompt
         assert "`bash`" in prompt and "retry it ONCE" in prompt
+        assert "WORK CONTINUITY" in prompt
+        assert "Never end your turn after a step" in prompt
+        assert "continue-pings" in prompt
 
     @pytest.mark.asyncio
     async def test_keepalive_announces_running_tool_from_message_list(

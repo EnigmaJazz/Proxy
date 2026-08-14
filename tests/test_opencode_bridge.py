@@ -3801,6 +3801,91 @@ class TestPendingQuestion:
         assert "Created file." in text and "Done." in text
 
 
+class _BlockingStream(_FakeStream):
+    """Yields the scripted lines then blocks forever — keeps the event
+    bus OPEN so the bus path's TimeoutError handler runs (instead of the
+    bus closing into the polling fallback)."""
+
+    async def aiter_lines(self) -> AsyncIterator[str]:
+        for line in self._lines:
+            yield line
+            await asyncio.sleep(0)
+        await asyncio.Event().wait()
+
+
+class _IdleGraceClient(_FakeClient):
+    """Bus open; message list carries a text part the SSE never delivered."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.lines: list[str] = []
+
+    def stream(self, *args: Any, **kwargs: Any) -> _BlockingStream:
+        return _BlockingStream(self.lines)
+
+    async def get(self, url: str, **kwargs: Any) -> _FakeResp:
+        if url.endswith(f"/session/{self.session_id}/message"):
+            return _FakeResp(200, [_assistant_msg([
+                {"id": "prt_new", "type": "text",
+                 "text": "next step narration"},
+            ])])
+        if url.endswith("/permission"):
+            return _FakeResp(200, [])
+        return await super().get(url, **kwargs)
+
+
+class TestIdleGrace:
+    """The bus path must NOT return on a finished step + idle session
+    while the agent is still working: multi-step turns report idle
+    briefly between steps (the model generates the next action), and an
+    eager return cut the stream mid-turn — the feed stopped after the
+    grep step while the session produced 45 more parts unseen (observed
+    live 2026-08-14).  The catch-up poll resets the grace on new content.
+    """
+
+    @pytest.mark.asyncio
+    async def test_bus_path_keeps_stream_open_on_idle_with_new_content(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        async def _noop(*args: Any, **kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        monkeypatch.setattr(opencode_bridge, "_recycle_serve_if_low_memory", _noop)
+        monkeypatch.setattr(opencode_bridge, "_detect_wedged_tool", lambda *a: False)
+        monkeypatch.setattr(opencode_bridge, "_EVENT_QUIET_TIMEOUT", 0.05)
+        monkeypatch.setattr(opencode_bridge, "_EVENT_FINAL_TIMEOUT", 0.05)
+        # Long grace: the first idle observation must NOT return; the
+        # catch-up poll's new content keeps the stream alive.
+        monkeypatch.setattr(opencode_bridge, "_IDLE_GRACE_S", 10.0)
+
+        client = _IdleGraceClient()
+        client.lines = [
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_u", "role": "user"}),
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_a", "role": "assistant"}),
+            _evt("message.part.updated", sessionID="ses_0001",
+                 part={"id": "prt_sf", "messageID": "msg_a", "type": "step-finish"}),
+            _evt("session.status", sessionID="ses_0001",
+                 status={"type": "idle"}),
+        ]
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        deltas = [
+            d async for d in opencode_chat_stream(
+                "task", session_map={}, session_key="k", timeout=0.5,
+            )
+        ]
+        # The next step's narration was delivered despite the idle event.
+        assert ("text", "next step narration") in deltas, deltas
+
+
 class TestResilientStream:
     """``opencode_chat_stream_resilient``: one auto-retry on a fresh serve
     when the first attempt dies silently (the serve's tool runner fails at

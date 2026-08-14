@@ -18,6 +18,25 @@ import httpx
 import pytest
 import pytest_asyncio
 
+
+@pytest.fixture(autouse=True)
+def _fast_idle_grace() -> None:
+    """Shrink the bridge's idle-grace completion window for tests.
+
+    ``_IDLE_GRACE_S`` is 45s in production (multi-step turns pause between
+    steps while the model generates).  Tests script step-finish + idle
+    streams that must return promptly; leaving the production grace in
+    place would make every scripted completion wait 45s and the suite
+    crawl.  Individual tests may monkeypatch the module attribute back up
+    to exercise the grace behavior itself.
+    """
+    import opencode_bridge
+
+    saved = opencode_bridge._IDLE_GRACE_S
+    opencode_bridge._IDLE_GRACE_S = 0.05
+    yield
+    opencode_bridge._IDLE_GRACE_S = saved
+
 # Ensure project root is importable when pytest loads conftest from tests/.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:

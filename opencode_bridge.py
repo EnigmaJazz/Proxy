@@ -202,6 +202,17 @@ _WEDGE_CHECK_INTERVAL_S: float = 10.0
 # before the first wedge cycle and the user would never see the command.
 _ANNOUNCE_CHECK_INTERVAL_S: float = 3.0
 
+#: Idle grace after the serve reports a finished step + idle session.
+#: Multi-step turns (work-continuity) pause between steps while the model
+#: generates the next action (5-40s on this hardware), and the serve can
+#: briefly report "idle" between assistant messages — an eager return on
+#: the first idle event cut the stream mid-turn while the agent kept
+#: working (observed live 2026-08-14: the feed stopped after the grep
+#: step; the session produced 45 more parts unseen).  The stream returns
+#: only after this quiet window with NO new content; any new part resets
+#: it.
+_IDLE_GRACE_S: float = 45.0
+
 #: Fallback plugin's project-local replay log (the rate-limit-fallback
 #: plugin mirrors its log into the repo's git dir).
 _FALLBACK_REPLAY_LOG = Path(__file__).parent / ".git" / "gentle-ai" / "rate-limit-fallback.log"
@@ -1203,6 +1214,10 @@ async def opencode_chat_stream(
                 # First quiet timeout announces immediately (due from the
                 # start), then every _ANNOUNCE_CHECK_INTERVAL_S.
                 bus_last_announce_check = time.monotonic() - _ANNOUNCE_CHECK_INTERVAL_S
+                # Multi-step turns report idle briefly between steps: the
+                # stream returns only after this quiet window with no new
+                # content (see _IDLE_GRACE_S).
+                idle_grace_started: Optional[float] = None
                 while True:
                     # Bounded total duration: a hung agent tool (e.g. a
                     # package-manager command stuck on a lock) leaves the
@@ -1409,7 +1424,21 @@ async def opencode_chat_stream(
                             await asyncio.sleep(1.0)
                     except asyncio.TimeoutError:
                         if pending_done and not session_busy:
-                            return
+                            # A finished step + idle session looks done —
+                            # but multi-step turns (work-continuity) pause
+                            # between steps while the model generates the
+                            # next action, and the serve can briefly report
+                            # idle between assistant messages.  Return only
+                            # after the idle grace with NO new content;
+                            # the catch-up poll below delivers the next
+                            # step's parts and resets the grace when the
+                            # agent continues.
+                            if idle_grace_started is None:
+                                idle_grace_started = time.monotonic()
+                            elif time.monotonic() - idle_grace_started > _IDLE_GRACE_S:
+                                return
+                        else:
+                            idle_grace_started = None
                         # A parked WRITE tool never emits permission.updated
                         # (opencode 1.18.15 write/edit tools omit the SSE
                         # event; only bash emits it), so the event-bus path
@@ -1472,6 +1501,7 @@ async def opencode_chat_stream(
                                 pending_done = True
                                 continue
                             yield delta
+                            idle_grace_started = None  # the agent is working
                         # Keep the client connection alive during long tool
                         # phases (and show the agent is still working).
                         yield ("status", "⏳ still working…")

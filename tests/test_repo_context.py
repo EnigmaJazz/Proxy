@@ -200,3 +200,46 @@ class TestRepoContentSection:
         out = self._section("?? memory/history.jsonl\n?? SOUL.md", tmp_path)
         assert "history.jsonl" not in out
         assert "[File: SOUL.md]" in out
+
+
+class TestSddOutputCopy:
+    """A completed SDD cycle's artifacts are copied into the nanobot
+    workspace (sdd-work/<change>/) so the local model sees the final
+    output — the cycle itself runs in the proxy repo (OpenSpec store)."""
+
+    def test_copies_change_artifacts_and_summary(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import routes
+
+        sdd_repo = tmp_path / "proxy-repo"
+        changes = sdd_repo / "openspec" / "changes" / "demo-change"
+        changes.mkdir(parents=True)
+        (changes / "tasks.md").write_text("task list", encoding="utf-8")
+        (changes / "design.md").write_text("design doc", encoding="utf-8")
+
+        work = tmp_path / "workspace"
+        work.mkdir()
+        monkeypatch.setattr(routes, "OPENCODE_SDD_DIRECTORY", str(sdd_repo))
+        monkeypatch.setattr(routes, "OPENCODE_BRIDGE_DIRECTORY", str(work))
+
+        dst = routes._copy_sdd_output_to_workspace(
+            "demo-change", "The cycle is complete."
+        )
+        assert dst == str(work / "sdd-work" / "demo-change")
+        assert (work / "sdd-work" / "demo-change" / "tasks.md").read_text() == "task list"
+        assert (work / "sdd-work" / "demo-change" / "design.md").read_text() == "design doc"
+        assert (work / "sdd-work" / "demo-change" / "FINAL-SUMMARY.md").read_text() == "The cycle is complete."
+
+    def test_missing_change_dir_is_quiet(self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+        import routes
+
+        sdd_repo = tmp_path / "proxy-repo"
+        sdd_repo.mkdir()
+        work = tmp_path / "workspace"
+        work.mkdir()
+        monkeypatch.setattr(routes, "OPENCODE_SDD_DIRECTORY", str(sdd_repo))
+        monkeypatch.setattr(routes, "OPENCODE_BRIDGE_DIRECTORY", str(work))
+
+        assert routes._copy_sdd_output_to_workspace("nope", "x") == ""
+        assert not (work / "sdd-work").exists()

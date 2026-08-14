@@ -24,6 +24,7 @@ import json
 import re
 import sqlite3
 import subprocess
+import shutil
 import time
 from datetime import datetime
 import uuid
@@ -612,6 +613,34 @@ async def list_models(request: Request) -> JSONResponse:
 #: prompt_cache F6 carve-out).  Small, per-process; dies with the process.
 _RECENT_OPENCODE_WORK: list[dict[str, Any]] = []
 _MAX_RECENT_WORK = 2
+
+
+def _copy_sdd_output_to_workspace(change_name: str, summary: str) -> str:
+    """Copy a completed SDD cycle's artifacts into the nanobot workspace.
+
+    SDD-autonomous cycles run in the proxy repo (OPENCODE_SDD_DIRECTORY —
+    the OpenSpec store lives there).  The cycle's final output is copied
+    to ``<bridge-directory>/sdd-work/<change>/`` — the shared workspace
+    the local model reads — with the final summary as FINAL-SUMMARY.md.
+    Returns the destination path ("" when the change dir is missing).
+    Runs in a worker thread (file I/O).  Never raises.
+    """
+    src = Path(OPENCODE_SDD_DIRECTORY) / "openspec" / "changes" / change_name
+    dst = Path(OPENCODE_BRIDGE_DIRECTORY) / "sdd-work" / change_name
+    try:
+        if not src.is_dir():
+            return ""
+        dst.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(src, dst, dirs_exist_ok=True)
+        if summary:
+            (dst / "FINAL-SUMMARY.md").write_text(summary, encoding="utf-8")
+        logger.info(
+            "Copied SDD output for change %s to %s", change_name, dst,
+        )
+        return str(dst)
+    except OSError:
+        logger.exception("copying SDD output to workspace failed")
+        return ""
 
 
 def _capture_opencode_work(text_parts: list[str]) -> None:
@@ -2730,6 +2759,16 @@ async def _opencode_task_response(
         # Best-effort: capture failures must never break the stream.
         if _resp_text:
             try:
+                # SDD-autonomous cycles run in the proxy repo (the OpenSpec
+                # store); copy their artifacts into the nanobot workspace so
+                # the local model can see the final output (2026-08-14,
+                # user-requested) BEFORE the context capture snapshots the
+                # tree (the copied files then appear in the block).
+                if autonomous and _chg is not None:
+                    await asyncio.to_thread(
+                        _copy_sdd_output_to_workspace,
+                        _chg.group(1), "".join(_resp_text),
+                    )
                 await asyncio.to_thread(_capture_opencode_work, _resp_text)
             except Exception:
                 logger.exception("capturing opencode work failed")

@@ -113,6 +113,15 @@ project-specific.
    exception (2026-08-11, F6 note in `prompt_cache.py`); the registries
    are small, per-process, and die with the process.
 
+   **Documented carve-out — bridge backend service reference**
+   (`opencode_backends.py` `BACKEND`): a module-level `OpenCodeBackend`
+   service reference for the opencode bridge's transport abstraction.
+   Accepted as a project exception (2026-08-16, F7 note in
+   `opencode_backends.py`); the reference is a never-mutated pointer to a
+   STATELESS backend (session/request state lives in the caller's dicts
+   and per-request httpx clients), so it carries no mutable state — the
+   same class of exception as the F5/F6 scalar/registry carve-outs.
+
 7. **Tests**: new code paths MUST have a regression test. Use the harness in
    `tests/conftest.py` (stubs FlashRank + heavy deps, lifespan disabled).
    Async tests need `@pytest_asyncio.fixture` (NOT plain `@pytest.fixture`).

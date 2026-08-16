@@ -460,13 +460,10 @@ async def _post_permission_response(
     errors (the caller proceeds with the pinned continuation either way).
     Never raises.
     """
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            return await BACKEND.reply_permission(
-                client, session_id, permission_id, response,
-            )
-    except (httpx.HTTPError, OSError):
-        return False
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        return await BACKEND.reply_permission(
+            client, session_id, permission_id, response,
+        )
 
 
 async def _abort_session_best_effort(
@@ -478,12 +475,10 @@ async def _abort_session_best_effort(
     The blocking escalation path has no SSE bus, so it cannot watch for
     wedged tools; when it gives up on a session (timeout, HTTP error,
     write-permission abort) it must not leave a busy zombie behind.
-    Never raises.
+    Never raises — the backend contract guarantees it (see
+    ``OpenCodeBackend.abort_session``).
     """
-    try:
-        await BACKEND.abort_session(client, session_id)
-    except (httpx.HTTPError, OSError):
-        pass
+    await BACKEND.abort_session(client, session_id)
 
 
 async def _abort_stream_session_best_effort(
@@ -1644,16 +1639,12 @@ async def _post_question_answer(
 
     The question tool completes with the answer and the agent continues
     with it in context.  Returns True when the serve accepted the reply.
+    Never raises — the backend logs and returns False on transport errors
+    (see ``OpenCodeBackend.reply_question``).
     """
-    try:
-        return await BACKEND.reply_question(
-            client, session_id, question_id, answer, question_count,
-        )
-    except (httpx.HTTPError, OSError, ValueError):
-        logger.warning(
-            "Question reply failed for session %s", session_id[:16], exc_info=True,
-        )
-    return False
+    return await BACKEND.reply_question(
+        client, session_id, question_id, answer, question_count,
+    )
 
 
 
@@ -2626,9 +2617,6 @@ async def _abort_zombie_sessions(
                     "opencode zombie session %s idle for %.0fs — aborting",
                     str(sid)[:16], (now_ms - updated) / 1000,
                 )
-                try:
-                    await BACKEND.abort_session(client, sid)
-                except (httpx.HTTPError, OSError):
-                    pass
+                await BACKEND.abort_session(client, sid)
     except (httpx.HTTPError, OSError, ValueError):
         return

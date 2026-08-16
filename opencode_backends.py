@@ -157,7 +157,11 @@ class OpenCodeBackend(ABC):
         permission_id: str,
         response: str,
     ) -> bool:
-        """POST a permission decision to the serve (best-effort)."""
+        """POST a permission decision to the serve (best-effort).
+
+        Never raises — network errors return False (the caller proceeds
+        with the pinned continuation either way).
+        """
 
     @abstractmethod
     async def fetch_questions(
@@ -175,7 +179,10 @@ class OpenCodeBackend(ABC):
         answer: str,
         question_count: int,
     ) -> bool:
-        """POST the user's answer to the serve's question reply endpoint."""
+        """POST the user's answer to the serve's question reply endpoint.
+
+        Never raises — network/HTTP errors are logged and return False.
+        """
 
 
 def _build_send_payload(

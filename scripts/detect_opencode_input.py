@@ -44,6 +44,15 @@ DEFAULT_BASE_URL = "http://127.0.0.1:18900"
 DEFAULT_INTERVAL = 2.0
 DEFAULT_TIMEOUT = 5.0
 
+# NOTE (deliberate): the endpoint default is re-declared here instead of
+# importing constants.py, and the target extraction mirrors
+# opencode_bridge._permission_target instead of importing the bridge.
+# This watchdog must stay stdlib-only and import-free of the proxy: it is
+# meant to run when the proxy/bridge are WEDGED or down (its whole point
+# is detecting that state), and importing the proxy's own modules could
+# import the very app that is stuck.  Keep DEFAULT_BASE_URL in sync with
+# constants.OPENCODE_SERVE_URL and the preference chain with the bridge.
+
 log = logging.getLogger("detect_opencode_input")
 
 

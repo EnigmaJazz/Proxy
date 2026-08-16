@@ -32,6 +32,11 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 13109
 DEFAULT_INTERVAL = 1.0
 
+# NOTE (deliberate): the llama.cpp port default is re-declared here instead
+# of importing constants.py.  This monitor must stay stdlib-only so it can
+# run while the proxy (and its venv/modules) are wedged or down; keep
+# DEFAULT_PORT in sync with the professional unit's port in constants.py.
+
 
 def fetch_slots(host: str, port: int, timeout: float) -> list[dict[str, Any]]:
     """GET /slots and return the slot array.  Raises on HTTP/network errors."""
@@ -61,6 +66,19 @@ def _decoded(slot: dict[str, Any]) -> int:
         if isinstance(nt, list) and nt:
             value = nt[0].get("n_decoded")
     return value or 0
+
+
+def _remain(slot: dict[str, Any]) -> Optional[int]:
+    """Read n_remain from next_token[0], tolerating idle-slot shapes.
+
+    llama.cpp reports idle slots without a populated ``next_token`` array
+    (it may be absent OR an empty list); the empty-list case would raise
+    IndexError on a naive ``[0]`` access, crashing the monitor mid-watch.
+    """
+    nt = slot.get("next_token")
+    if isinstance(nt, list) and nt and isinstance(nt[0], dict):
+        return nt[0].get("n_remain")
+    return None
 
 
 class SlotTracker:
@@ -127,7 +145,7 @@ def render_snapshot(
                 "state": slot_state(slot),
                 "task": slot.get("id_task"),
                 "decoded": _decoded(slot),
-                "remain": slot.get("next_token", [{}])[0].get("n_remain"),
+                "remain": _remain(slot),
                 "prompt_tokens": slot.get("n_prompt_tokens"),
             })
         return json.dumps({
@@ -153,7 +171,7 @@ def render_snapshot(
     ]
     for slot in slots:
         t = trackers[slot["id"]]
-        remain = slot.get("next_token", [{}])[0].get("n_remain")
+        remain = _remain(slot)
         lines.append(
             f"  slot {slot['id']}: task {slot.get('id_task')} "
             f"{slot_state(slot):<8} decoded={_decoded(slot)} "
@@ -188,9 +206,10 @@ def main() -> int:
     def summarize() -> None:
         elapsed = time.monotonic() - start
         gen_cum = sum(t.gen_total for t in trackers.values())
+        rate = gen_cum / elapsed if elapsed > 0 else 0.0
         print(
             f"\nTotal: {gen_cum:,} tokens generated in {elapsed:.0f}s "
-            f"({gen_cum / elapsed:.1f} tok/s avg) over {len(trackers)} slot(s), "
+            f"({rate:.1f} tok/s avg) over {len(trackers)} slot(s), "
             f"{failures} failed poll(s)"
         )
 

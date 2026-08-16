@@ -20,6 +20,13 @@ Used by:
 The response text is post-processed to drop proxy-status content
 (sentinel-prefixed triage) that the opencode client accumulates as
 assistant text.
+
+Message-path HTTP primitives route through the module-level ``BACKEND``
+instance from ``opencode_backends.py`` (openchamber-bridge-backend design,
+step 1): session create/send/fetch/abort, permission and question relay.
+The ``/event`` SSE bus and the serve lifecycle (spawn/recycle/config
+sync) stay in this module — they are serve-specific and belong to later
+steps of the design.
 """
 from __future__ import annotations
 
@@ -47,6 +54,7 @@ from constants import (
     _machine,
     get_logger,
 )
+from opencode_backends import BACKEND
 
 logger = get_logger("kinver.opencode_bridge")
 
@@ -454,12 +462,9 @@ async def _post_permission_response(
     """
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                f"{OPENCODE_SERVE_URL}/session/{session_id}/permissions/{permission_id}",
-                json={"response": response},
-                timeout=10.0,
+            return await BACKEND.reply_permission(
+                client, session_id, permission_id, response,
             )
-            return resp.status_code == 200
     except (httpx.HTTPError, OSError):
         return False
 
@@ -476,10 +481,7 @@ async def _abort_session_best_effort(
     Never raises.
     """
     try:
-        await client.post(
-            f"{OPENCODE_SERVE_URL}/session/{session_id}/abort",
-            timeout=10.0,
-        )
+        await BACKEND.abort_session(client, session_id)
     except (httpx.HTTPError, OSError):
         pass
 
@@ -553,10 +555,7 @@ async def _handle_permission_event(
         mid = tool_info.get("messageID")
         call_id = tool_info.get("callID")
         if mid:
-            msg_resp = await client.get(
-                f"{OPENCODE_SERVE_URL}/session/{session_id}/message/{mid}",
-                timeout=10.0,
-            )
+            msg_resp = await BACKEND.fetch_message(client, session_id, mid)
             if msg_resp.status_code == 200:
                 for part in (msg_resp.json().get("parts") or []):
                     if part.get("callID") == call_id or part.get("id") == call_id:
@@ -606,7 +605,7 @@ async def _detect_pending_permission(
     event-bus path.
     """
     try:
-        resp = await client.get(f"{OPENCODE_SERVE_URL}/permission", timeout=10.0)
+        resp = await BACKEND.fetch_permissions(client)
         if resp.status_code != 200:
             return None
         for perm in resp.json():
@@ -876,10 +875,8 @@ async def _opencode_chat_attempt(
     """
     try:
         # ---- 1. Create a fresh session --------------------------------
-        resp = await client.post(
-            f"{OPENCODE_SERVE_URL}/session",
-            params={"directory": directory or OPENCODE_BRIDGE_DIRECTORY},
-            timeout=30.0,
+        resp = await BACKEND.create_session(
+            client, directory=directory or OPENCODE_BRIDGE_DIRECTORY,
         )
         if resp.status_code != 200:
             return f"[OpenCode Bridge Error: session HTTP {resp.status_code}]", False
@@ -888,24 +885,13 @@ async def _opencode_chat_attempt(
             return "[OpenCode Bridge Error: no session id returned.]", False
 
         # ---- 2. Post the message, watching for permission gates ------
-        payload: dict[str, Any] = {
-            "agent": agent,
-            "system": system_prompt,
-            "parts": [{"type": "text", "text": user_text}],
-        }
-        if model_id:
-            payload["model"] = {
-                "modelID": model_id,
-                "providerID": provider_id,
-                "variant": "default",
-            }
         # The POST runs as a task so the poller below can watch GET
         # /permission concurrently (httpx clients are concurrency-safe).
         post_task = asyncio.create_task(
-            client.post(
-                f"{OPENCODE_SERVE_URL}/session/{session_id}/message",
-                json=payload,
-                timeout=timeout,
+            BACKEND.send_message(
+                client, session_id,
+                agent=agent, system_prompt=system_prompt, user_text=user_text,
+                model_id=model_id, provider_id=provider_id, timeout=timeout,
             )
         )
         try:
@@ -1066,18 +1052,14 @@ async def opencode_chat_stream(
                 fetch_ok = False
                 exists = True
                 try:
-                    get_resp = await client.get(
-                        f"{OPENCODE_SERVE_URL}/session/{session_id}", timeout=10.0,
-                    )
+                    get_resp = await BACKEND.session_exists(client, session_id)
                     fetch_ok = True
                     exists = get_resp.status_code == 200
                 except (httpx.HTTPError, ValueError):
                     pass
                 st = None
                 try:
-                    st_resp = await client.get(
-                        f"{OPENCODE_SERVE_URL}/session/status", timeout=10.0,
-                    )
+                    st_resp = await BACKEND.fetch_session_status(client)
                     st = (st_resp.json().get(session_id) or {}).get("type")
                 except (httpx.HTTPError, ValueError):
                     st = None
@@ -1186,10 +1168,8 @@ async def opencode_chat_stream(
                     )
                     session_id = None
             if not session_id:
-                resp = await client.post(
-                    f"{OPENCODE_SERVE_URL}/session",
-                    params={"directory": directory or OPENCODE_BRIDGE_DIRECTORY},
-                    timeout=30.0,
+                resp = await BACKEND.create_session(
+                    client, directory=directory or OPENCODE_BRIDGE_DIRECTORY,
                 )
                 if resp.status_code != 200:
                     yield ("status", f"[OpenCode Bridge Error: session HTTP {resp.status_code}]")
@@ -1200,17 +1180,6 @@ async def opencode_chat_stream(
                     return
                 if session_map is not None and session_key:
                     session_map[session_key] = session_id
-            payload: dict[str, Any] = {
-                "agent": agent,
-                "system": system_prompt,
-                "parts": [{"type": "text", "text": user_text}],
-            }
-            if model_id:
-                payload["model"] = {
-                    "modelID": model_id,
-                    "providerID": provider_id,
-                    "variant": "default",
-                }
             # Open the event bus BEFORE sending the message: the bus is
             # fire-and-forget (no replay), so connecting after prompt_async
             # misses the early events (user message, assistant start, first
@@ -1218,10 +1187,11 @@ async def opencode_chat_stream(
             async with client.stream("GET", f"{OPENCODE_SERVE_URL}/event") as ev:
                 async_resp = None
                 if not skip_prompt:
-                    async_resp = await client.post(
-                        f"{OPENCODE_SERVE_URL}/session/{session_id}/prompt_async",
-                        json=payload,
-                        timeout=30.0,
+                    async_resp = await BACKEND.send_prompt(
+                        client, session_id,
+                        agent=agent, system_prompt=system_prompt,
+                        user_text=user_text, model_id=model_id,
+                        provider_id=provider_id,
                     )
                 if async_resp is not None and async_resp.status_code != 204:
                     # Session was created and pinned before this POST — do
@@ -1342,10 +1312,7 @@ async def opencode_chat_stream(
                             if pending_done and not cycle_content:
                                 still_running = False
                                 try:
-                                    msg_resp = await client.get(
-                                        f"{OPENCODE_SERVE_URL}/session/{session_id}/message",
-                                        timeout=10.0,
-                                    )
+                                    msg_resp = await BACKEND.fetch_messages(client, session_id)
                                     if msg_resp.status_code == 200:
                                         msgs = msg_resp.json()
                                         for m in msgs:
@@ -1376,9 +1343,7 @@ async def opencode_chat_stream(
                             # steps).  New content or a busy status resets
                             # the timer.
                             try:
-                                st_resp = await client.get(
-                                    f"{OPENCODE_SERVE_URL}/session/status", timeout=10.0,
-                                )
+                                st_resp = await BACKEND.fetch_session_status(client)
                                 st = (st_resp.json().get(session_id) or {}).get("type")
                             except (httpx.HTTPError, ValueError):
                                 st = None
@@ -1656,7 +1621,7 @@ async def _find_pending_question(
     returns (request_id, question_count) or (None, 0).
     """
     try:
-        resp = await client.get(f"{OPENCODE_SERVE_URL}/question", timeout=10.0)
+        resp = await BACKEND.fetch_questions(client)
         if resp.status_code != 200:
             return None, 0
         for entry in resp.json():
@@ -1681,20 +1646,8 @@ async def _post_question_answer(
     with it in context.  Returns True when the serve accepted the reply.
     """
     try:
-        resp = await client.post(
-            f"{OPENCODE_SERVE_URL}/question/{question_id}/reply",
-            json={"answers": [[answer] for _ in range(max(1, question_count))]},
-            timeout=15.0,
-        )
-        if 200 <= resp.status_code < 300:
-            logger.info(
-                "Answered pending question %s for session %s",
-                question_id[:16], session_id[:16],
-            )
-            return True
-        logger.warning(
-            "Question reply %s -> HTTP %s (session %s)",
-            question_id[:16], resp.status_code, session_id[:16],
+        return await BACKEND.reply_question(
+            client, session_id, question_id, answer, question_count,
         )
     except (httpx.HTTPError, OSError, ValueError):
         logger.warning(
@@ -1875,10 +1828,7 @@ async def _yield_part_deltas(
                         # Preferred: the part's own message (carries input).
                         mid = part.get("messageID") or ""
                         if mid:
-                            msg_resp = await client.get(
-                                f"{OPENCODE_SERVE_URL}/session/{session_id}/message/{mid}",
-                                timeout=10.0,
-                            )
+                            msg_resp = await BACKEND.fetch_message(client, session_id, mid)
                             if msg_resp.status_code == 200:
                                 fetched = True
                                 for p2 in (msg_resp.json().get("parts") or []):
@@ -1908,10 +1858,7 @@ async def _yield_part_deltas(
                         # question part by its persisted id (it carries the
                         # complete multi-group input there).
                         try:
-                            msg_resp = await client.get(
-                                f"{OPENCODE_SERVE_URL}/session/{session_id}/message",
-                                timeout=10.0,
-                            )
+                            msg_resp = await BACKEND.fetch_messages(client, session_id)
                             if msg_resp.status_code == 200:
                                 fetched = True
                                 for m in msg_resp.json():
@@ -2018,9 +1965,7 @@ async def _current_running_tool(
     when nothing new is running.
     """
     try:
-        resp = await client.get(
-            f"{OPENCODE_SERVE_URL}/session/{session_id}/message", timeout=10.0,
-        )
+        resp = await BACKEND.fetch_messages(client, session_id)
         if resp.status_code != 200:
             return None
         for m in reversed(resp.json()):
@@ -2065,10 +2010,7 @@ async def _child_wedged(client: httpx.AsyncClient, child_id: str) -> bool:
     False (no extra early abort).  Never raises.
     """
     try:
-        resp = await client.get(
-            f"{OPENCODE_SERVE_URL}/session/{child_id}/message",
-            timeout=10.0,
-        )
+        resp = await BACKEND.fetch_messages(client, child_id)
         if resp.status_code != 200:
             return False
         now_ms = int(time.time() * 1000)
@@ -2096,9 +2038,7 @@ async def _session_live(client: httpx.AsyncClient, session_id: str) -> bool:
     transport error.  Never raises.
     """
     try:
-        resp = await client.get(
-            f"{OPENCODE_SERVE_URL}/session/status", timeout=10.0,
-        )
+        resp = await BACKEND.fetch_session_status(client)
         if resp.status_code != 200:
             return True
         st_map = resp.json()
@@ -2126,9 +2066,7 @@ async def _detect_wedged_tool(client: httpx.AsyncClient, session_id: str) -> boo
     """
     try:
         serve_start_ms = await asyncio.to_thread(_serve_start_epoch_ms)
-        resp = await client.get(
-            f"{OPENCODE_SERVE_URL}/session/{session_id}/message", timeout=10.0,
-        )
+        resp = await BACKEND.fetch_messages(client, session_id)
         if resp.status_code != 200:
             return False
         now_ms = int(time.time() * 1000)
@@ -2223,9 +2161,7 @@ async def _session_busy_on_current_serve(
     not be swept as zombies.  Never raises.
     """
     try:
-        resp = await client.get(
-            f"{OPENCODE_SERVE_URL}/session/{session_id}/message", timeout=10.0,
-        )
+        resp = await BACKEND.fetch_messages(client, session_id)
         if resp.status_code != 200:
             return False
         for m in resp.json():
@@ -2255,9 +2191,7 @@ async def _session_over_context_cap(
     failure keeps the pin (False).
     """
     try:
-        resp = await client.get(
-            f"{OPENCODE_SERVE_URL}/session/{session_id}/message", timeout=10.0,
-        )
+        resp = await BACKEND.fetch_messages(client, session_id)
         if resp.status_code != 200:
             return False
         body = resp.json()
@@ -2302,9 +2236,7 @@ async def _seed_resumed_session_state(
     """
     total_chars = 0
     try:
-        resp = await client.get(
-            f"{OPENCODE_SERVE_URL}/session/{session_id}/message", timeout=10.0,
-        )
+        resp = await BACKEND.fetch_messages(client, session_id)
         if resp.status_code != 200:
             return 0
         body = resp.json()
@@ -2353,9 +2285,7 @@ async def _poll_session_deltas(
     bus closes but the session is still busy).  Yields deltas; the CALLER
     checks the session status and decides when to stop polling."""
     try:
-        resp = await client.get(
-            f"{OPENCODE_SERVE_URL}/session/{session_id}/message", timeout=10.0,
-        )
+        resp = await BACKEND.fetch_messages(client, session_id)
         if resp.status_code != 200:
             return
         for m in resp.json():
@@ -2664,7 +2594,7 @@ async def _abort_zombie_sessions(
     handles the genuinely stuck pinned session instead.
     """
     try:
-        resp = await client.get(f"{OPENCODE_SERVE_URL}/session", timeout=10.0)
+        resp = await BACKEND.list_sessions(client)
         if resp.status_code != 200:
             return
         now_ms = int(time.time() * 1000)
@@ -2697,9 +2627,7 @@ async def _abort_zombie_sessions(
                     str(sid)[:16], (now_ms - updated) / 1000,
                 )
                 try:
-                    await client.post(
-                        f"{OPENCODE_SERVE_URL}/session/{sid}/abort", timeout=10.0,
-                    )
+                    await BACKEND.abort_session(client, sid)
                 except (httpx.HTTPError, OSError):
                     pass
     except (httpx.HTTPError, OSError, ValueError):

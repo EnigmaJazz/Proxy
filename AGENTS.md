@@ -121,6 +121,12 @@ project-specific.
    STATELESS backend (session/request state lives in the caller's dicts
    and per-request httpx clients), so it carries no mutable state — the
    same class of exception as the F5/F6 scalar/registry carve-outs.
+   When `OPENCODE_BACKEND=openchamber` selects `OpenChamberBackend`, the
+   reference points at an instance that carries ONE piece of per-session
+   state (a session_id → directory map — the CLI needs `--dir` on every
+   call while the interface only carries the directory at create) —
+   documented as the F8 exception in `opencode_backends.py`; the default
+   `ServeBackend` remains stateless.
 
 7. **Tests**: new code paths MUST have a regression test. Use the harness in
    `tests/conftest.py` (stubs FlashRank + heavy deps, lifespan disabled).

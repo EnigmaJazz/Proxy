@@ -906,6 +906,11 @@ class OpenChamberBackend(OpenCodeBackend):
                 f"no directory recorded for session {session_id[:16]}",
             )
         deadline = time.monotonic() + timeout
+        # Cap the send CLI's own timeout to the remaining budget so the
+        # dispatch cannot overshoot the caller's deadline (the original
+        # timeout+30 could run 30 s past the budget).
+        remaining = deadline - time.monotonic()
+        send_timeout = min(timeout + 30.0, max(0.1, remaining))
         rc, _ = await chamber._run_cli(
             [
                 "session", "send",
@@ -916,13 +921,15 @@ class OpenChamberBackend(OpenCodeBackend):
                 "--timeout", str(int(timeout)),
                 "--json",
             ],
-            timeout=timeout + 30.0,
+            timeout=send_timeout,
         )
         if rc != 0:
             raise httpx.ConnectError(
                 f"openchamber CLI send failed (rc={rc})",
             )
         while True:
+            if time.monotonic() >= deadline:
+                break
             rc, out = await chamber._run_cli(
                 [
                     "session", "messages",

@@ -155,7 +155,7 @@ def is_openchamber_daemon_running() -> bool:
         return False
 
 
-def _patch_agent_model(config_text: str) -> str:
+def _patch_agent_model(config_text: str) -> Optional[str]:
     """Pin the bridge agents to kinver/professional in the daemon config.
 
     The CLI ``--model`` flag does not override an agent's configured
@@ -164,18 +164,28 @@ def _patch_agent_model(config_text: str) -> str:
     a STRING — patch the ``gentle-orchestrator`` block's ``"model"``
     value only.  Deterministic string surgery on the JSONC text (the
     file is JSONC — comments — so a text patch beats json round-trip).
+
+    Returns the patched text, or ``None`` when the expected pattern is
+    absent (template drift — the silent no-op would run the wrong model).
+    Callers must treat ``None`` as a patch failure.
     """
     marker = '"gentle-orchestrator"'
     start = config_text.find(marker)
     if start < 0:
-        return config_text
+        logger.warning(
+            "openchamber config patch failed: gentle-orchestrator marker not found — template drift would run the wrong model",
+        )
+        return None
     # Find the model key inside this block (the block ends at the next
     # top-level key or closing brace; the template keeps agents at the
     # same indent, so scan forward to the next line at indent 0 or the
     # closing '}' of the agent block).
     end = config_text.find("\n}", start)
     if end < 0:
-        return config_text
+        logger.warning(
+            "openchamber config patch failed: gentle-orchestrator block end not found",
+        )
+        return None
     block = config_text[start:end]
     # Replace only the gentle-orchestrator block's OWN model key: the
     # first occurrence inside the block.  Sibling agents that share the
@@ -184,7 +194,11 @@ def _patch_agent_model(config_text: str) -> str:
     old_model = '"model": "opencode-go/deepseek-v4-flash"'
     idx = block.find(old_model)
     if idx < 0:
-        return config_text
+        logger.warning(
+            "openchamber config patch failed: expected %r not found in gentle-orchestrator block — template drift would run the wrong model",
+            old_model,
+        )
+        return None
     new_block = block[:idx] + '"model": "kinver/professional"' + block[idx + len(old_model):]
     return config_text[:start] + new_block + config_text[end:]
 
@@ -208,8 +222,14 @@ def _sync_openchamber_config() -> None:
         os.makedirs(oc_dir, exist_ok=True)
 
         # 1. Template → patched opencode.jsonc
-        template = open(OPCODE_CONFIG_PATH, encoding="utf-8").read()
+        with open(OPCODE_CONFIG_PATH, encoding="utf-8") as f:
+            template = f.read()
         patched = _patch_agent_model(template)
+        if patched is None:
+            logger.warning(
+                "openchamber config sync: patch failed — not writing unpatched config as if it were patched",
+            )
+            return
         with open(os.path.join(oc_dir, "opencode.jsonc"), "w", encoding="utf-8") as f:
             f.write(patched)
 
@@ -310,6 +330,7 @@ async def stop_openchamber_daemon() -> bool:
 
     Returns True when the listener is gone afterwards (or was never up).
     """
+    proc: Optional[asyncio.subprocess.Process] = None
     try:
         port = OPENCHAMBER_SERVE_URL.rsplit(":", 1)[-1]
         proc = await asyncio.create_subprocess_exec(
@@ -319,7 +340,11 @@ async def stop_openchamber_daemon() -> bool:
         )
         await asyncio.wait_for(proc.wait(), timeout=15.0)
     except (OSError, asyncio.TimeoutError):
-        pass
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+            except (OSError, ProcessLookupError):
+                pass
     # Wait for the listener to go away.
     for _ in range(20):
         if not await asyncio.to_thread(is_openchamber_daemon_running):
@@ -404,9 +429,19 @@ def _messages_have_content(messages_json: str) -> bool:
 
     Tolerates the CLI's plain-JSON shape and an empty/error body; only a
     non-empty array with at least one text/error part counts as engaged.
+    Also accepts the object shape ``{"messages": [...]}`` that
+    ``_normalize_messages`` handles, so the smoke probe and the backend
+    agree on what counts as engaged (a healthy daemon must not be
+    classified hollow when the CLI returns the object shape).
     """
     try:
         data = json.loads(messages_json)
+        if isinstance(data, dict):
+            msgs = data.get("messages")
+            if isinstance(msgs, list):
+                data = msgs
+            else:
+                return False
         if not isinstance(data, list) or not data:
             return False
         for msg in data:

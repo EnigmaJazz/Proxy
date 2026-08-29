@@ -412,3 +412,169 @@ async def test_session_status_and_list_normalize(
     assert st.json() == {FAKE_SESSION_ID: {"type": "idle"}}
     assert listed.status_code == 200
     assert listed.json() == [{"id": FAKE_SESSION_ID}]
+
+# -- Polling error branches (F3) --------------------------------------------
+
+@pytest.mark.asyncio
+async def test_send_message_transient_cli_failure_retries_while_daemon_alive(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """F3a: messages rc!=0 with live daemon → retry, eventual success."""
+    monkeypatch.setattr(ob, "_POLL_INTERVAL_S", 0.02)
+    backend = _backend()
+    workdir = str(tmp_path / "work")
+    backend._session_dirs[FAKE_SESSION_ID] = workdir
+
+    # Ensure daemon stub stays healthy (autouse already does, keep explicit).
+    monkeypatch.setattr(oc, "is_openchamber_daemon_running", lambda: True)
+
+    async def _fake_ensure() -> tuple[bool, str]:
+        return True, "ok"
+
+    monkeypatch.setattr(oc, "ensure_openchamber_daemon", _fake_ensure)
+    # Also patch via ob.chamber for completeness (same module object).
+    monkeypatch.setattr(ob.chamber, "is_openchamber_daemon_running", lambda: True)
+    monkeypatch.setattr(ob.chamber, "ensure_openchamber_daemon", _fake_ensure)
+
+    call_counts = {"messages": 0, "send": 0}
+
+    async def _fake_run_cli(args: list[str], timeout: float) -> tuple[int, str]:  # type: ignore[no-untyped-def]
+        if len(args) >= 2 and args[0] == "session" and args[1] == "send":
+            call_counts["send"] += 1
+            return 0, json.dumps({"status": "ok"})
+        if len(args) >= 2 and args[0] == "session" and args[1] == "messages":
+            call_counts["messages"] += 1
+            if call_counts["messages"] == 1:
+                return 1, "transient error"
+            # Second poll succeeds with assistant text in object shape.
+            return 0, json.dumps(
+                {
+                    "status": "ok",
+                    "sessionId": FAKE_SESSION_ID,
+                    "sessionStatus": {"type": "idle"},
+                    "messages": [
+                        {
+                            "id": "msg_ok",
+                            "role": "assistant",
+                            "text": "PONG",
+                        }
+                    ],
+                }
+            )
+        return 1, ""
+
+    monkeypatch.setattr(oc, "_run_cli", _fake_run_cli)
+    monkeypatch.setattr(ob.chamber, "_run_cli", _fake_run_cli)
+
+    async with httpx.AsyncClient() as client:
+        resp = await backend.send_message(
+            client,
+            FAKE_SESSION_ID,
+            agent="gentle-orchestrator",
+            system_prompt="sys",
+            user_text="hello",
+            model_id=None,
+            provider_id="kinver",
+            timeout=1.0,
+        )
+    assert resp.status_code == 200
+    assert resp.json()["parts"] == [{"type": "text", "text": "PONG"}]
+    assert call_counts["messages"] >= 2, "poll must have retried after transient failure"
+    assert call_counts["send"] == 1
+
+
+@pytest.mark.asyncio
+async def test_send_message_raises_when_daemon_dies_mid_poll(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """F3b: messages rc!=0 and daemon gone → httpx.ConnectError."""
+    monkeypatch.setattr(ob, "_POLL_INTERVAL_S", 0.02)
+    backend = _backend()
+    workdir = str(tmp_path / "work")
+    backend._session_dirs[FAKE_SESSION_ID] = workdir
+
+    async def _fake_run_cli(args: list[str], timeout: float) -> tuple[int, str]:  # type: ignore[no-untyped-def]
+        if len(args) >= 2 and args[0] == "session" and args[1] == "send":
+            return 0, json.dumps({"status": "ok"})
+        if len(args) >= 2 and args[0] == "session" and args[1] == "messages":
+            return 1, "cli error"
+        return 1, ""
+
+    monkeypatch.setattr(oc, "_run_cli", _fake_run_cli)
+    monkeypatch.setattr(ob.chamber, "_run_cli", _fake_run_cli)
+    # Daemon death: is_openchamber_daemon_running returns False → triggers raise.
+    monkeypatch.setattr(oc, "is_openchamber_daemon_running", lambda: False)
+    monkeypatch.setattr(ob.chamber, "is_openchamber_daemon_running", lambda: False)
+    # Ensure still pretends healthy at send time (send's _ensure_daemon uses ensure, not is_running).
+    async def _fake_ensure_ok() -> tuple[bool, str]:  # type: ignore[no-untyped-def]
+        return True, "ok"
+
+    monkeypatch.setattr(oc, "ensure_openchamber_daemon", _fake_ensure_ok)
+    monkeypatch.setattr(ob.chamber, "ensure_openchamber_daemon", _fake_ensure_ok)
+
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(httpx.ConnectError, match="daemon died"):
+            await backend.send_message(
+                client,
+                FAKE_SESSION_ID,
+                agent="gentle-orchestrator",
+                system_prompt="sys",
+                user_text="hello",
+                model_id=None,
+                provider_id="kinver",
+                timeout=1.0,
+            )
+
+
+@pytest.mark.asyncio
+async def test_send_message_transient_failure_then_daemon_death(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Mixed: first poll transient alive, second poll daemon dead → ConnectError."""
+    monkeypatch.setattr(ob, "_POLL_INTERVAL_S", 0.02)
+    backend = _backend()
+    workdir = str(tmp_path / "work")
+    backend._session_dirs[FAKE_SESSION_ID] = workdir
+
+    poll_n = [0]
+
+    async def _fake_run_cli(args: list[str], timeout: float) -> tuple[int, str]:  # type: ignore[no-untyped-def]
+        if len(args) >= 2 and args[0] == "session" and args[1] == "send":
+            return 0, json.dumps({"status": "ok"})
+        if len(args) >= 2 and args[0] == "session" and args[1] == "messages":
+            poll_n[0] += 1
+            return 1, "error"
+        return 1, ""
+
+    monkeypatch.setattr(oc, "_run_cli", _fake_run_cli)
+    monkeypatch.setattr(ob.chamber, "_run_cli", _fake_run_cli)
+
+    # First poll sees daemon alive (retry), second sees it dead (raise).
+    daemon_calls = [0]
+
+    def _fake_daemon_running() -> bool:
+        daemon_calls[0] += 1
+        return daemon_calls[0] == 1
+
+    monkeypatch.setattr(oc, "is_openchamber_daemon_running", _fake_daemon_running)
+    monkeypatch.setattr(ob.chamber, "is_openchamber_daemon_running", _fake_daemon_running)
+
+    async def _fake_ensure_ok() -> tuple[bool, str]:  # type: ignore[no-untyped-def]
+        return True, "ok"
+
+    monkeypatch.setattr(oc, "ensure_openchamber_daemon", _fake_ensure_ok)
+    monkeypatch.setattr(ob.chamber, "ensure_openchamber_daemon", _fake_ensure_ok)
+
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(httpx.ConnectError):
+            await backend.send_message(
+                client,
+                FAKE_SESSION_ID,
+                agent="gentle-orchestrator",
+                system_prompt="sys",
+                user_text="hello",
+                model_id=None,
+                provider_id="kinver",
+                timeout=1.0,
+            )
+    assert poll_n[0] == 2

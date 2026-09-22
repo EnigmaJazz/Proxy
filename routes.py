@@ -100,7 +100,7 @@ logger = get_logger("proxy.routes")
 _PAUSE_RE = re.compile(r"(?i)\s*/pause(?:\s+(\d+))?\s*$")
 _RESUME_RE = re.compile(r"(?i)\s*/resume\s*$")
 _CLOUD_RE = re.compile(r"/cloud")
-_OPENCODE_RE = re.compile(r"/opencode")
+_OPENCODE_RE = re.compile(r"(?i)^\s*/opencode(?:\s|$)")
 
 # Sentinel-prefixed coding-decision question.  Visible inline (like the
 # triage) and stripped from the OUTBOUND model-copy by strip_proxy_status,
@@ -3011,7 +3011,19 @@ async def _apply_coding_decision_gate(
                 reason = assessment.get("reason", "")
                 if difficulty and recommendation:
                     reason_suffix = f" ({reason})" if reason else ""
-                    if difficulty == "low":
+                    if difficulty == "low" and recommendation in ("opencode", "sdd"):
+                        # SECURITY GUARD (2026-09-12): a raw-model completion
+                        # must never be silently diverted into the agent
+                        # bridge.  An agentic route requires the user's
+                        # explicit answer — fall through to the question
+                        # below instead of auto-launching opencode/SDD.
+                        logger.info(
+                            "Coding decision for session %s: low difficulty "
+                            "but agentic recommendation %r — prompting "
+                            "instead of auto-routing",
+                            session_id, recommendation,
+                        )
+                    elif difficulty == "low":
                         # Simple coding task — the user asked for no prompt:
                         # apply the recommendation's route immediately and
                         # skip the question (the bare question must never
@@ -3022,26 +3034,6 @@ async def _apply_coding_decision_gate(
                             session_id, recommendation,
                         )
                         decisions[session_id] = recommendation
-                        if recommendation in ("opencode", "sdd"):
-                            is_sdd = recommendation == "sdd"
-                            resp = await _opencode_task_response(
-                                _last_user_text(messages),
-                                client_stream,
-                                session_map=await _opencode_session_state(app),
-                                session_key=session_id,
-                                pending_permissions=_pending_permissions_state(app),
-                                system_prompt=(
-                                    _SDD_AUTONOMOUS_SYSTEM_PROMPT
-                                    if is_sdd else _BRIDGE_SYSTEM_PROMPT
-                                ),
-                                timeout=(
-                                    OPENCODE_SDD_TIMEOUT
-                                    if is_sdd else OPENCODE_SERVE_TIMEOUT
-                                ),
-                                autonomous=is_sdd,
-                            )
-                            await _persist_opencode_sessions(app)
-                            return resp
                         # "local"/"professional" recommendation: the normal
                         # flow continues to the local code pathway.
                         return None

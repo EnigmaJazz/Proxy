@@ -938,6 +938,86 @@ class TestEmbeddedCommandFalsePositive:
         assert capture.payload is not None
         assert "Directing to OpenCode" not in capture.payload
 
+    @pytest.mark.asyncio
+    async def test_latest_user_message_with_opencode_path_does_not_route(
+        self, gate_client
+    ) -> None:
+        """Incident regression (2026-09-12): a Lane B completion whose LATEST
+        user message carries the ``/opencode`` substring inside paths (the
+        incident's implementation-writer prompt) must NOT be hijacked into the
+        agent bridge — only a leading ``/opencode`` command token is a command.
+        """
+        capture = _StreamCapture()
+
+        bridge_calls: list[str] = []
+
+        async def _fake_bridge(
+            text: str, *args: Any, **kwargs: Any,
+        ) -> AsyncIterator[tuple[str, str]]:
+            bridge_calls.append(text)
+            yield ("text", "SHOULD_NOT_RUN")
+
+        writer_prompt = (
+            "You are a local-model implementation writer for the repository "
+            "/home/user/opencode-workspace/frontend-integration. The opencode "
+            "CLI is /home/user/.opencode/bin/opencode and its serve config "
+            "lives at /home/user/opencode-workspace/serve-config.opencode.jsonc. "
+            "Implement the fix."
+        )
+        with patch("routes.stream_llm", new=capture), \
+             patch("routes.opencode_chat_stream_resilient", new=_fake_bridge):
+            response = await gate_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "auto",
+                    "messages": [{"role": "user", "content": writer_prompt}],
+                    "stream": True,
+                },
+                headers={
+                    "Authorization": "Bearer agent-key",
+                    "sk-ide-pass": "sk-ide-pass",
+                },
+            )
+            await response.aread()
+
+        # The model was called — NOT the opencode bridge.
+        assert capture.payload is not None
+        assert "Directing to OpenCode" not in capture.payload
+        assert bridge_calls == []
+
+
+class TestEmbeddedOpencodeCommand:
+    """A REAL leading ``/opencode <task>`` command still routes to the
+    bridge, and the command token is stripped from the task text."""
+
+    @pytest.mark.asyncio
+    async def test_leading_opencode_command_routes_to_bridge(
+        self, gate_client, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen: list[str] = []
+
+        async def _fake_stream(
+            text: str, *args: Any, **kwargs: Any,
+        ) -> AsyncIterator[tuple[str, str]]:
+            seen.append(text)
+            yield ("text", "ok")
+
+        monkeypatch.setattr("routes.opencode_chat_stream_resilient", _fake_stream)
+        response = await gate_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "auto",
+                "messages": [
+                    {"role": "user", "content": "/opencode write a parser"},
+                ],
+                "stream": True,
+            },
+            headers={"Authorization": "Bearer agent-key"},
+        )
+        await response.aread()
+
+        assert seen == ["write a parser"]
+
 
 # ---------------------------------------------------------------------------
 # Cached-decision follow-ups stay CODE (no re-ask, no drop to chat)
@@ -1114,9 +1194,14 @@ class TestKeywordHeuristicsTightened:
 
 
 class TestLowDifficultyNoPrompt:
-    """Simple coding tasks (professional assessment: low difficulty) must
-    route straight through per the recommendation — the user asked for no
-    prompt, so the question must NEVER appear for them."""
+    """Simple coding tasks (professional assessment: low difficulty) with a
+    NON-agentic recommendation (local/professional) route straight through —
+    the user asked for no prompt, so the question must NEVER appear for them.
+
+    EXCEPTION (2026-09-12): an agentic recommendation (``opencode``/``sdd``)
+    at low difficulty MUST prompt — a raw completion is never silently
+    diverted into the agent bridge without the user's explicit answer.
+    """
 
     async def _send(self, gate_client, content: str) -> str:
         capture = _StreamCapture()
@@ -1156,6 +1241,55 @@ class TestLowDifficultyNoPrompt:
         # (the professional answering stream).
         assert "Coding decision" not in text
         assert "Reply" not in text
+
+    @pytest.mark.asyncio
+    async def test_low_difficulty_agentic_recommendation_prompts(
+        self, gate_client
+    ) -> None:
+        """SECURITY (2026-09-12): a low-difficulty assessment recommending
+        ``opencode`` must NOT auto-launch the bridge — the user is prompted
+        instead (the agentic route needs an explicit answer)."""
+        capture = _StreamCapture()
+        bridge_calls: list[str] = []
+
+        async def _fake_bridge(
+            text: str, *args: Any, **kwargs: Any,
+        ) -> AsyncIterator[tuple[str, str]]:
+            bridge_calls.append(text)
+            yield ("text", "SHOULD_NOT_RUN")
+
+        with patch("routes.stream_llm", new=capture), \
+             patch(
+                 "routes.classify_with_frontdesk",
+                 new=AsyncMock(return_value=_classification("CODE")),
+             ), \
+             patch(
+                 "routes.evaluate_coding_task",
+                 new=AsyncMock(return_value={
+                     "difficulty": "low",
+                     "recommendation": "opencode",
+                     "reason": "single-file edit",
+                 }),
+             ), \
+             patch("routes.opencode_chat_stream_resilient", new=_fake_bridge):
+            response = await gate_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "auto",
+                    "messages": [{
+                        "role": "user",
+                        "content": "refactor the routing module",
+                    }],
+                    "stream": True,
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            text = (await response.aread()).decode()
+
+        # The bridge was NOT launched — the user is prompted instead.
+        assert bridge_calls == []
+        assert capture.payload is None
+        assert "Coding decision" in text
 
 
 class TestMicroInputGuard:

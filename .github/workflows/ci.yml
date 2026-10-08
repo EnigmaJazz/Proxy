@@ -17,4 +17,4 @@ jobs:
       - name: Install sync dependencies
         run: pip install pyyaml httpx
       - name: Hard-block on profile drift
-        run: python tools/sync_model_profiles.py sync --check
+        run: python tools/sync_model_profiles.py --check

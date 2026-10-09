@@ -2200,10 +2200,11 @@ async def _opencode_task_response(
     client_stream: bool,
     session_map: Optional[dict[str, str]] = None,
     session_key: Optional[str] = None,
-    pending_permissions: Optional[dict[str, str]] = None,
+    pending_permissions: Optional[dict[str, tuple[str, bool]]] = None,
     just_approved_permission: bool = False,
     system_prompt: str = _BRIDGE_SYSTEM_PROMPT,
     timeout: float = OPENCODE_SERVE_TIMEOUT,
+    autonomous: bool = False,
 ) -> Response:
     """Run a task through the opencode bridge and return the response.
 
@@ -2215,6 +2216,9 @@ async def _opencode_task_response(
     When ``session_map``/``session_key`` are given the opencode agent session
     is pinned per conversation so follow-ups resume the same agent (it keeps
     its state and can answer clarifying questions).
+
+    ``autonomous`` marks SDD-autonomous mode (model "opencode-sdd"): the
+    bridge auto-allows every permission ask instead of relaying it (REQ-2).
     """
     if not task_text:
         return JSONResponse(
@@ -2236,6 +2240,7 @@ async def _opencode_task_response(
             just_approved_permission=just_approved_permission,
             system_prompt=system_prompt,
             timeout=timeout,
+            autonomous=autonomous,
         ):
             stop_after = False
             if not text_delta:
@@ -2290,6 +2295,9 @@ async def _opencode_task_response(
         session_key=session_key,
         pending_permissions=pending_permissions,
         just_approved_permission=just_approved_permission,
+        system_prompt=system_prompt,
+        timeout=timeout,
+        autonomous=autonomous,
     ):
         if kind == "text" and text_delta:
             resp_parts.append(text_delta)
@@ -2313,7 +2321,7 @@ async def _handle_opencode_request(
     client_stream: bool,
     session_map: Optional[dict[str, str]] = None,
     session_key: Optional[str] = None,
-    pending_permissions: Optional[dict[str, str]] = None,
+    pending_permissions: Optional[dict[str, tuple[str, bool]]] = None,
     sdd: bool = False,
 ) -> Response:
     """Handle ``model: "opencode"`` — direct the task to the opencode agent.
@@ -2338,6 +2346,7 @@ async def _handle_opencode_request(
             _SDD_AUTONOMOUS_SYSTEM_PROMPT if sdd else _BRIDGE_SYSTEM_PROMPT
         ),
         timeout=OPENCODE_SDD_TIMEOUT if sdd else OPENCODE_SERVE_TIMEOUT,
+        autonomous=sdd,
     )
     return resp
 

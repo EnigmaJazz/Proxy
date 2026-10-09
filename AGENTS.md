@@ -45,6 +45,22 @@ project-specific.
    opt-out via `X-Proxy-Context-Governance: off`. This is a mechanical budget
    optimization, not an intent alteration.
 
+   **Documented carve-out — current date/time stamp** (`routes.py`
+   `_inject_current_datetime`): frontends (nanobot, OpenWebUI) never send
+   the date, so the models they drive run date-blind. The proxy MAY add
+   the current DATE to the OUTBOUND system message, APPENDED after the
+   system content (not prefixed): the stable system prefix must stay
+   KV-cache-visible so the model's prompt cache hits across requests.
+   The stamp is DATE-ONLY (2026-08-11) — a clock time changed the
+   cache-visible prefix every request and invalidated every checkpoint
+   (the server's "erased invalidated context checkpoint" logs), forcing
+   full prefills even on session follow-ups; the date changes once per
+   day. It never touches user or assistant text, never mutates the
+   client's stored conversation or the DB audit copy, and is per-request
+   opt-out via `X-Proxy-Date-Time: off`. This is a content-availability
+   fix mirroring the opencode app's own date-only stamp for its
+   sessions.
+
    **Documented carve-out — search-result enrichment** (`proxy/search_enrichment.py`):
    frontends own tool execution and often return thin `search_web` results (a JSON
    array of `{title, link, snippet}`) that the model cannot answer from. When a
@@ -79,6 +95,43 @@ project-specific.
    request, shared state lives on `proxy.app.state.*`. Module-level mutable
    globals are forbidden except cached constants in `constants.py`.
 
+   **Documented carve-out — serve-config mtime cache** (`opencode_bridge.py`
+   `_serve_config_mtime`): a scalar `Optional[float]` cache of the serve
+   config's last-synced mtime, mutated only in `_sync_serve_config` /
+   `_spawn_serve`. The spawn gate has no `app.state` handle (it runs from
+   scripts and tests too), so threading app state through would couple the
+   bridge's core to the FastAPI app. Accepted as a project exception
+   (2026-08-09, F5 note in `opencode_bridge.py`); the cache is a scalar
+   timestamp, never a container.
+
+   **Documented carve-out — prompt priming registries** (`prompt_cache.py`
+   `_PROMPTS` / `_LAST_PRIMED`): runtime-mutable module-level registries
+   for the frontend system-prompt priming. Priming is currently DISABLED
+   (2026-08-12, commit 2e408fc: the session KV-cache does the real work and
+   the prime never reduced the first-request prefill), so nothing in the
+   residency monitor loop (hardware.py) or the request path (routes.py)
+   calls it; the module, its registries and its tests are kept so it can
+   be re-enabled. When wired, the priming runs from those two places with
+   no app.state handle in the monitor, so threading app state through
+   would couple the cache to the FastAPI app. Accepted as a project
+   exception (2026-08-11, F6 note in `prompt_cache.py`); the registries
+   are small, per-process, and die with the process.
+
+   **Documented carve-out — bridge backend service reference**
+   (`opencode_backends.py` `BACKEND`): a module-level `OpenCodeBackend`
+   service reference for the opencode bridge's transport abstraction.
+   Accepted as a project exception (2026-08-16, F7 note in
+   `opencode_backends.py`); the reference is a never-mutated pointer to a
+   STATELESS backend (session/request state lives in the caller's dicts
+   and per-request httpx clients), so it carries no mutable state — the
+   same class of exception as the F5/F6 scalar/registry carve-outs.
+   When `OPENCODE_BACKEND=openchamber` selects `OpenChamberBackend`, the
+   reference points at an instance that carries ONE piece of per-session
+   state (a session_id → directory map — the CLI needs `--dir` on every
+   call while the interface only carries the directory at create) —
+   documented as the F8 exception in `opencode_backends.py`; the default
+   `ServeBackend` remains stateless.
+
 7. **Tests**: new code paths MUST have a regression test. Use the harness in
    `tests/conftest.py` (stubs FlashRank + heavy deps, lifespan disabled).
    Async tests need `@pytest_asyncio.fixture` (NOT plain `@pytest.fixture`).
@@ -106,3 +159,12 @@ project-specific.
 - `openspec/changes/glass-pipe-followups/` — R17/R18 specs and design
 - `docs/brainstorms/2026-07-05-proxy-glass-pipe-hardening-requirements.md` — R1–R10 violations
 - `docs/brainstorms/2026-07-19-client-named-model-fix.md` — R19 fix background
+
+## Task routing (workflow recipe)
+
+This repo participates in the machine-wide task-routing recipe. The canonical recipe is `/home/james/ai-workspace/workflow_optimisation/WORKFLOW.md` (loaded via the global opencode AGENTS.md); its task classes are tiny fix, small feature, substantial feature, bug investigation, documentation, and global tooling change.
+
+- Classify incoming tasks by decision content, not file count; ambiguous → ask, default substantial.
+- Every code change passes the receipt-driven review gate before delivery (RDD is enabled globally).
+- After each routed task, append one row to `ROUTER-LOG.md` in this repo (date, task, class, reclassification, gate outcome, probe flag, evidence) AND add the `ROUTED: <class>@<gate-outcome>` trailer to the task's commit.
+- The `.gga` hook and this file remain the code-review contract for this proxy; the routing recipe sits alongside it, not in place of it.

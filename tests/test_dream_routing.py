@@ -143,6 +143,37 @@ async def test_dream_routes_to_professional_code_profile(dream_client: Any) -> N
 
 
 @pytest.mark.asyncio
+async def test_apply_local_bypass_routes_straight_to_professional(
+    dream_client: Any,
+) -> None:
+    """The opencode serve's sdd-apply-local delegation (the task text
+    'You are the apply executor for SDD change ...') must bypass the
+    frontdesk triage and the coding gate and pin the professional model
+    directly — the user explicitly chose the LOCAL model for the apply."""
+    capture = _StreamCapture()
+    with patch("routes.stream_llm", new=capture):
+        resp = await dream_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "auto",
+                "messages": [
+                    {"role": "user", "content": "\u00a71\u00a7 You are the apply executor for SDD change `r1-quests-xp`, slice S5a"},
+                ],
+                "stream": True,
+            },
+        )
+
+    assert resp.status_code == 200
+    params = _params_replaced(_parse_sse_events(resp.text))
+    assert params["model"] == "professional"
+
+    assert capture.payload is not None
+    # The payload's model key is the route's model key; the profile values
+    # were applied (the params_replaced event proves the route resolved).
+    assert params["values"]["temperature"] == 0.2
+
+
+@pytest.mark.asyncio
 async def test_dream_params_replaced_only_lists_applied_fields(
     dream_client: Any,
 ) -> None:

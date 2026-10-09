@@ -49,6 +49,7 @@ from constants import (
     IDE_PASSTHROUGH_HEADER,
     LOOP_LIMITS,
     ROUTE_MAP,
+    _machine,
     _DREAM_FALLBACK_PHRASES,
     _DREAM_SNIP_PHRASES,
     get_logger,
@@ -110,10 +111,12 @@ def _get_dream_phrases() -> list[str]:
         Falls back to _DREAM_FALLBACK_PHRASES if the template is
         inaccessible.
     """
-    # Glob with wildcard Python version — survives uv updates
-    pattern = (
-        "~/.local/share/uv/tools/nanobot-ai/lib/python*/"
-        "site-packages/nanobot/templates/agent/dream_phase1.md"
+    # Glob with wildcard Python version — survives uv updates.  The nanobot
+    # install lives under the user's uv tool dir; the pattern is
+    # machine-specific (local_config.UV_NANOBOT_PATTERN).
+    pattern = _machine(
+        "UV_NANOBOT_PATTERN",
+        os.path.expanduser("~/.local/share/uv/tools/nanobot-ai/lib/python*/") + "site-packages/nanobot/templates/agent/dream_phase1.md",
     )
     paths = sorted(glob.glob(pattern))
     if not paths:
@@ -303,7 +306,7 @@ def _front_desk_prompt() -> str:
     """Load the frontdesk prompt from disk (cached after first load).
 
     Uses ``load_role_prompt("frontdesk")`` which reads from
-    ``~/kinver-hub/prompts/frontdesk.txt``.  Cached since the
+    ``<kinver-home>/prompts/frontdesk.txt``.  Cached since the
     prompt doesn't change at runtime.
     """
     from llm import load_role_prompt
@@ -573,6 +576,96 @@ async def evaluate_coding_task(
 # ---------------------------------------------------------------------------
 # Model resolution
 # ---------------------------------------------------------------------------
+
+
+def _safe_json_parse(text: str) -> Any:
+    """Best-effort JSON extraction from a model reply (the first {...}
+    block).  Returns None on failure."""
+    import json as _json
+    try:
+        return _json.loads(text.strip())
+    except ValueError:
+        pass
+    try:
+        start = text.find("{")
+        end = text.rfind("}")
+        if 0 <= start < end:
+            return _json.loads(text[start:end + 1])
+    except ValueError:
+        pass
+    return None
+
+
+async def reclassify_with_professional(
+    user_text: str,
+    model_port: int = 0,
+) -> dict[str, Any]:
+    """Ask the professional model to reclassify a request before answering.
+
+    The 2B frontdesk under-judges complex work (it called a 12-file
+    refactor "low").  The professional's reclassification runs on the
+    SAME context the answering pass will use — the professional's
+    KV-cache makes the reclassification preprocessing reusable by the
+    answering call, so the added latency is the marginal decode, not a
+    full re-read.  The proxy then assigns the correct intent-based
+    sampling parameters to the actual answering call.  Best-effort: on
+    any failure returns {} so the frontdesk's classification stands.
+    """
+    defaults: dict[str, Any] = {}
+    try:
+        from llm import call_model
+
+        prompt = (
+            "You are the proxy's reclassifier.  Given the request context "
+            "below, reclassify it for correct routing and sampling.  Reply "
+            "with EXACTLY this JSON — no commentary, no markdown:\n"
+            '{"intent": "CHAT|TOOL|CODE|SCHOLAR|IMAGE|PROFESSIONAL", '
+            '"priority": 1|2|3, "complexity": "low|medium|high", '
+            '"parameters": {"temperature": 0.0-1.5, "top_p": 0.0-1.0, '
+            '"thinking_budget_tokens": 0-8192}}\n'
+            "Guidance: coding and multi-step work -> CODE; research/deep "
+            "analysis -> SCHOLAR; image-bearing requests -> IMAGE; casual "
+            "conversation -> CHAT; tool-requiring requests -> TOOL.  "
+            "Priority 1 = heavy model required, 3 = light.  "
+            "Parameters: complex/analytic work benefits from lower "
+            "temperature (0.1-0.3) and a thinking budget; casual chat from "
+            "higher temperature; simple factual answers from zero thinking.\n"
+            f"REQUEST CONTEXT:\n{user_text[:4000]}"
+        )
+        port = model_port or 13109  # professional default port
+        text = await asyncio.wait_for(
+            call_model(port, prompt, max_tokens=256), timeout=15.0,
+        )
+        payload = _safe_json_parse(text)
+        if not isinstance(payload, dict):
+            return defaults
+        result = dict(defaults)
+        if isinstance(payload.get("intent"), str):
+            result["intent"] = payload["intent"].upper()
+        # Values are clamped + type-checked: the reclassifier's output is
+        # steerable via prompt injection in user_text, and unclamped values
+        # would flow straight into the generation sampling parameters.
+        prio = payload.get("priority")
+        if isinstance(prio, int) and 1 <= prio <= 3:
+            result["priority"] = prio
+        if isinstance(payload.get("complexity"), str):
+            result["complexity"] = payload["complexity"].lower()
+        if isinstance(payload.get("parameters"), dict):
+            params: dict[str, Any] = {}
+            temp = payload["parameters"].get("temperature")
+            if isinstance(temp, (int, float)) and 0.0 <= float(temp) <= 1.5:
+                params["temperature"] = float(temp)
+            top_p = payload["parameters"].get("top_p")
+            if isinstance(top_p, (int, float)) and 0.0 <= float(top_p) <= 1.0:
+                params["top_p"] = float(top_p)
+            tb = payload["parameters"].get("thinking_budget_tokens")
+            if isinstance(tb, int) and 0 <= tb <= 8192:
+                params["thinking_budget_tokens"] = tb
+            if params:
+                result["parameters"] = params
+        return result
+    except (httpx.HTTPError, OSError, ValueError, AttributeError):
+        return defaults
 
 def resolve_model(intent: str, is_lane_b: bool = False) -> str:
     """

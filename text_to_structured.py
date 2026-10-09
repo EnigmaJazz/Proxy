@@ -2,7 +2,7 @@
 structured ``delta.tool_calls``.
 
 The Qwen 3.5 chat template (and the fixed v21 template at
-``~/kinver-hub/config/qwen-fixed.jinja``) instructs the model
+``<kinver-home>/config/qwen-fixed.jinja``) instructs the model
 to emit tool calls in the XML text format:
 
     <tool_call>
@@ -31,7 +31,7 @@ from typing import Any
 
 
 # Tags emitted by the Qwen 3.5 chat template's system prompt
-# (see ~/kinver-hub/config/qwen-fixed.jinja line 124).
+# (see <kinver-home>/config/qwen-fixed.jinja line 124).
 _OPEN_TAG = "<tool_call>"
 _CLOSE_TAG = "</tool_call>"
 _FUNCTION_TAG_RE = re.compile(r"<function=([^>\s]+)>")

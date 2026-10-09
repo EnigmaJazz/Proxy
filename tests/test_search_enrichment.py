@@ -272,6 +272,69 @@ class TestEnrichment:
 
 
 # ---------------------------------------------------------------------------
+# Date/time injection — routes._inject_current_datetime
+# ---------------------------------------------------------------------------
+
+class TestDateTimeInjection:
+    """The OUTBOUND system message gets the current date + time (frontends
+    never send it), with ``X-Proxy-Date-Time: off`` as the opt-out."""
+
+    def _inject(self, msgs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        from routes import _inject_current_datetime
+        return _inject_current_datetime(msgs)
+
+    def test_prefixes_existing_system_message(self) -> None:
+        msgs = [{"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "hi"}]
+        out = self._inject(msgs)
+        # KV-CACHE POSITION (2026-08-11): the stamp is APPENDED to the
+        # system message so the stable system content stays the
+        # cache-visible prefix — a prepended time changed the prefix
+        # every request and forced full ~45s prefills.
+        assert out[0]["content"].startswith("You are helpful.")
+        assert "Today's date:" in out[0]["content"]
+        # DATE-ONLY (2026-08-11): the clock time changed the cache-
+        # visible prefix every request and invalidated every checkpoint
+        assert "Current time:" not in out[0]["content"]
+        assert "Today's date:" in out[0]["content"][-60:]  # stamp at the end
+        assert out[1] == msgs[1]  # user message untouched
+
+    def test_inserts_system_message_when_absent(self) -> None:
+        msgs = [{"role": "user", "content": "hi"}]
+        out = self._inject(msgs)
+        assert len(out) == 2
+        assert out[0]["role"] == "system"
+        assert out[0]["content"].startswith("Today's date:")
+        assert out[1] == msgs[0]
+
+    def test_never_mutates_input(self) -> None:
+        msgs = [{"role": "system", "content": "You are helpful."}]
+        self._inject(msgs)
+        assert msgs[0]["content"] == "You are helpful."
+
+    @pytest.mark.asyncio
+    async def test_govern_wiring_default_on(self) -> None:
+        from routes import _govern_messages
+        import types as _types
+        request = _types.SimpleNamespace(headers={})
+        msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
+        out = await _govern_messages(request, msgs, model_key="professional", max_tokens=4096)
+        assert out[0]["content"].startswith("sys")
+        assert "Today's date:" in out[0]["content"]
+
+    @pytest.mark.asyncio
+    async def test_govern_wiring_opt_out(self) -> None:
+        from routes import _govern_messages
+        import types as _types
+        request = _types.SimpleNamespace(
+            headers={"x-proxy-date-time": "off", "x-proxy-repo-context": "off"},
+        )
+        msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
+        out = await _govern_messages(request, msgs, model_key="professional", max_tokens=4096)
+        assert out[0]["content"] == "sys"
+
+
+# ---------------------------------------------------------------------------
 # Wire tests — routes._govern_messages (OUTBOUND copy + opt-out header)
 # ---------------------------------------------------------------------------
 
@@ -294,7 +357,7 @@ class TestGovernMessagesWiring:
         monkeypatch.setattr("tools.web_search.execute_web_search", _fake_search)
         msgs = _search_messages(THIN_SNIPPET_JSON)
         out = await self._govern(msgs, {})
-        assert "Rich answer for weather forecast in Kinver" in out[2]["content"]
+        assert "Rich answer for weather forecast in Kinver" in out[3]["content"]
         # DB audit copy source is untouched (input never mutated)
         assert msgs[2]["content"] == THIN_SNIPPET_JSON
 
@@ -306,4 +369,26 @@ class TestGovernMessagesWiring:
         monkeypatch.setattr("tools.web_search.execute_web_search", _should_not_run)
         msgs = _search_messages(THIN_SNIPPET_JSON)
         out = await self._govern(msgs, {"x-proxy-search-enrichment": "off"})
-        assert out[2]["content"] == THIN_SNIPPET_JSON
+        assert out[3]["content"] == THIN_SNIPPET_JSON
+
+
+class TestPrimingCallerKey:
+    """The observed registration keys the nanobot's requests under a
+    stable "nanobot" caller (its apiKey is the shared AGENTIC token —
+    the generic caller would thrash the observed registration)."""
+
+    @pytest.mark.asyncio
+    async def test_nanobot_ua_registers_nanobot_key(self) -> None:
+        from routes import _priming_caller_for
+
+        assert _priming_caller_for(
+            {"user-agent": "nanobot/0.5.1 python-httpx"}, "AGENTIC",
+        ) == "nanobot"
+
+    @pytest.mark.asyncio
+    async def test_other_agentic_keeps_caller_type(self) -> None:
+        from routes import _priming_caller_for
+
+        assert _priming_caller_for(
+            {"user-agent": "python-httpx/0.27"}, "AGENTIC",
+        ) == "AGENTIC"

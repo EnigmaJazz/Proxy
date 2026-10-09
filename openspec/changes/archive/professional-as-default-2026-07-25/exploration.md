@@ -57,10 +57,10 @@ average (CHAT and CODE both trigger a swap to a different model).
 - `profile_loader.py:54-82` — `ModelProfileTable.resolve`: 3-step lookup (exact → model-wildcard → intent-fallback). The (CHAT, professional) and (TOOL, professional) tuples need resolution.
 - `profile_loader.py:21-22` — `_CODE_INTENTS` includes `{CODE, ARCHITECT, TOOL, PROFESSIONAL}`; `_CHAT_INTENTS` is `{CHAT, CREATIVE, SCHOLAR}`. So CHAT → "chat" bucket, TOOL → "code" bucket.
 - `config/model_profiles.yaml:58-70` — `professional` row has `intent: code` (line 59). **No `professional` row with `intent: chat` exists today**. The resolver would fall back to `model: "*", intent: chat` (line 142-147: `temperature: 0.7, top_p: 1.0, max_tokens: 4096, thinking_budget_tokens: 0`).
-- `config/local_models.yaml:23-24` — `professional: ~/kinver-hub/models/Professional.gguf` (22 GB Qwen3.6 35B MoE per `llama-professional.service`).
-- `config/local_models.yaml:19-20` — `worker: ~/kinver-hub/models/Worker.gguf` (7.6 GB Qwen 3.5 9B).
-- `config/local_models.yaml:29-30` — `chatter: ~/kinver-hub/models/Lifeboat.gguf` (4.9 GB Mistral3 — actually uses the Lifeboat GGUF, not a separate model).
-- `config/local_models.yaml:33-34` — `lifeboat: ~/kinver-hub/models/Lifeboat.gguf`. Same file as chatter.
+- `config/local_models.yaml:23-24` — `professional: /kinver-home/models/Professional.gguf` (22 GB Qwen3.6 35B MoE per `llama-professional.service`).
+- `config/local_models.yaml:19-20` — `worker: /kinver-home/models/Worker.gguf` (7.6 GB Qwen 3.5 9B).
+- `config/local_models.yaml:29-30` — `chatter: /kinver-home/models/Lifeboat.gguf` (4.9 GB Mistral3 — actually uses the Lifeboat GGUF, not a separate model).
+- `config/local_models.yaml:33-34` — `lifeboat: /kinver-home/models/Lifeboat.gguf`. Same file as chatter.
 
 ### Hotswap & Heavy Model Mechanics
 
@@ -84,8 +84,8 @@ average (CHAT and CODE both trigger a swap to a different model).
 ### Tool Calling on Professional
 
 - `routes.py:163, 587-588` — Tools are passed through: `if tools: payload["tools"] = tools` (line 587-588). No tool_choice forwarding (deliberate, commit `9904917`).
-- `~/kinver-hub/prompts/worker.txt:23-34` — The Worker system prompt is **explicitly trained on the OpenAI tool_calls JSON format** with the exact `Action: {"tool_calls": [...]}` pattern. The Lifeboat prompt (`lifeboat.txt`) is identical.
-- `~/kinver-hub/prompts/worker.txt` and `lifeboat.txt` are the only prompts that teach the tool-call pattern. **Professional, Architect, Creative, Scholar have no role prompts**; they fall through to the model's GGUF-embedded template + `--jinja` (where present).
+- `/kinver-home/prompts/worker.txt:23-34` — The Worker system prompt is **explicitly trained on the OpenAI tool_calls JSON format** with the exact `Action: {"tool_calls": [...]}` pattern. The Lifeboat prompt (`lifeboat.txt`) is identical.
+- `/kinver-home/prompts/worker.txt` and `lifeboat.txt` are the only prompts that teach the tool-call pattern. **Professional, Architect, Creative, Scholar have no role prompts**; they fall through to the model's GGUF-embedded template + `--jinja` (where present).
 - `routes.py:601-641` — TOOL routing in `resolve_route_for_lane_a`: the `has_tool_history` branch keeps Worker on GPU even when busy. **This entire "lock to Worker" code is about preserving tool-calling JSON quality**. If we route TOOL to Professional, this branch is no longer needed (Professional is always-on, not hot-swapped).
 - `routes.py:362-396` — Mid-tool-flow lock: if last message is assistant+tool_calls OR role=tool → force intent=TOOL, skip frontdesk. **If TOOL goes to Professional, the lock is harmless** (just forces the same destination).
 - `routing.py:618-641` — Lifeboat template rejection: Lifeboat's chat template rejects messages with `tool_calls`/`tool_call_id`. This is why mid-tool-flow can't fall back to Lifeboat. **Professional has no such restriction** (no role prompt injected).

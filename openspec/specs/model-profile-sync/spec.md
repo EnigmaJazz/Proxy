@@ -75,15 +75,15 @@ The GGUF header (`general.name`, `general.architecture`, `*.context_length`) is 
 - THEN the YAML is regenerated on disk
 - AND the running proxy is NOT hot-reloaded
 
-### REQ-4: CI drift gate hard-blocks on profile drift (R18)
+### REQ-4: Pre-push drift gate hard-blocks on profile drift (R18)
 
-CI SHALL run `sync --check` as a HARD gate. Drift SHALL fail the build and block merge. The gate MUST NOT auto-regenerate the YAML; a human MUST commit the regenerated file.
+A local pre-push hook (`scripts/pre-push-drift-check.sh`) SHALL run `tools/sync_model_profiles.py --check` as a HARD gate. Drift SHALL block the push. The gate runs locally because the check reads GGUF model files that are not available to a hosted CI runner. The gate MUST NOT auto-regenerate the YAML; a human MUST commit the regenerated file.
 
-#### Scenario-1: Drift fails CI
+#### Scenario-1: Drift blocks the push
 
-- GIVEN a PR introduces drift in `config/model_profiles.yaml`
-- WHEN CI runs the drift gate
-- THEN the build fails and merge is blocked
+- GIVEN a commit introduces drift in `config/model_profiles.yaml`
+- WHEN the pre-push hook runs the drift gate
+- THEN the hook exits non-zero and the push is blocked
 
 ### REQ-5: max_tokens derived from context window with 10% headroom (R18)
 

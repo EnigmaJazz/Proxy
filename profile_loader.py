@@ -20,6 +20,8 @@ logger = get_logger("proxy.profile_loader")
 # Proxy intent vocabulary mapped to the two YAML buckets.
 _CODE_INTENTS: frozenset[str] = frozenset({"CODE", "ARCHITECT", "TOOL", "PROFESSIONAL"})
 _CHAT_INTENTS: frozenset[str] = frozenset({"CHAT", "CREATIVE", "SCHOLAR"})
+# Vision requests: dedicated sampling bucket (professional/image row).
+_IMAGE_INTENTS: frozenset[str] = frozenset({"IMAGE"})
 
 # Keys that are metadata on a YAML row, not forwarded sampling parameters.
 _METADATA_KEYS: frozenset[str] = frozenset({"model", "intent", "context_window"})
@@ -36,10 +38,12 @@ class ProfileEntry:
 
 
 def bucket(intent: str) -> str:
-    """Map a proxy intent to the YAML ``code`` or ``chat`` bucket."""
+    """Map a proxy intent to the YAML ``code``, ``chat`` or ``image`` bucket."""
     normalized = intent.upper()
     if normalized in _CODE_INTENTS:
         return "code"
+    if normalized in _IMAGE_INTENTS:
+        return "image"
     if normalized in _CHAT_INTENTS:
         return "chat"
     return "chat"

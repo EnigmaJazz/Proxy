@@ -24,7 +24,9 @@ import json
 import re
 import sqlite3
 import subprocess
+import shutil
 import time
+from datetime import datetime
 import uuid
 from pathlib import Path
 import httpx
@@ -48,6 +50,8 @@ from constants import (
     MODEL_LABELS,
     OPENCODE_AGENT,
     OPENCODE_SDD_TIMEOUT,
+    OPENCODE_SDD_DIRECTORY,
+    OPENCODE_BRIDGE_DIRECTORY,
     OPENCODE_SERVE_TIMEOUT,
     RUNTIME_CONTEXT_WINDOWS,
     get_logger,
@@ -58,6 +62,7 @@ from context_governance import (
     strip_proxy_status,
 )
 from search_enrichment import enrich_thin_search_results
+from image_downscale import downscale_images
 from llm import (
     stream_llm,
     openrouter_cloud_escalation,
@@ -67,8 +72,7 @@ from opencode_bridge import (
     _SDD_AUTONOMOUS_SYSTEM_PROMPT,
     _parse_permission_answer,
     _post_permission_response,
-    opencode_chat,
-    opencode_chat_stream,
+    opencode_chat_stream_resilient,
 )
 from routing import (
     RouteDecision,
@@ -81,6 +85,7 @@ from routing import (
     check_semantic_cache,
     extract_project_context,
     is_dream_process,
+    reclassify_with_professional,
 )
 from text_to_structured import ToolCallTextToStructured, _format_status
 
@@ -95,7 +100,7 @@ logger = get_logger("proxy.routes")
 _PAUSE_RE = re.compile(r"(?i)\s*/pause(?:\s+(\d+))?\s*$")
 _RESUME_RE = re.compile(r"(?i)\s*/resume\s*$")
 _CLOUD_RE = re.compile(r"/cloud")
-_OPENCODE_RE = re.compile(r"/opencode")
+_OPENCODE_RE = re.compile(r"(?i)^\s*/opencode(?:\s|$)")
 
 # Sentinel-prefixed coding-decision question.  Visible inline (like the
 # triage) and stripped from the OUTBOUND model-copy by strip_proxy_status,
@@ -165,7 +170,7 @@ def _coding_decision_state(app: FastAPI) -> dict[str, str]:
     return state.coding_decisions
 
 
-def _opencode_session_state(app: FastAPI) -> dict[str, str]:
+async def _opencode_session_state(app: FastAPI) -> dict[str, str]:
     """Lazy accessor for the pinned opencode agent sessions on ``app.state``.
 
     Keyed by proxy ``session_id`` → opencode session id.  Pinning lets a
@@ -178,9 +183,12 @@ def _opencode_session_state(app: FastAPI) -> dict[str, str]:
     state = app.state
     if not hasattr(state, "opencode_sessions"):
         # Deliberate one-time lazy init (a single cold read on first
-        # access; the map is then cached on app.state and all later
-        # mutations are disk-persisted off the event loop).
-        state.opencode_sessions = _load_opencode_sessions()
+        # access — on a worker thread, Rule 3; the map is then cached on
+        # app.state and all later mutations are disk-persisted off the
+        # event loop).
+        state.opencode_sessions = await asyncio.to_thread(
+            _load_opencode_sessions,
+        )
     return state.opencode_sessions
 
 
@@ -208,7 +216,7 @@ async def _persist_opencode_sessions(app: FastAPI) -> None:
     """
     try:
         path = Path.home() / ".kinver-proxy" / "opencode-sessions.json"
-        data = json.dumps(_opencode_session_state(app))
+        data = json.dumps(await _opencode_session_state(app))
         await asyncio.to_thread(_write_opencode_sessions, path, data)
     except OSError as exc:
         logger.warning("Failed to persist opencode sessions: %s", exc)
@@ -266,6 +274,8 @@ def _parse_coding_answer(text: str) -> str:
         return "cancel"
     if any(k in lowered for k in ("opencode", "/opencode")):
         return "opencode"
+    if any(k in lowered for k in ("sdd", "spec-driven", "spec driven", "sd cycle")):
+        return "sdd"
     return "professional"
 
 
@@ -295,7 +305,8 @@ def _looks_like_gibberish(text: str) -> bool:
     """True when the text has fewer than two alphabetic words — the
     profile of complete nonsense (e.g. ``asdfghjkl12345!!!@@@``).  Used as
     a guard so the 2B frontdesk's ``is_valid=False`` cannot false-positive
-    on short-but-meaningful queries like ``help``.  The ``[role]:`` labels
+    on short-but-meaningful multi-word queries (a lone ``help`` IS
+    intercepted when the frontdesk says invalid).  The ``[role]:`` labels
     from the context dump are stripped first so they don't count as words.
     """
     stripped = re.sub(r"\[[^\]]+\]:\s*", "", text or "")
@@ -418,6 +429,36 @@ def _first_user_message_content(messages: list[dict[str, Any]]) -> str:
                 )
             return str(content) if content else ""
     return ""
+
+
+def _request_has_image(messages: list[dict[str, Any]]) -> bool:
+    """True when the conversation carries an image part the model must see.
+
+    Detects typed image parts (OpenAI ``{"type": "image_url"}`` and
+    Anthropic ``{"type": "image"}``) and inline base64
+    (``data:image/...``) in any user/tool content.  The frontdesk
+    classifier only sees flattened text, so image requests must be
+    classified HERE (as IMAGE → professional) before it can misroute
+    them (e.g. to CODE) from the text alone.
+    """
+    for msg in messages:
+        if msg.get("role") not in ("user", "tool"):
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            if "data:image/" in content:
+                return True
+            continue
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                ptype = str(part.get("type") or "")
+                if ptype in ("image_url", "image"):
+                    return True
+                if ptype == "text" and "data:image/" in str(part.get("text") or ""):
+                    return True
+    return False
 
 
 def _resolve_session_id(messages: list[dict[str, Any]], app: FastAPI) -> str:
@@ -563,6 +604,267 @@ async def list_models(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
+#: Module-level registry of the most recent completed opencode tasks
+#: (summary + repo snapshot), consumed by the professional's repo-context
+#: injection (_repo_context_block).  The capture runs from stream
+#: generators (_opencode_task_response) that hold no app.state handle, so
+#: threading app state through would couple the task response to the
+#: FastAPI app — accepted project exception (2026-08-14, mirrors the
+#: prompt_cache F6 carve-out).  Small, per-process; dies with the process.
+_RECENT_OPENCODE_WORK: list[dict[str, Any]] = []
+_MAX_RECENT_WORK = 2
+
+
+def _copy_sdd_output_to_workspace(change_name: str, summary: str) -> str:
+    """Copy a completed SDD cycle's artifacts into the nanobot workspace.
+
+    SDD-autonomous cycles run in the proxy repo (OPENCODE_SDD_DIRECTORY —
+    the OpenSpec store lives there).  The cycle's final output is copied
+    to ``<bridge-directory>/sdd-work/<change>/`` — the shared workspace
+    the local model reads — with the final summary as FINAL-SUMMARY.md.
+    Returns the destination path ("" when the change dir is missing).
+    Runs in a worker thread (file I/O).  Never raises.
+    """
+    src = Path(OPENCODE_SDD_DIRECTORY) / "openspec" / "changes" / change_name
+    dst = Path(OPENCODE_BRIDGE_DIRECTORY) / "sdd-work" / change_name
+    try:
+        if not src.is_dir():
+            return ""
+        dst.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(src, dst, dirs_exist_ok=True)
+        if summary:
+            (dst / "FINAL-SUMMARY.md").write_text(summary, encoding="utf-8")
+        logger.info(
+            "Copied SDD output for change %s to %s", change_name, dst,
+        )
+        return str(dst)
+    except OSError:
+        logger.exception("copying SDD output to workspace failed")
+        return ""
+
+
+def _capture_opencode_work(text_parts: list[str]) -> None:
+    """Snapshot a completed opencode task for the local model's repo
+    context: the final summary text plus the working-tree state at task
+    end (the agent's files land in the repo, and a future professional
+    conversation has no other way to see them — the model has no tools).
+    Runs in a worker thread (git calls are blocking).  Never raises.
+    """
+    summary = "".join(text_parts).strip()
+    if not summary:
+        return
+    repo = Path(OPENCODE_BRIDGE_DIRECTORY)
+    status = diffstat = log = ""
+    try:
+        status = subprocess.check_output(
+            ["git", "-C", str(repo), "status", "--short"],
+            text=True, timeout=10,
+        ).strip()
+        diffstat = subprocess.check_output(
+            ["git", "-C", str(repo), "diff", "--stat"],
+            text=True, timeout=10,
+        ).strip()
+        log = subprocess.check_output(
+            ["git", "-C", str(repo), "log", "--oneline", "-3"],
+            text=True, timeout=10,
+        ).strip()
+    except (subprocess.SubprocessError, OSError):
+        pass
+    _RECENT_OPENCODE_WORK.append({
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "summary": summary[:1200],
+        "status": status,
+        "diffstat": diffstat,
+        "log": log,
+    })
+    del _RECENT_OPENCODE_WORK[_MAX_RECENT_WORK:]
+
+
+def _repo_context_block() -> str:
+    """Compact repo-state block for the professional's system message: the
+    most recent opencode tasks (summary + files), the CONTENT of the work
+    files (untracked files in full, tracked changes as diffs — the model
+    has no tools, so this is its only way to read and edit them), plus the
+    current working-tree/commit state.  Bounded (per-file line caps + a
+    total budget); the live git/file reads are cheap and the block is
+    cache-stable between repo changes.
+    """
+    parts: list[str] = []
+    for entry in _RECENT_OPENCODE_WORK[-_MAX_RECENT_WORK:]:
+        parts.append(
+            f"[Recent OpenCode task ({entry['time']})]\n{entry['summary']}"
+        )
+        if entry["status"]:
+            parts.append(f"Files it changed:\n{entry['status']}")
+        if entry["diffstat"]:
+            parts.append(entry["diffstat"])
+    repo = Path(OPENCODE_BRIDGE_DIRECTORY)
+    status = log = ""
+    try:
+        status = subprocess.check_output(
+            ["git", "-C", str(repo), "status", "--short"],
+            text=True, timeout=5,
+        ).strip()
+        log = subprocess.check_output(
+            ["git", "-C", str(repo), "log", "--oneline", "-5"],
+            text=True, timeout=5,
+        ).strip()
+    except (subprocess.SubprocessError, OSError):
+        pass
+    if status:
+        content_section = _repo_content_section(status, repo=repo)
+        if content_section:
+            parts.append(
+                "[OpenCode work files — read them to understand and edit the code]"
+            )
+            parts.append(content_section)
+        parts.append(f"[Current working tree]\n{status}")
+    if log:
+        parts.append(f"[Recent commits]\n{log}")
+    return "\n\n".join(parts) if parts else ""
+
+
+_MAX_FILE_LINES = 400
+_MAX_DIFF_LINES = 300
+_MAX_CONTENT_LINES = 800
+
+#: Nanobot-internal state dirs in the workspace — never injected into the
+#: model's system prompt (noise + the conversation memory is private to
+#: nanobot).  The shared context is SOUL.md/USER.md/AGENTS.md and the
+#: agents' real work files.
+_NANOBOT_INTERNAL_PREFIXES = (
+    ".nanobot/", "memory/", "logs/", "media/", "backups/", "history/",
+)
+
+
+def _repo_content_section(
+    status: str,
+    repo: Optional[Path] = None,
+) -> str:
+    """Read the opencode work files into the repo-context block so the
+    local model can understand and edit them: untracked files in full
+    (they have no diff), tracked modifications as working-tree diffs.
+    Bounded per file and by a total line budget; oversized/binary files
+    and nanobot-internal state dirs are skipped.
+    """
+    repo = repo or Path(OPENCODE_BRIDGE_DIRECTORY)
+    lines_out: list[str] = []
+    budget = _MAX_CONTENT_LINES
+    for line in status.splitlines():
+        st, _, path = line.partition(" ")
+        path = path.strip()
+        if not path or any(path.startswith(p) for p in _NANOBOT_INTERNAL_PREFIXES):
+            continue
+        full = repo / path
+        if st.startswith("??"):
+            try:
+                if not full.is_file() or full.stat().st_size > 200_000:
+                    continue
+                content = full.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            clines = content.splitlines()
+            capped = clines[:_MAX_FILE_LINES]
+            lines_out.append(f"[File: {path}]")
+            lines_out.extend(capped)
+            if len(clines) > len(capped):
+                lines_out.append(
+                    f"... ({len(clines) - len(capped)} more lines truncated)"
+                )
+            budget -= len(capped) + 2
+        elif st.strip().startswith(("M", "A")):
+            try:
+                diff = subprocess.check_output(
+                    ["git", "-C", str(repo), "diff", "--", path],
+                    text=True, timeout=10,
+                )
+                if path not in diff:
+                    diff = subprocess.check_output(
+                        ["git", "-C", str(repo), "diff", "--cached", "--", path],
+                        text=True, timeout=10,
+                    )
+            except subprocess.SubprocessError:
+                diff = ""
+            dl = diff.splitlines()
+            if dl:
+                capped = dl[:_MAX_DIFF_LINES]
+                lines_out.append(f"[Diff: {path}]")
+                lines_out.extend(capped)
+                budget -= len(capped) + 2
+        if budget <= 0:
+            lines_out.append("... (file-content budget exhausted)")
+            break
+    return "\n".join(lines_out)
+
+
+
+async def _inject_repo_context(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Append the repo-context block to the OUTBOUND system message.
+
+    R1 carve-out (2026-08-14, user-requested): the local model has no
+    tools and no visibility of the opencode agents' work, so a future
+    conversation can't pick up the code.  The block is APPENDED (the
+    stable system prefix stays KV-cache-visible; only the delta
+    re-prefills) and is cache-stable between repo changes.  Never
+    touches the client's stored conversation or the DB audit copy.
+    Opt out per request with ``X-Proxy-Repo-Context: off``.
+    """
+    block = await asyncio.to_thread(_repo_context_block)
+    if not block:
+        return messages
+    messages = list(messages)
+    for i, m in enumerate(messages):
+        if m.get("role") == "system" and isinstance(m.get("content"), str):
+            messages[i] = {**m, "content": m["content"] + "\n\n" + block}
+            return messages
+    return [{"role": "system", "content": block}] + messages
+
+
+def _inject_current_datetime(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Append the current DATE to the OUTBOUND copy's system message
+    (date-only — the clock time broke the KV-cache prefix every request).
+
+    Frontends (nanobot, OpenWebUI) never send the date, so the models
+    they drive run date-blind; the opencode app's own sessions do get a
+    date-only stamp.  This mirrors that on the proxy path with the full
+    date AND time.  R1 carve-out: only the outbound model-copy is
+    touched; the client's stored conversation and the DB audit copy are
+    never mutated.  Opt out per request with ``X-Proxy-Date-Time: off``.
+    """
+    now = datetime.now()
+    # DATE-ONLY (2026-08-11): the clock time changed the cache-visible
+    # system content EVERY request — the llama-server's prefix matching
+    # diverged at the stamp's position and invalidated every checkpoint,
+    # forcing full ~14k-token prefills on session follow-ups (the
+    # checkpoints' "erased invalidated" evidence).  The date changes once
+    # per day, so the system stays cache-stable within the day; the
+    # opencode app itself injects only the date.
+    stamp = f"Today's date: {now.strftime('%A, %B %d, %Y')}."
+    # Copy the list, never mutate: the client's stored conversation is
+    # preserved verbatim (the outbound copy gets the stamp).
+    messages = list(messages)
+    for i, m in enumerate(messages):
+        if m.get("role") == "system" and isinstance(m.get("content"), str):
+            # KV-CACHE POSITION (2026-08-11): the stamp goes at the END
+            # of the system message, NOT the start.  Prepended, the time
+            # changed the cache-visible prefix every request and the
+            # professional re-prefilled the FULL ~20k-token prompt each
+            # time (~45s/request — the measured slowdown).  Appended,
+            # the stable system content + growing history stay cache-
+            # visible and only the ~20-token stamp delta re-prefills.
+            messages[i] = {**m, "content": m["content"] + "\n\n" + stamp}
+            return messages
+    return [{"role": "system", "content": stamp}] + messages
+
+
+def _dump_wire_system(system_msg: str) -> None:
+    """Write the wire system message to a local file (worker thread)."""
+    with open("/tmp/wire-system.txt", "w", encoding="utf-8") as fh:
+        fh.write(system_msg)
+
+
 async def _govern_messages(
     request: Request,
     messages: list[dict[str, Any]],
@@ -583,6 +885,18 @@ async def _govern_messages(
     # Always strip proxy-owned status content (sentinel-prefixed) so the
     # model never sees its own triage/loading/tool-status echoed back.
     messages = strip_proxy_status(messages)
+    # Current date + time injection (R1 carve-out): frontends never send
+    # the date, so the models run date-blind; stamp the OUTBOUND system
+    # message.  Opt out per request with ``X-Proxy-Date-Time: off``.
+    if request.headers.get("x-proxy-date-time", "").strip().lower() != "off":
+        messages = _inject_current_datetime(messages)
+    # Repo-context injection (R1 carve-out, user-requested 2026-08-14):
+    # the local model has no tools and no visibility of the opencode
+    # agents' work; append the recent-task summaries + working-tree state
+    # to the OUTBOUND system message.  Opt out per request with
+    # ``X-Proxy-Repo-Context: off``.
+    if request.headers.get("x-proxy-repo-context", "").strip().lower() != "off":
+        messages = await _inject_repo_context(messages)
     # Search-result enrichment (explicit user-approved R1 carve-out
     # extension): frontends execute search_web themselves and often return
     # thin SEO snippets; when that happens, append the proxy's own rich
@@ -591,6 +905,13 @@ async def _govern_messages(
     # per request with ``X-Proxy-Search-Enrichment: off``.
     if request.headers.get("x-proxy-search-enrichment", "").strip().lower() != "off":
         messages = await enrich_thin_search_results(messages)
+    # Outbound image downscaling (R1 carve-out): a 3000×4000 image crashed
+    # llama-professional with a Vulkan device-lost core dump (2026-08-12).
+    # Oversized images are downscaled on the OUTBOUND copy only; the
+    # client's stored conversation and the DB audit copy are never touched.
+    # Opt out per request with ``X-Proxy-Image-Downscale: off``.
+    if request.headers.get("x-proxy-image-downscale", "").strip().lower() != "off":
+        messages = await downscale_images(messages)
     header = request.headers.get("x-proxy-context-governance", "")
     if header.strip().lower() == "off":
         return messages
@@ -604,6 +925,71 @@ async def _govern_messages(
         context_window=context_window,
         max_output_tokens=max_tokens,
     )
+
+
+def _priming_caller_for(headers: dict[str, str], caller_type: str) -> str:
+    """The priming registration key for a request: the nanobot's
+    user-agent gets the stable "nanobot" key (its apiKey is the shared
+    AGENTIC token — the generic caller would thrash the observed
+    registration); everyone else uses the discriminated caller type.
+    """
+    ua = headers.get("user-agent", "").lower()
+    if "nanobot" in ua:
+        return "nanobot"
+    return caller_type or "unknown"
+
+
+async def _reclassify_gated(
+    classification: dict[str, Any],
+    user_text: str,
+    *,
+    port: int = 0,
+) -> dict[str, Any]:
+    """Professional reclassification (user-approved 2026-08-09; gated
+    2026-08-11): the 2B frontdesk under-judges complex work, so ask the
+    professional to reclassify BEFORE answering — but ONLY when the
+    frontdesk flags medium/high complexity.  The gate restores the fast
+    path for simple requests: the reclass costs a full ~12s professional
+    generation and its KV-cache is NOT reusable by the answering pass
+    (the system prompts diverge at the first token).  The reclassified
+    intent/priority/complexity replace the frontdesk's values and the
+    proxy assigns the reclass-recommended sampling parameters to the
+    answering call.  Best-effort: any failure keeps the frontdesk's
+    classification.  Returns the reclass dict (empty when gated off or
+    failed).
+    """
+    # The gate runs the professional second opinion when the frontdesk
+    # flags medium/high complexity OR the request is a coding task
+    # (intent CODE).  The frontdesk UNDER-JUDGES complex work — its
+    # complexity rating is the unreliable signal — so coding tasks
+    # always reclassify (2026-08-11: a medium-complexity coding task
+    # rated low by the frontdesk skipped the reclass entirely).
+    intent = classification.get("intent", "")
+    if (
+        intent != "CODE"
+        and classification.get("complexity", "low") not in ("medium", "high")
+    ):
+        return {}
+    try:
+        reclass = await reclassify_with_professional(
+            user_text, model_port=port,
+        )
+    except (httpx.HTTPError, OSError, ValueError):
+        return {}
+    if reclass.get("intent"):
+        classification["intent"] = reclass["intent"]
+        classification["priority"] = reclass.get(
+            "priority", classification.get("priority", 2),
+        )
+        classification["complexity"] = reclass.get(
+            "complexity", classification.get("complexity", "low"),
+        )
+        logger.info(
+            "Professional reclassified: intent=%s priority=%s complexity=%s",
+            classification["intent"], classification["priority"],
+            classification["complexity"],
+        )
+    return reclass
 
 
 async def chat_completions(request: Request) -> Response:
@@ -665,6 +1051,7 @@ async def chat_completions(request: Request) -> Response:
     caller_type = discriminate_caller(headers)
     lane_b = is_lane_b(headers)
     is_dream = False
+    is_apply_local = False  # bound for every caller path (2026-08-11)
 
     # ---- Prepare messages (Glass Pipe Rule: NO text alteration) ------------
     processed_messages: list[dict[str, Any]] = list(messages)  # Shallow copy
@@ -696,6 +1083,16 @@ async def chat_completions(request: Request) -> Response:
             if isinstance(m.get("content"), str)
         ).lower()
         is_dream = await is_dream_process(raw_text)
+        # LOCAL-APPLY BYPASS: the opencode serve's kinver calls for the
+        # sdd-apply-local agent (the task text always starts 'You are the
+        # apply executor for SDD change') must NEVER be triaged or sent
+        # through the coding gate — the user explicitly chose the LOCAL
+        # model for the apply, so the request goes straight to the
+        # professional service (mirrors the dream-request bypass).
+        is_apply_local = (
+            "you are the apply executor for sdd change" in raw_text
+            or "you are the apply executor for sd" in raw_text
+        )
 
         effective_domain = model_domain if model_domain in (
             "coder", "architect", "professional", "creative", "scholar",
@@ -760,7 +1157,7 @@ async def chat_completions(request: Request) -> Response:
     # context dump carries full conversation history, so matching against
     # it would mis-route whenever history merely MENTIONS a command — e.g.
     # a tool result containing file paths like ``.../.git/opencode`` or
-    # ``~/.opencode/bin/opencode`` matched the unanchored
+    # ``<home>/.opencode/bin/opencode`` matched the unanchored
     # /opencode regex and routed every follow-up to the opencode bridge.
     last_user = _last_user_text(processed_messages)
     pause_match = _PAUSE_RE.search(last_user) if last_user else None
@@ -779,7 +1176,7 @@ async def chat_completions(request: Request) -> Response:
     # /opencode — direct the request to the opencode agent instead of a
     # local model (the programmatic escape hatch for coding tasks).
     if last_user and _OPENCODE_RE.search(last_user.lower()):
-        return await _handle_opencode_command(last_user)
+        return await _handle_opencode_command(last_user, request.app)
 
     # model: "opencode" / "opencode-sdd" — client picked the opencode
     # bridge model.  This bypasses llama routing entirely: the task goes to
@@ -790,7 +1187,7 @@ async def chat_completions(request: Request) -> Response:
         resp = await _handle_opencode_request(
             processed_messages,
             client_stream,
-            session_map=_opencode_session_state(request.app),
+            session_map=await _opencode_session_state(request.app),
             session_key=session_key,
             pending_permissions=_pending_permissions_state(request.app),
             sdd=(requested_model == "opencode-sdd"),
@@ -805,7 +1202,7 @@ async def chat_completions(request: Request) -> Response:
     # the last assistant message is the pending coding-decision question
     # — that turn is owned by the gate (the user's "opencode"/"local"
     # answer must resolve the routing, never become the agent's task).
-    pinned = _opencode_session_state(request.app).get(session_key)
+    pinned = (await _opencode_session_state(request.app)).get(session_key)
     if pinned and _find_coding_question_index(processed_messages) is None:
         answer = _last_user_text(processed_messages)
         # Pending external_directory WRITE permission from the previous
@@ -833,7 +1230,7 @@ async def chat_completions(request: Request) -> Response:
         resp = await _opencode_task_response(
             answer or "continue",
             client_stream,
-            session_map=_opencode_session_state(request.app),
+            session_map=await _opencode_session_state(request.app),
             session_key=session_key,
             pending_permissions=_pending_permissions_state(request.app),
             just_approved_permission=just_approved,
@@ -971,6 +1368,11 @@ async def chat_completions(request: Request) -> Response:
         "tools_required": False,
     }
 
+    # The professional's reclassification result (populated in the
+    # frontdesk branch below; empty for mid-tool-flow so the parameters
+    # section below never sees an unbound name).
+    reclass: dict[str, Any] = {}
+
     if has_tool_calls:
         # Conversation already has tool calls — preserve the classified
         # route, don't let frontdesk reclassify and switch models
@@ -982,6 +1384,16 @@ async def chat_completions(request: Request) -> Response:
             sum(1 for m in processed_messages
                 if m.get("role") in ("assistant", "tool")
                 and ("tool_calls" in m or m.get("role") == "tool")),
+        )
+    elif _request_has_image(processed_messages):
+        # Image requests: the frontdesk classifier cannot see images and
+        # misroutes them (e.g. to CODE) from the text alone.  Force the
+        # IMAGE intent — always professional, with the image profile's
+        # sampling parameters (R17 lookup via the "image" bucket).
+        classification["intent"] = "IMAGE"
+        classification["priority"] = 2
+        logger.info(
+            "Image request detected — frontdesk bypassed, intent forced to IMAGE",
         )
     elif not lane_b and caller_type != "IDE":
         # Resolve the frontdesk port live from the systemd unit file so
@@ -1011,6 +1423,14 @@ async def chat_completions(request: Request) -> Response:
             classification.get("priority"),
             classification.get("project_name"),
             classification.get("is_factual"),
+        )
+
+        systemd_state = getattr(request.app.state, "systemd", None)
+        reclass_port = 0
+        if systemd_state is not None:
+            reclass_port = await systemd_state.get_port("professional")
+        reclass = await _reclassify_gated(
+            classification, user_text, port=reclass_port,
         )
     else:
         classification["intent"] = "CODE"
@@ -1155,6 +1575,24 @@ async def chat_completions(request: Request) -> Response:
             is_lane_b=True,
             bypass_frontdesk=True,
         )
+    elif is_apply_local:
+        # LOCAL-APPLY BYPASS (2026-08-09): the request is the opencode
+        # serve's sdd-apply-local delegation — the user explicitly chose
+        # the local model.  Pin professional directly, no frontdesk
+        # triage, no coding gate.
+        port = await systemd.get_port("professional")
+        route = RouteDecision(
+            model_key="professional",
+            port=port,
+            is_cpu_fallback=False,
+            hardware_path="gpu",
+            priority=1,
+            intent="CODE",
+            project_id="general",
+            is_factual=False,
+            is_lane_b=False,
+            bypass_frontdesk=True,
+        )
     else:
         # Lane A: GPU-aware routing.  CHAT/TOOL contention with a
         # specialist routes to Professional unconditionally.
@@ -1237,8 +1675,15 @@ async def chat_completions(request: Request) -> Response:
     profiles = state.model_profiles
     entry = profiles.resolve(route.intent, route.model_key) if profiles else None
 
+    # The professional's reclassification recommends sampling parameters
+    # (temperature / top_p / thinking_budget_tokens) for the answering
+    # call.  When present they win over the profile defaults — the
+    # reclassification saw the actual request context (KV-cached, so the
+    # answering pass reuses its preprocessing).
+    reclass_params: dict[str, Any] = reclass.get("parameters") or {}
+
     if auto_authority and entry is not None:
-        parameters = {**entry.values}
+        parameters = {**entry.values, **reclass_params}
     else:
         # R1/R7 client-wins: when the client picked the model, the client's
         # sampling parameters are authoritative. We only fill in a
@@ -1511,41 +1956,38 @@ async def _event_stream(
     # user.
     tts_tool_call_indices: set[int] = set()
 
-    # ---- Yield proxy-injected preamble events -----------------------------
-    # These events (e.g. params_replaced) are emitted before the triage
-    # status chunk so consumers see substitution signals first.
-    if proxy_preamble:
-        for event_line in proxy_preamble:
-            yield event_line
-
-    # ---- Yield triage metadata as first SSE chunk ---------------------------
-    # Let the frontend know which model was selected and why, so users
-    # see the routing announcement during the model-loading gap.  Emitted
-    # as sentinel-prefixed delta.content via _make_status_chunk: visible
-    # inline, but stripped from the OUTBOUND model-copy on the next
-    # request (strip_proxy_status) so the model never echoes it back.
-    # Previously emitted as custom events, which the model never saw but
-    # which ALSO made the status invisible to nanobot — users lost all
-    # feedback during loading/tool gaps.  The sentinel restores inline
-    # visibility without the echo degeneration.
-    #
-    # Mid-tool-flow requests (last message is a tool call or a tool
-    # result) skip the triage entirely: the model is continuing a chain
-    # it already started, so re-announcing the route adds noise AND
-    # feeds the model's own input with repeated "Proxy triage" text.
-    last_msg = processed_messages[-1] if processed_messages else {}
-    mid_tool_flow = (
-        last_msg.get("role") == "assistant" and "tool_calls" in last_msg
-    ) or last_msg.get("role") == "tool"
-    triage_msg = _build_triage_message(route, client_named_model=client_named_model)
-    if not mid_tool_flow:
-        yield _make_status_chunk(triage_msg, kind="triage")
-
     # Terminal outcome of this stream: completed | failed | cancelled.
     # Stays "unknown" if the generator is closed early (client disconnect
     # delivered as GeneratorExit) so the finally block can mark the job.
     outcome = "unknown"
     try:
+        # ---- Yield proxy-injected preamble events -------------------------
+        # These events (e.g. params_replaced) are emitted before the
+        # triage status chunk so consumers see substitution signals
+        # first.  INSIDE the try: a client disconnect during ANY yield
+        # (preamble, triage, stream) reaches the finally and marks the
+        # job (2026-08-11).
+        if proxy_preamble:
+            for event_line in proxy_preamble:
+                yield event_line
+        # ---- Yield triage metadata as first SSE chunk ---------------------
+        # Let the frontend know which model was selected and why, so
+        # users see the routing announcement during the model-loading
+        # gap.  Skipped mid-tool-flow entirely: the model is continuing
+        # a chain it already started, so re-announcing the route adds
+        # noise AND feeds the model's own input with repeated "Proxy
+        # triage" text.
+        last_msg = processed_messages[-1] if processed_messages else {}
+        mid_tool_flow = (
+            last_msg.get("role") == "assistant" and "tool_calls" in last_msg
+        ) or last_msg.get("role") == "tool"
+        triage_msg = _build_triage_message(
+            route, client_named_model=client_named_model,
+        )
+        if not mid_tool_flow:
+            # Trailing newline: the triage must not run straight into
+            # the model's response (2026-08-08).
+            yield _make_status_chunk(triage_msg + "\n", kind="triage")
         async for chunk in stream_llm(
             endpoint=route.model_key,
             payload=payload,
@@ -1895,6 +2337,7 @@ async def _event_stream_with_model_startup(
     This wrapper brings the same behaviour to the direct-streaming path.
     """
     systemd = state.systemd
+    db = state.database
     model_key = route.model_key
 
     # Only intervene for heavy GPU models that may need cold-starting.
@@ -1964,6 +2407,14 @@ async def _event_stream_with_model_startup(
                 })
                 yield f"data: {error_chunk}\n\n"
                 yield "data: [DONE]\n\n"
+                # The job was already enqueued — mark it failed so it
+                # never lingers active and re-processes on restart
+                # (2026-08-11).
+                if db is not None:
+                    try:
+                        await db.fail_job(job_id)
+                    except (OSError, ValueError):
+                        logger.exception("Failed to mark job %s failed", job_id)
                 return
 
             # ---- Restore project-specific KV cache if available --------------
@@ -2205,6 +2656,7 @@ async def _opencode_task_response(
     system_prompt: str = _BRIDGE_SYSTEM_PROMPT,
     timeout: float = OPENCODE_SERVE_TIMEOUT,
     autonomous: bool = False,
+    directory: Optional[str] = None,
 ) -> Response:
     """Run a task through the opencode bridge and return the response.
 
@@ -2227,11 +2679,29 @@ async def _opencode_task_response(
         )
 
     async def _stream() -> AsyncIterator[str]:
+        # The SDD-autonomous path operates on the OpenSpec store in the
+        # proxy repo, NOT the nanobot workspace the plain bridge sessions
+        # use — default the directory per mode.
+        stream_directory = directory
+        if stream_directory is None:
+            stream_directory = (
+                OPENCODE_SDD_DIRECTORY if autonomous else OPENCODE_BRIDGE_DIRECTORY
+            )
+        # The status line carries the TASK's identity so the stream can be
+        # discriminated from any other task asked in the meantime: the SDD
+        # change name (when the task text declares one) plus the task's
+        # first line.
+        _task_first = (task_text.strip().splitlines() or [""])[0]
+        _task_label = _task_first[:90] if _task_first else ""
+        _chg = re.search(r"CHANGE NAME:\s*([^\s]+)", task_text)
+        _chg_label = f" for {_chg.group(1)}" if _chg else ""
         status_msg = (
-            f"_⏳ [Proxy: Directing to OpenCode ({OPENCODE_AGENT} agent)...]_\n\n"
+            f"_⏳ [Proxy: Directing to OpenCode ({OPENCODE_AGENT} agent)"
+            f"{_chg_label}: {_task_label}]_\n\n"
         )
         yield f"data: {json.dumps(_make_system_chunk(status_msg))}\n\n"
-        async for kind, text_delta in opencode_chat_stream(
+        _resp_text: list[str] = []
+        async for kind, text_delta in opencode_chat_stream_resilient(
             task_text,
             agent=OPENCODE_AGENT,
             session_map=session_map,
@@ -2241,7 +2711,10 @@ async def _opencode_task_response(
             system_prompt=system_prompt,
             timeout=timeout,
             autonomous=autonomous,
+            directory=stream_directory,
         ):
+            if kind == "text" and text_delta:
+                _resp_text.append(text_delta)
             stop_after = False
             if not text_delta:
                 continue
@@ -2279,6 +2752,26 @@ async def _opencode_task_response(
             if stop_after:
                 break
         yield "data: [DONE]\n\n"
+        # Record the completed opencode task for the local model's repo
+        # context (2026-08-14): a future professional conversation has no
+        # visibility of the agent's work unless it is captured here — the
+        # session text is out of reach and the model has no tools.
+        # Best-effort: capture failures must never break the stream.
+        if _resp_text:
+            try:
+                # SDD-autonomous cycles run in the proxy repo (the OpenSpec
+                # store); copy their artifacts into the nanobot workspace so
+                # the local model can see the final output (2026-08-14,
+                # user-requested) BEFORE the context capture snapshots the
+                # tree (the copied files then appear in the block).
+                if autonomous and _chg is not None:
+                    await asyncio.to_thread(
+                        _copy_sdd_output_to_workspace,
+                        _chg.group(1), "".join(_resp_text),
+                    )
+                await asyncio.to_thread(_capture_opencode_work, _resp_text)
+            except Exception:
+                logger.exception("capturing opencode work failed")
 
     if client_stream:
         return StreamingResponse(_stream(), media_type="text/event-stream")
@@ -2288,7 +2781,12 @@ async def _opencode_task_response(
     # handling behave identically (a plain opencode_chat here would create a
     # fresh session and orphan the pin / parked permission).
     resp_parts: list[str] = []
-    async for kind, text_delta in opencode_chat_stream(
+    stream_directory = directory
+    if stream_directory is None:
+        stream_directory = (
+            OPENCODE_SDD_DIRECTORY if autonomous else OPENCODE_BRIDGE_DIRECTORY
+        )
+    async for kind, text_delta in opencode_chat_stream_resilient(
         task_text,
         agent=OPENCODE_AGENT,
         session_map=session_map,
@@ -2298,6 +2796,7 @@ async def _opencode_task_response(
         system_prompt=system_prompt,
         timeout=timeout,
         autonomous=autonomous,
+        directory=stream_directory,
     ):
         if kind == "text" and text_delta:
             resp_parts.append(text_delta)
@@ -2417,8 +2916,8 @@ async def _apply_coding_decision_gate(
     opencode routing, or the professional decision turn), or ``None`` to
     continue the normal flow.
     """
-    if route.is_lane_b:
-        return None  # opencode caller → local model directly, never prompt
+    if route.is_lane_b or route.bypass_frontdesk:
+        return None  # opencode caller / pinned local apply → direct, never prompt
 
     decisions = _coding_decision_state(app)
 
@@ -2437,13 +2936,19 @@ async def _apply_coding_decision_gate(
         decisions[session_id] = decision
         logger.info("Coding decision for session %s: %s", session_id, decision)
         task_messages = messages[:question_idx]  # task = convo up to the question
-        if decision == "opencode":
+        if decision in ("opencode", "sdd"):
+            is_sdd = decision == "sdd"
             resp = await _opencode_task_response(
                 _last_user_text(task_messages),
                 client_stream,
-                session_map=_opencode_session_state(app),
+                session_map=await _opencode_session_state(app),
                 session_key=session_id,
                 pending_permissions=_pending_permissions_state(app),
+                system_prompt=(
+                    _SDD_AUTONOMOUS_SYSTEM_PROMPT if is_sdd else _BRIDGE_SYSTEM_PROMPT
+                ),
+                timeout=OPENCODE_SDD_TIMEOUT if is_sdd else OPENCODE_SERVE_TIMEOUT,
+                autonomous=is_sdd,
             )
             await _persist_opencode_sessions(app)
             return resp
@@ -2455,21 +2960,36 @@ async def _apply_coding_decision_gate(
 
     # ---- Fresh coding request: prompt once, then cache the choice ------
     if route.intent == "CODE" and not has_tool_calls:
+        # MICRO-INPUT GUARD (2026-08-12): a single-word ping ("test",
+        # "hello") is not a coding task — the frontdesk over-classifies
+        # short CODE intents, and the coding machinery (assessment +
+        # prompt + recommendation) must not fire for them.  The normal
+        # flow answers directly.
+        if _looks_like_gibberish(_last_user_text(messages)):
+            return None
         decision = decisions.get(session_id)
-        if decision == "opencode":
+        if decision in ("opencode", "sdd"):
+            is_sdd = decision == "sdd"
             resp = await _opencode_task_response(
                 _last_user_text(messages),
                 client_stream,
-                session_map=_opencode_session_state(app),
+                session_map=await _opencode_session_state(app),
                 session_key=session_id,
                 pending_permissions=_pending_permissions_state(app),
+                system_prompt=(
+                    _SDD_AUTONOMOUS_SYSTEM_PROMPT if is_sdd else _BRIDGE_SYSTEM_PROMPT
+                ),
+                timeout=OPENCODE_SDD_TIMEOUT if is_sdd else OPENCODE_SERVE_TIMEOUT,
+                autonomous=is_sdd,
             )
             await _persist_opencode_sessions(app)
             return resp
         if decision is None:
             question = (
-                f"{_CODING_QUESTION_PREFIX} Coding task detected — route to OpenCode "
-                f"or the local code pathway (Professional)? Reply `opencode` or `local`."
+                f"{_CODING_QUESTION_PREFIX} Coding task detected — route to OpenCode, "
+                f"the local code pathway (Professional), or a full SDD cycle "
+                f"(proposal → spec → design → tasks → apply → verify → archive)? "
+                f"Reply `opencode`, `local`, or `sdd`."
             )
             # Advisory local-model difficulty assessment shown in the question.
             # Best-effort: any failure here must never block the gate, so the
@@ -2491,12 +3011,39 @@ async def _apply_coding_decision_gate(
                 reason = assessment.get("reason", "")
                 if difficulty and recommendation:
                     reason_suffix = f" ({reason})" if reason else ""
+                    if difficulty == "low" and recommendation in ("opencode", "sdd"):
+                        # SECURITY GUARD (2026-09-12): a raw-model completion
+                        # must never be silently diverted into the agent
+                        # bridge.  An agentic route requires the user's
+                        # explicit answer — fall through to the question
+                        # below instead of auto-launching opencode/SDD.
+                        logger.info(
+                            "Coding decision for session %s: low difficulty "
+                            "but agentic recommendation %r — prompting "
+                            "instead of auto-routing",
+                            session_id, recommendation,
+                        )
+                    elif difficulty == "low":
+                        # Simple coding task — the user asked for no prompt:
+                        # apply the recommendation's route immediately and
+                        # skip the question (the bare question must never
+                        # appear for simple tasks).
+                        logger.info(
+                            "Coding decision for session %s: low difficulty — "
+                            "applying recommendation %r without prompting",
+                            session_id, recommendation,
+                        )
+                        decisions[session_id] = recommendation
+                        # "local"/"professional" recommendation: the normal
+                        # flow continues to the local code pathway.
+                        return None
                     question = (
-                        f"{_CODING_QUESTION_PREFIX} Coding task detected — route to OpenCode "
-                        f"or the local code pathway (Professional)?\n\n"
+                        f"{_CODING_QUESTION_PREFIX} Coding task detected — route to OpenCode, "
+                        f"the local code pathway (Professional), or a full SDD cycle "
+                        f"(proposal → spec → design → tasks → apply → verify → archive)?\n\n"
                         f"🔍 Local model assessment: {difficulty} difficulty — "
                         f"recommends `{recommendation}`{reason_suffix}\n\n"
-                        f"Reply `opencode` or `local`."
+                        f"Reply `opencode`, `local`, or `sdd`."
                     )
             except (httpx.HTTPError, OSError, AttributeError, ValueError):
                 logger.exception(
@@ -2507,11 +3054,17 @@ async def _apply_coding_decision_gate(
     return None
 
 
-async def _handle_opencode_command(user_text: str) -> StreamingResponse:
+async def _handle_opencode_command(user_text: str, app: FastAPI) -> Response:
     """Handle the /opencode command embedded in a user prompt.
 
-    Directs the remaining text to the opencode agent (gentle-orchestrator), mirroring
-    the /cloud command flow.
+    Routes the remaining text through the opencode bridge STREAM path
+    (``_opencode_task_response``), giving /opencode the SAME relay/
+    auto-allow policy as ``model: "opencode"`` (REQ-3): write/edit
+    permission gates surface as questions instead of being silently
+    dropped by the old bare ``opencode_chat`` blocking call.  ``app`` is
+    required to resolve the pending-permission map on ``app.state`` (Rule
+    6 — mirrors ``_apply_coding_decision_gate``); the call site passes
+    ``request.app``.
     """
     logger.info(
         "opencode /opencode command: task=%r source_len=%d",
@@ -2521,28 +3074,12 @@ async def _handle_opencode_command(user_text: str) -> StreamingResponse:
     if not task_text:
         task_text = user_text.strip()
 
-    async def _stream() -> AsyncIterator[str]:
-        status_msg = (
-            f"_⏳ [Proxy: Routing concurrently to OpenCode ({OPENCODE_AGENT} agent)...]_\n\n"
-        )
-        yield f"data: {json.dumps(_make_system_chunk(status_msg))}\n\n"
-
-        resp_text = await opencode_chat(task_text, agent=OPENCODE_AGENT)
-        chunk = {
-            "id": f"chatcmpl-{int(time.time())}",
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": "opencode",
-            "choices": [{
-                "index": 0,
-                "delta": {"content": resp_text},
-                "finish_reason": None,
-            }],
-        }
-        yield f"data: {json.dumps(chunk)}\n\n"
-        yield "data: [DONE]\n\n"
-
-    return StreamingResponse(_stream(), media_type="text/event-stream")
+    return await _opencode_task_response(
+        task_text,
+        client_stream=True,
+        pending_permissions=_pending_permissions_state(app),
+        autonomous=False,
+    )
 
 
 # ---------------------------------------------------------------------------

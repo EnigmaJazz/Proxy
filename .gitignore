@@ -250,3 +250,6 @@ docs/
 .atl/.skill-registry.cache.json
 .atl/
 proxy.log.*
+# machine-specific config (never commit)
+local_config.py
+config/local_models.yaml

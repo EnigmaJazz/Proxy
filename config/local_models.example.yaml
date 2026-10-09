@@ -12,16 +12,16 @@
 #    an entry for R17 profile resolution)
 models:
   architect:
-    path: ~/kinver-hub/models/Architect.gguf
+    path: <KINVER_HOME>/models/Architect.gguf
   coder:
-    path: ~/kinver-hub/models/Coder.gguf
+    path: <KINVER_HOME>/models/Coder.gguf
   professional:
-    path: ~/kinver-hub/models/Professional.gguf
+    path: <KINVER_HOME>/models/Professional.gguf
   creative:
-    path: ~/kinver-hub/models/Creative.gguf
+    path: <KINVER_HOME>/models/Creative.gguf
   scholar:
-    path: ~/kinver-hub/models/Scholar.gguf
+    path: <KINVER_HOME>/models/Scholar.gguf
   chatter:
-    path: ~/kinver-hub/models/Lifeboat.gguf
+    path: <KINVER_HOME>/models/Lifeboat.gguf
   frontdesk:
-    path: ~/kinver-hub/models/Front-Desk.gguf
+    path: <KINVER_HOME>/models/Front-Desk.gguf

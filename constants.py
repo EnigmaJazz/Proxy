@@ -34,11 +34,15 @@ PROJECT_ROOT: Path = Path(__file__).resolve().parent
 RUNTIME_CONTEXT_WINDOWS: dict[str, int] = {
     "frontdesk": 12_288,
     "chatter": 32_768,
-    "professional": 65_536,
+    # 131072 since 2026-08-14: the context bump (-c 131072, KV quants
+    # unchanged) fits because --fit on rebalances model layers to CPU;
+    # load-time VRAM ~12.5GB of 12.87GB.  65536 was the pre-bump value.
+    "professional": 131_072,
     "scholar": 32_768,
     "creative": 32_768,
     "architect": 32_768,
-    "coder": 32_768,
+    # The Qwen3.8 cutover aligns the coder's -c with the professional.
+    "coder": 65_536,
 }
 
 # ---------------------------------------------------------------------------
@@ -77,6 +81,32 @@ def get_logger(name: str = "proxy") -> logging.Logger:
 # ---------------------------------------------------------------------------
 
 from dotenv import load_dotenv as _load_dotenv
+
+# ---------------------------------------------------------------------------
+# Machine-specific configuration (GIT-IGNORED).  ``local_config.py`` holds
+# real absolute paths for THIS machine; when absent, safe generic defaults
+# (user home, repo root) keep a fresh clone working.  Never hardcode
+# private paths below.
+# ---------------------------------------------------------------------------
+try:
+    import local_config as _local_config
+except ImportError:  # pragma: no cover - fresh clone without local_config.py
+    _local_config = None  # type: ignore[assignment]
+
+
+def _machine(attr: str, default: str) -> str:
+    """Resolve a machine-specific value: local_config wins, else default."""
+    if _local_config is not None:
+        value = getattr(_local_config, attr, None)
+        if value:
+            return value
+    return default
+
+
+_KINVER_HOME: str = _machine(
+    "KINVER_HOME", os.path.expanduser("~/kinver-hub"),
+)
+_REPO_ROOT: str = os.path.dirname(os.path.abspath(__file__))
 _load_dotenv(PROJECT_ROOT / ".env")
 
 # ---------------------------------------------------------------------------
@@ -155,22 +185,54 @@ ALL_MODEL_KEYS: tuple[str, ...] = tuple(
 # opencode agent instead of a local llama model.
 OPENCODE_SERVE_URL: str = "http://127.0.0.1:18900"
 
+# OpenChamber daemon for the bridge's second transport (openchamber-bridge
+# backend, step 2+).  The bridge owns its lifecycle like the serve: the
+# daemon spawns on a fixed loopback port with ISOLATED XDG homes under
+# OPENCHAMBER_CONFIG_DIR (sibling of the serve-config dir).  Port 8791 is
+# the prototype's 8790 + 1 (the prototype daemon may still be running).
+OPENCHAMBER_SERVE_URL: str = "http://127.0.0.1:8791"
+
+# The OpenChamber CLI binary (the bridge spawns the daemon through it).
+OPENCHAMBER_BIN: str = _machine(
+    "OPENCHAMBER_BIN", os.path.expanduser("~/.bun/bin/openchamber"),
+)
+
+
 # Working directory for the headless opencode serve.  Deliberately OUTSIDE
 # the proxy repo: bridge sessions (gentle-orchestrator/build agents) write
 # files there, and running them in the repo polluted the proxy git tree
 # (stray artifacts + corrupt index objects).
-OPENCODE_WORKSPACE_DIR: str = "~/opencode-workspace"
+OPENCODE_WORKSPACE_DIR: str = _machine(
+    "OPENCODE_WORKSPACE_DIR", os.path.expanduser("~/opencode-workspace"),
+)
 
 # Directory the opencode bridge creates sessions in.  The serve defaults to
 # its own cwd (OPENCODE_WORKSPACE_DIR); passing an explicit directory lets
 # bridge sessions operate on a real project (e.g. the proxy repo, which
 # hosts the OpenSpec SDD store) instead of the scratch workspace.
-OPENCODE_BRIDGE_DIRECTORY: str = "<REPO_ROOT>"
+OPENCODE_BRIDGE_DIRECTORY: str = _machine("OPENCODE_BRIDGE_DIRECTORY", _REPO_ROOT)
+
+# Isolated homes for the bridge-owned OpenChamber daemon (sibling of the
+# serve-config dir): XDG_CONFIG_HOME here, XDG_DATA_HOME here/data,
+# XDG_CACHE_HOME here/cache.  The daemon's managed opencode runtime never
+# shares the TUI's data — same isolation rationale as the serve.
+OPENCHAMBER_CONFIG_DIR: str = _machine(
+    "OPENCHAMBER_CONFIG_DIR",
+    os.path.join(OPENCODE_WORKSPACE_DIR, "openchamber-config"),
+)
+
+# Directory the SDD-AUTONOMOUS sessions run in.  The full-SDD-cycle path
+# operates on the OpenSpec store + repo, which lives in the proxy repo
+# (NOT the nanobot workspace the plain bridge sessions use).  Machine
+# override via local_config.OPENCODE_SDD_DIRECTORY.
+OPENCODE_SDD_DIRECTORY: str = _machine("OPENCODE_SDD_DIRECTORY", _REPO_ROOT)
 
 # Absolute path to the opencode binary.  systemd services run with a
 # minimal PATH that does not include ~/.opencode/bin, so the bridge spawn
 # must not rely on PATH resolution.
-OPENCODE_BIN: str = "~/.opencode/bin/opencode"
+OPENCODE_BIN: str = _machine(
+    "OPENCODE_BIN", os.path.expanduser("~/.opencode/bin/opencode"),
+)
 
 # Agent used by the bridge for coding tasks.  The Gentle AI SDD
 # orchestrator coordinates the full SDD cycle (and handles direct tasks)
@@ -180,6 +242,33 @@ OPENCODE_AGENT: str = "gentle-orchestrator"
 # How long to wait for the opencode agent to finish a task.
 OPENCODE_SERVE_TIMEOUT: float = 600.0
 
+# Serve stability mode (REQ-4): candidate B (serve-scoped config dir via
+# XDG_CONFIG_HOME, default) vs candidate A (`--pure` arg).  When True the
+# serve spawns with `--pure`, disabling ALL external plugin auto-load
+# incl. the rate-limit-fallback plugin — kept as a documented fallback
+# only; the reduced-config path is the default.  Subprocess-scoped toggle,
+# never touches the user's TUI config.
+OPENCODE_SERVE_PURE: bool = False
+
+# Scratch config dir the proxy OWNS for the headless serve (candidate B).
+# The serve spawns with XDG_CONFIG_HOME pointing here, and the proxy
+# syncs a REDUCED opencode.jsonc template into its ``opencode/`` subdir
+# (opencode-serve-config.opencode.jsonc) so ONLY the rate-limit-fallback
+# plugin loads.  Never points at ~/.config/opencode — the user's TUI
+# config stays untouched.
+OPENCODE_SERVE_CONFIG_DIR: str = _machine(
+    "OPENCODE_SERVE_CONFIG_DIR",
+    os.path.join(OPENCODE_WORKSPACE_DIR, "serve-config"),
+)
+
+# Path whose mtime drives config-drift detection (REQ-5): the committed
+# serve template.  Hot-editing it while a serve runs recycles the serve
+# before the next request so the new config actually loads.
+OPCODE_CONFIG_PATH: str = _machine(
+    "OPCODE_CONFIG_PATH",
+    os.path.join(_REPO_ROOT, "opencode-serve-config.opencode.jsonc"),
+)
+
 # Bridge model keys exposed to clients, validated alongside ALL_MODEL_KEYS.
 # "opencode" routes to the opencode serve bridge instead of llama.cpp.
 BRIDGE_MODEL_KEYS: frozenset[str] = frozenset({"opencode", "opencode-sdd"})
@@ -188,7 +277,7 @@ BRIDGE_MODEL_KEYS: frozenset[str] = frozenset({"opencode", "opencode-sdd"})
 # agentic task; the SDD-autonomous mode runs the FULL cycle (proposal →
 # spec → design → tasks → apply → verify → archive) in one long-lived
 # turn, so it gets a much larger budget.
-OPENCODE_SDD_TIMEOUT: float = 3600.0
+OPENCODE_SDD_TIMEOUT: float = 7200.0
 
 # Queue-worker escalation backend after local tiers are exhausted:
 # "opencode" → headless opencode serve (build agent);
@@ -308,10 +397,18 @@ MIGRATIONS: list[str] = [
 ]
 
 # Legacy paths (kept for transition / backward compat)
-MODELS_DIR: str = "~/kinver-hub/models/"
-PROMPTS_DIR: str = "~/kinver-hub/prompts/"
-ENV_NGL_FILE: str = "~/kinver-hub/.env.ngl"
-CACHE_DIR: str = "~/kinver-hub/cache/"
+MODELS_DIR: str = _machine(
+    "MODELS_DIR", os.path.join(_KINVER_HOME, "models/"),
+)
+PROMPTS_DIR: str = _machine(
+    "PROMPTS_DIR", os.path.join(_KINVER_HOME, "prompts/"),
+)
+ENV_NGL_FILE: str = _machine(
+    "ENV_NGL_FILE", os.path.join(_KINVER_HOME, ".env.ngl"),
+)
+CACHE_DIR: str = _machine(
+    "CACHE_DIR", os.path.join(_KINVER_HOME, "cache/"),
+)
 RECOVERY_FILE: str = str(PROJECT_ROOT / "recovery_state.json")
 PERSISTENT_QUEUE_FILE: str = str(PROJECT_ROOT / "background_queue.json")
 
@@ -553,6 +650,7 @@ FACTUAL_KEYWORDS: frozenset[str] = frozenset({
 #   CHAT      → professional (35B MoE)
 #   TOOL      → professional (35B MoE, handles tool_calls natively)
 #   CODE      → professional (35B MoE, heavy coding model)
+#   IMAGE     → professional (35B MoE, vision-capable; image profile)
 #   SCHOLAR   → scholar  (deep research)
 #   PROFESSIONAL → professional (professional writing / 35B MoE)
 #   CREATIVE  → creative (long-form creative writing)
@@ -565,6 +663,7 @@ ROUTE_MAP: dict[str, str] = {
     "CHAT":         "professional",
     "TOOL":         "professional",
     "CODE":         "professional",  # 35B MoE
+    "IMAGE":        "professional",  # vision model (35B MoE, image profile)
     "SCHOLAR":      "scholar",
     "PROFESSIONAL": "professional",
     "CREATIVE":     "creative",
@@ -679,6 +778,37 @@ REQUEST_TIMEOUT: float = 300.0  # 5 minutes for long generations
 
 # Thermal monitor polling interval (seconds)
 SENSOR_INTERVAL: float = 3.0
+
+# ---------------------------------------------------------------------------
+# Professional model residency (keep-warm)
+#
+# The proxy keeps the professional model (35B MoE) LOADED on the 12 GB
+# GPU whenever the GPU is not serving another heavy model and not busy with
+# other heavy work (e.g. gaming/rendering), eliminating cold-start latency for
+# the most common route.  The thermal monitor drives the check cadence.
+# ---------------------------------------------------------------------------
+PROFESSIONAL_RESIDENT_ENABLED: bool = True     # kill toggle for residency
+PROFESSIONAL_RESIDENT_CHECK_S: float = 60.0    # how often the monitor checks
+# vram_used_gb >= this → GPU busy with OTHER work, so professional is not
+# (re)loaded on top of it.  An idle desktop holds about 0.6 GB; professional
+# itself fills most of the card, so a resident professional also reads as
+# busy, which is harmless (the check only gates a load).  The old 22.0 could
+# never be reached on the 12 GB card (2026-10-08 freeze).
+GPU_BUSY_VRAM_GB: float = 3.0
+
+# ---------------------------------------------------------------------------
+# Outbound image downscaling (R1 carve-out)
+#
+# A 3000×4000 image core-dumped llama-professional (Vulkan device lost,
+# 2026-08-12) — no downscaling existed anywhere.  Oversized images are
+# downscaled on the OUTBOUND model-copy only (the client's stored
+# conversation and the DB audit copy are never touched).  Opt out per
+# request with ``X-Proxy-Image-Downscale: off``.
+# ---------------------------------------------------------------------------
+IMAGE_DOWNSCALE_MAX_LONG_SIDE: int = 2048      # px — long-side cap for the vision model
+IMAGE_DOWNSCALE_JPEG_QUALITY: int = 85         # re-encode quality
+IMAGE_DOWNSCALE_MAX_FETCH_BYTES: int = 10 * 1024 * 1024  # remote fetch cap (10 MiB)
+IMAGE_DOWNSCALE_FETCH_TIMEOUT: float = 5.0     # seconds for a remote image fetch
 
 # TCP health-check timeout (seconds)
 TCP_TIMEOUT: float = 5.0

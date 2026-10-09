@@ -2,14 +2,17 @@
 Description=AI Multi-Agent Proxy Service
 After=network.target
 
+# Machine-specific deployment template.  Copy to
+# /etc/systemd/system/ai-proxy.service and replace the __PLACEHOLDER__
+# values with your machine's paths (see local_config.example.py).
 [Service]
 Type=simple
-User=james
-Group=james
-WorkingDirectory=~/kinver-hub/proxy
-Environment="PATH=~/kinver-hub/proxy/.venv/bin:/usr/local/bin:/usr/bin:/bin"
-EnvironmentFile=~/kinver-hub/proxy/.env
-ExecStart=~/kinver-hub/proxy/.venv/bin/python proxy.py
+User=__PROXY_USER__
+Group=__PROXY_USER__
+WorkingDirectory=__PROXY_ROOT__
+Environment="PATH=__PROXY_ROOT__/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=__PROXY_ROOT__/.env
+ExecStart=__PROXY_ROOT__/.venv/bin/python proxy.py
 Restart=always
 RestartSec=10
 

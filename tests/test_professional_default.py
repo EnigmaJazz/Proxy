@@ -4,6 +4,7 @@ Covers REQ-1 through REQ-8 from the Professional Default Routing spec.
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -12,6 +13,7 @@ import pytest
 import pytest_asyncio
 
 import proxy
+import routes
 from profile_loader import ModelProfileTable
 from routing import RouteDecision, resolve_route_for_lane_a
 
@@ -640,3 +642,229 @@ class TestQueueLifecycle:
             "and the stream ends in 'All connection attempts failed'."
         )
         assert captured["is_lane_b"] is False
+
+
+class TestReclassificationGate:
+    """The professional reclassification runs only when the frontdesk
+    flags medium/high complexity — the simple-request fast path must not
+    pay the ~12s professional generation (whose KV-cache the answering
+    pass cannot reuse: the system prompts diverge at the first token)."""
+
+    @pytest.mark.asyncio
+    async def test_low_complexity_skips_reclass(self) -> None:
+        from unittest.mock import AsyncMock
+
+        called = AsyncMock(return_value={"intent": "CODE"})
+        classification = {
+            "intent": "CHAT", "priority": 3, "complexity": "low",
+            "project_name": "general", "is_factual": False,
+        }
+        with patch("routes.reclassify_with_professional", called):
+            await routes._reclassify_gated(classification, "hi")
+        called.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_medium_complexity_runs_reclass(self) -> None:
+        from unittest.mock import AsyncMock
+
+        called = AsyncMock(return_value={"intent": "CODE"})
+        classification = {
+            "intent": "CHAT", "priority": 2, "complexity": "medium",
+            "project_name": "general", "is_factual": False,
+        }
+        with patch("routes.reclassify_with_professional", called):
+            await routes._reclassify_gated(classification, "refactor the routing")
+        called.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_high_complexity_runs_reclass(self) -> None:
+        from unittest.mock import AsyncMock
+
+        called = AsyncMock(return_value={"intent": "CODE", "priority": 1})
+        classification = {
+            "intent": "CHAT", "priority": 3, "complexity": "high",
+            "project_name": "general", "is_factual": False,
+        }
+        with patch("routes.reclassify_with_professional", called):
+            await routes._reclassify_gated(classification, "rearchitect the router")
+        called.assert_awaited_once()
+        assert classification["intent"] == "CODE"
+        assert classification["priority"] == 1
+
+    @pytest.mark.asyncio
+    async def test_gated_failure_preserves_frontdesk(self) -> None:
+        from unittest.mock import AsyncMock
+
+        called = AsyncMock(side_effect=httpx.ConnectError("boom"))
+        classification = {
+            "intent": "CHAT", "priority": 2, "complexity": "high",
+            "project_name": "general", "is_factual": False,
+        }
+        with patch("routes.reclassify_with_professional", called):
+            await routes._reclassify_gated(classification, "complex request")
+        called.assert_awaited_once()
+        assert classification["intent"] == "CHAT"  # frontdesk kept
+
+
+class TestReclassificationGateCodeTasks:
+    """Coding tasks always get the professional reclassification — the
+    frontdesk's complexity rating under-judges them (2026-08-11: a
+    medium-complexity coding task rated low skipped the reclass)."""
+
+    @pytest.mark.asyncio
+    async def test_code_intent_reclassifies_even_when_frontdesk_says_low(
+        self,
+    ) -> None:
+        from unittest.mock import AsyncMock
+
+        called = AsyncMock(return_value={"intent": "CODE"})
+        classification = {
+            "intent": "CODE", "priority": 2, "complexity": "low",
+            "project_name": "general", "is_factual": False,
+        }
+        with patch("routes.reclassify_with_professional", called):
+            await routes._reclassify_gated(classification, "refactor the router")
+        called.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_low_chat_still_skips(self) -> None:
+        from unittest.mock import AsyncMock
+
+        called = AsyncMock(return_value={"intent": "CHAT"})
+        classification = {
+            "intent": "CHAT", "priority": 2, "complexity": "low",
+            "project_name": "general", "is_factual": False,
+        }
+        with patch("routes.reclassify_with_professional", called):
+            await routes._reclassify_gated(classification, "hi there")
+        called.assert_not_awaited()
+
+
+class _ProbeFakeSystemd:
+    """Configurable systemd fake with liveness probing (queue worker tests)."""
+
+    def __init__(self, *, active: str | None = None, port_alive: bool = True) -> None:
+        self.active_heavy_model = active
+        self.port_alive = port_alive
+        self._port_cache: dict[str, int] = {"professional": 13109}
+        self.hotswaps: list[tuple[str, str]] = []
+
+    async def get_port(self, domain: str) -> int:
+        return self._port_cache.get(domain, 13109)
+
+    async def probe_model_port(self, port: int) -> bool:
+        return self.port_alive
+
+    async def hot_swap(self, from_domain: str, to_domain: str) -> int:
+        self.hotswaps.append((from_domain, to_domain))
+        self.active_heavy_model = to_domain
+        return self._port_cache.get(to_domain, 13109)
+
+    async def get_pending_jobs(self) -> list[dict[str, Any]]:
+        return []
+
+    async def is_active(self, domain: str) -> bool:
+        return self.active_heavy_model == domain
+
+
+class TestQueueHotSwapLiveness:
+    """The queue worker probes recorded state before skipping the hot-swap.
+
+    2026-08-12 incident: an external stop (``systemctl isolate`` from
+    unlock.sh) killed llama-professional while ``active_heavy_model`` still
+    said "professional" — the queue worker skipped the hot-swap because
+    ``current_heavy == target_model``, and the service stayed dead 1.5h.
+    """
+
+    @pytest.mark.asyncio
+    async def test_stale_recorded_model_dead_port_triggers_start(self) -> None:
+        """Recorded professional is dead (external stop) → start path runs."""
+        from proxy import _ensure_heavy_model_serving, AppState
+
+        systemd = _ProbeFakeSystemd(active="professional", port_alive=False)
+        state = AppState()
+        await _ensure_heavy_model_serving(systemd, "professional", state)
+        # from_domain "" → hot_swap runs the pure start path (no stop)
+        assert systemd.hotswaps == [("", "professional")]
+        assert state.active_heavy_model == "professional"
+
+    @pytest.mark.asyncio
+    async def test_stale_recorded_model_live_port_idempotent(self) -> None:
+        """Recorded professional is genuinely serving → no restart."""
+        from proxy import _ensure_heavy_model_serving, AppState
+
+        systemd = _ProbeFakeSystemd(active="professional", port_alive=True)
+        state = AppState()
+        await _ensure_heavy_model_serving(systemd, "professional", state)
+        assert systemd.hotswaps == []
+
+    @pytest.mark.asyncio
+    async def test_different_target_swaps_without_probe(self) -> None:
+        """Unchanged behavior: a different target still hot-swaps directly."""
+        from proxy import _ensure_heavy_model_serving, AppState
+
+        systemd = _ProbeFakeSystemd(active="professional", port_alive=False)
+        state = AppState()
+        await _ensure_heavy_model_serving(systemd, "coder", state)
+        assert systemd.hotswaps == [("professional", "coder")]
+        assert state.active_heavy_model == "coder"
+
+    @pytest.mark.asyncio
+    async def test_lightweight_target_untouched(self) -> None:
+        """Lightweight models (chatter) are never probed or swapped."""
+        from proxy import _ensure_heavy_model_serving, AppState
+
+        systemd = _ProbeFakeSystemd(active=None, port_alive=False)
+        state = AppState()
+        await _ensure_heavy_model_serving(systemd, "chatter", state)
+        assert systemd.hotswaps == []
+        assert state.active_heavy_model is None
+
+    @pytest.mark.asyncio
+    async def test_queue_worker_runs_helper_for_heavy_target(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The queue worker calls the liveness helper before streaming."""
+
+        class _OneShotDb:
+            def __init__(self) -> None:
+                self.job = {
+                    "id": "j1", "intent": "professional", "priority": 2,
+                    "failure_count": 0, "messages_json": "[]",
+                    "partial_content": "",
+                }
+                self.done = False
+
+            async def dequeue_next(self, max_priority: int) -> Any:
+                if not self.done:
+                    self.done = True
+                    return self.job
+                return None
+
+            async def complete_job(self, *args: Any, **kwargs: Any) -> None:
+                pass
+
+            async def get_pending_jobs(self) -> list[dict[str, Any]]:
+                return []
+
+        from proxy import queue_worker, AppState
+
+        systemd = _ProbeFakeSystemd(active="professional", port_alive=False)
+        state = AppState()
+        state.database = _OneShotDb()
+        state.systemd = systemd
+
+        called: list[str] = []
+
+        async def _helper(systemd: Any, target_model: str, state: Any) -> None:
+            called.append(target_model)
+
+        monkeypatch.setattr("proxy._ensure_heavy_model_serving", _helper)
+        task = asyncio.create_task(queue_worker(state))
+        for _ in range(200):
+            if called:
+                break
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert called == ["professional"]

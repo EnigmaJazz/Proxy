@@ -38,6 +38,8 @@ import aiofiles.os as aio_os
 from constants import (
     SYSTEMD_DIR,
     SERVICE_PATTERN,
+    PROFESSIONAL_RESIDENT_ENABLED,
+    GPU_BUSY_VRAM_GB,
     get_logger,
 )
 
@@ -49,6 +51,15 @@ logger = get_logger("proxy.systemd")
 HEALTH_CHECK_INTERVAL: float = 0.5  # seconds between /health polls
 DEFAULT_HEALTH_TIMEOUT: float = 120.0  # seconds before giving up on a model
 VRAM_RELEASE_DELAY: float = 2.0  # seconds to let VRAM free between swaps
+# Liveness probe timeout (seconds) for the cheap TCP port check used to
+# verify recorded heavy-model state before trusting it (2026-08-12 incident:
+# an external ``systemctl isolate`` stopped llama-professional while the proxy
+# still recorded it as active).
+PROBE_TIMEOUT: float = 1.0
+# Absolute systemctl path — PATH fragility in the proxy's environment produced
+# "systemctl missing" failures (2026-08-12); model management must never
+# silently break because systemctl cannot be resolved.
+SYSTEMCTL: str = "/usr/bin/systemctl"
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +102,7 @@ class SystemdController:
         service_name = f"llama-{domain}"
         logger.info("Starting service: %s", service_name)
         proc = await asyncio.create_subprocess_exec(
-            "systemctl", "start", service_name,
+            SYSTEMCTL, "start", service_name,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -111,7 +122,7 @@ class SystemdController:
         service_name = f"llama-{domain}"
         logger.info("Stopping service: %s", service_name)
         proc = await asyncio.create_subprocess_exec(
-            "systemctl", "stop", service_name,
+            SYSTEMCTL, "stop", service_name,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -130,7 +141,7 @@ class SystemdController:
         service_name = f"llama-{domain}"
         logger.info("Restarting service: %s", service_name)
         proc = await asyncio.create_subprocess_exec(
-            "systemctl", "restart", service_name,
+            SYSTEMCTL, "restart", service_name,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -146,7 +157,7 @@ class SystemdController:
         """
         service_name = f"llama-{domain}"
         proc = await asyncio.create_subprocess_exec(
-            "systemctl", "is-active", "--quiet", service_name,
+            SYSTEMCTL, "is-active", "--quiet", service_name,
         )
         await proc.communicate()
         return proc.returncode == 0
@@ -252,6 +263,51 @@ class SystemdController:
         logger.warning("Port %d did not become ready within %.1fs", port, timeout)
         return False
 
+    async def probe_model_port(
+        self,
+        port: int,
+        timeout: float = PROBE_TIMEOUT,
+    ) -> bool:
+        """
+        Cheap TCP liveness check for a model port.
+
+        Verifies that something is actually listening on ``127.0.0.1:port``
+        with a short connect timeout (~1s).  Used to validate the RECORDED
+        heavy-model state before trusting it: an external stop (e.g. an
+        ``unlock.sh`` ``systemctl isolate``) kills the service while the
+        proxy still believes it is loaded — without the probe, residency
+        and hot-swap decisions skip on stale state and the service stays
+        dead (2026-08-12 incident, 1.5h of non-restart).
+
+        Never raises: connection refused / timeout / any OSError means the
+        port is dead and the caller treats the model as not serving.
+
+        Parameters
+        ----------
+        port : int
+            TCP port to probe.
+        timeout : float
+            Maximum seconds to wait for the connect (default 1s).
+
+        Returns
+        -------
+        bool
+            True if the port accepts a TCP connection.
+        """
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", port),
+                timeout=timeout,
+            )
+        except (OSError, asyncio.TimeoutError):
+            return False
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except OSError:
+            pass
+        return True
+
     # ------------------------------------------------------------------
     # Hot-swap orchestration
     # ------------------------------------------------------------------
@@ -316,6 +372,67 @@ class SystemdController:
         logger.info("Professional service started on port %d", professional_port)
 
     # ------------------------------------------------------------------
+    # Professional residency (keep-warm)
+    # ------------------------------------------------------------------
+
+    async def ensure_professional_resident(self, gpu_vram_used_gb: float) -> None:
+        """
+        Keep the professional model loaded whenever the GPU is free.
+
+        Called periodically by the thermal monitor.  No-op unless the feature
+        is enabled, no other heavy model is active, and the GPU is not busy
+        with non-model work (gaming/rendering — inferred from VRAM usage at or
+        above ``GPU_BUSY_VRAM_GB``).  Never raises: systemctl failures are
+        logged as warnings and left for the next check.
+
+        Parameters
+        ----------
+        gpu_vram_used_gb : float
+            Current GPU VRAM usage in GiB (from the thermal monitor state).
+        """
+        if not PROFESSIONAL_RESIDENT_ENABLED:
+            return
+        if self._active_heavy_model is not None:
+            # Recorded state may be STALE: an external stop (e.g. an
+            # unlock.sh ``systemctl isolate``) kills the service while the
+            # proxy still believes it is loaded (2026-08-12 incident — 1.5h
+            # of non-restart).  Probe the recorded model's port: a live port
+            # means a heavy model genuinely owns the GPU (routing owns it),
+            # a dead port means the record is stale — clear it and proceed
+            # to (re)start professional.  The probe never raises, but the
+            # port lookup can — an unresolvable port is also a stale record.
+            recorded_port: Optional[int] = None
+            try:
+                recorded_port = await self.get_port(self._active_heavy_model)
+                if await self.probe_model_port(recorded_port):
+                    return  # a heavy model is genuinely serving
+            except (OSError, RuntimeError):
+                logger.debug(
+                    "Failed to probe recorded model '%s' — assuming stale",
+                    self._active_heavy_model,
+                )
+            logger.warning(
+                "Cleared stale active-heavy-model state '%s' "
+                "(port %s not serving)",
+                self._active_heavy_model,
+                recorded_port if recorded_port is not None else "unresolved",
+            )
+            self._active_heavy_model = None
+        if gpu_vram_used_gb >= GPU_BUSY_VRAM_GB:
+            return  # GPU busy with other work (gaming/rendering) — don't fight it
+
+        try:
+            if await self.is_active("professional"):
+                return  # already loaded
+            await self.start_service("professional")
+        except (OSError, RuntimeError) as exc:
+            logger.warning("Failed to keep professional resident: %s", exc)
+            return
+
+        self._active_heavy_model = "professional"
+        logger.info("Professional model loaded resident (GPU free)")
+
+    # ------------------------------------------------------------------
     # Model discovery
     # ------------------------------------------------------------------
 
@@ -378,11 +495,14 @@ class SystemdController:
 
     def is_gpu_occupied(self) -> bool:
         """
-        Return True if a heavy GPU model is currently active.
+        Return True if a heavy GPU model is currently loaded.
 
         Heavy models are: professional, coder, creative, scholar, architect.
         Lightweight models (chatter, frontdesk)
         are NOT considered "heavy" and can coexist or be quickly swapped.
+        Note: professional may be loaded but resident-IDLE (kept warm by
+        ``ensure_professional_resident`` when the GPU is free) — this flag
+        reports the loaded state, not the busy state.
         """
         heavy_models = {"professional", "coder", "creative", "scholar", "architect"}
         return (

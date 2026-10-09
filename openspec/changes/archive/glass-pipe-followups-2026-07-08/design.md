@@ -282,36 +282,36 @@ class ModelProfileTable:
 # `overrides:` in model_profiles.yaml is the PER-DEPLOYMENT layer applied at load.
 models:
   reasoning:
-    path: ~/kinver-hub/models/DeepSeek-R1-Distill-Qwen-32B-Q4_K_M.gguf
+    path: /kinver-home/models/DeepSeek-R1-Distill-Qwen-32B-Q4_K_M.gguf
     hf_model_id: deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
   coder:
-    path: ~/kinver-hub/models/qwen25-coder-32b-q4_k_m.gguf
+    path: /kinver-home/models/qwen25-coder-32b-q4_k_m.gguf
     hf_model_id: Qwen/Qwen2.5-Coder-32B-Instruct
   architect:
-    path: ~/kinver-hub/models/qwen3-32b-instruct-q4_k_m.gguf
+    path: /kinver-home/models/qwen3-32b-instruct-q4_k_m.gguf
     hf_model_id: Qwen/Qwen3-32B-Instruct
     overrides:
       max_tokens: 8192          # cap a 32B model for VRAM headroom
   professional:
-    path: ~/kinver-hub/models/qwen25-72b-instruct-q4_k_m.gguf
+    path: /kinver-home/models/qwen25-72b-instruct-q4_k_m.gguf
     hf_model_id: Qwen/Qwen2.5-72B-Instruct
   creative:
-    path: ~/kinver-hub/models/llama-3.3-70b-instruct-q4_k_m.gguf
+    path: /kinver-home/models/llama-3.3-70b-instruct-q4_k_m.gguf
     hf_model_id: meta-llama/Llama-3.3-70B-Instruct
   scholar:
-    path: ~/kinver-hub/models/qwen3-30b-a3b-instruct-q4_k_m.gguf
+    path: /kinver-home/models/qwen3-30b-a3b-instruct-q4_k_m.gguf
     hf_model_id: Qwen/Qwen3-30B-A3B-Instruct
   worker:
-    path: ~/kinver-hub/models/qwen25-9b-instruct-q5_k_m.gguf
+    path: /kinver-home/models/qwen25-9b-instruct-q5_k_m.gguf
     hf_model_id: Qwen/Qwen2.5-9B-Instruct
   chatter:
-    path: ~/kinver-hub/models/DeepSeek-R1-Distill-Qwen-3B-Q4_K_M.gguf
+    path: /kinver-home/models/DeepSeek-R1-Distill-Qwen-3B-Q4_K_M.gguf
     hf_model_id: deepseek-ai/DeepSeek-R1-Distill-Qwen-3B
   frontdesk:
-    path: ~/kinver-hub/models/qwen25-3b-instruct-q5_k_m.gguf
+    path: /kinver-home/models/qwen25-3b-instruct-q5_k_m.gguf
     hf_model_id: Qwen/Qwen2.5-3B-Instruct
   lifeboat:
-    path: ~/kinver-hub/models/llama-3.2-3b-instruct-q4_k_m.gguf
+    path: /kinver-home/models/llama-3.2-3b-instruct-q4_k_m.gguf
     hf_model_id: meta-llama/Llama-3.2-3B-Instruct
 ```
 
@@ -593,7 +593,7 @@ reverting drops the event with no protocol break.
 - [ ] Confirm the `gguf` package exposes the arch-keyed context length via
   `reader.get(f"{arch}.context_length")` (or equivalent) for every architecture the
   deployment ships (qwen2, llama, …). Verify at sdd-apply against the real files
-  under `~/kinver-hub/models/`.
+  under `/kinver-home/models/`.
 - [ ] `local_models.yaml` per-entry `overrides:` (baked at sync) vs
   `model_profiles.yaml` top-level `overrides:` (applied at load) — confirm
   precedence and whether both can coexist for the same `model_key`. Default:

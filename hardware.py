@@ -47,6 +47,10 @@ from constants import (
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
     SENSOR_INTERVAL,
+    PROFESSIONAL_RESIDENT_CHECK_S,
+    GPU_BUSY_VRAM_GB,
+    _machine,
+    _KINVER_HOME,
     metric_cpu_temp,
     metric_gpu_edge_temp,
     metric_gpu_junc_temp,
@@ -67,7 +71,7 @@ try:
     from pyrsmi import rocUtil  # type: ignore
     logger.info("pyrsmi loaded – AMD GPU telemetry available")
 except ImportError:
-    logger.warning("pyrsmi not installed – GPU temps will be zero")
+    logger.warning("pyrsmi not installed – using the amdgpu sysfs fallback")
     PYRSMI_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
@@ -179,13 +183,41 @@ def _read_amdgpu_hwmon() -> dict[str, float]:
     return result
 
 
+def _read_amdgpu_vram_used_gb(drm_root: Path = Path("/sys/class/drm")) -> float:
+    """
+    Read used VRAM in GiB from the ``amdgpu`` DRM sysfs counters.
+
+    Reads ``mem_info_vram_used`` of the AMD card (PCI vendor ``0x1002``)
+    with the largest ``mem_info_vram_total``: on a machine with an iGPU and
+    a discrete card, the discrete card is the one the models run on.
+    Returns 0.0 when no AMD card exposes the counters or a read fails.
+    """
+    best_total = 0
+    used_bytes = 0
+    try:
+        for device in sorted(drm_root.glob("card*/device")):
+            try:
+                if (device / "vendor").read_text().strip() != "0x1002":
+                    continue
+                total = int((device / "mem_info_vram_total").read_text())
+                used = int((device / "mem_info_vram_used").read_text())
+            except (OSError, ValueError):
+                continue
+            if total > best_total:
+                best_total, used_bytes = total, used
+    except OSError:
+        logger.debug("amdgpu DRM sysfs unreadable", exc_info=True)
+        return 0.0
+    return used_bytes / (1024**3)
+
+
 def get_gpu_temps() -> dict[str, float]:
     """
     Return dict with keys: edge, junction, vram, vram_used_gb (all floats).
 
     Uses pyrsmi (ROCm) for direct AMD GPU telemetry when available.
-    Falls back to the ``amdgpu`` hwmon sysfs interface (always present
-    with the amdgpu kernel driver) when pyrsmi is unavailable.
+    Falls back to the ``amdgpu`` hwmon and DRM sysfs interfaces (always
+    present with the amdgpu kernel driver) when pyrsmi is unavailable.
     Returns zeros if both sources fail.
     """
     result: dict[str, float] = {"edge": 0.0, "junction": 0.0, "vram": 0.0, "vram_used_gb": 0.0}
@@ -209,9 +241,12 @@ def get_gpu_temps() -> dict[str, float]:
         except (OSError, ValueError, RuntimeError):
             logger.exception("pyrsmi readout failed — falling back to hwmon")
 
-    # Fallback: read amdgpu hwmon sysfs (edge, junction, VRAM temps only)
+    # Fallback: amdgpu hwmon sysfs for temperatures, DRM sysfs for VRAM
+    # usage (hwmon has no usage counter; without this the residency
+    # "GPU busy" guard saw 0.0 GB forever — 2026-10-08 freeze).
     hwmon_temps = _read_amdgpu_hwmon()
     result.update(hwmon_temps)
+    result["vram_used_gb"] = _read_amdgpu_vram_used_gb()
     return result
 
 
@@ -356,7 +391,7 @@ async def calculate_dynamic_ngl(
     - Headless: minimal buffer (256MB) since no additional GPU workload
     - Graphical: larger buffer (1024MB) to handle compositor/user actions
 
-    The result is written to ``~/kinver-hub/.env.ngl``.
+    The result is written to ``<kinver-home>/.env.ngl``.
     """
     from constants import ENV_NGL_FILE
 
@@ -415,7 +450,10 @@ def is_system_headless() -> bool:
 # ---------------------------------------------------------------------------
 
 # Shared environment file written by arm_gpu_for_inference for llama.cpp
-SHARED_ENV_FILE: str = "~/kinver-hub/gpu_state.env"
+SHARED_ENV_FILE: str = _machine(
+    "SHARED_ENV_FILE",
+    os.path.join(_KINVER_HOME, "gpu_state.env"),
+)
 
 
 async def arm_gpu_for_inference(
@@ -632,7 +670,9 @@ async def send_bash_notification(title: str, message: str) -> None:
     Execute the custom ``ar-notify.sh`` bash notification script.
     The script is sourced and the ``notify_phone`` function is called.
     """
-    bash_file = "~/ar-notify.sh"
+    bash_file = _machine(
+        "NOTIFY_SCRIPT", os.path.expanduser("~/ar-notify.sh"),
+    )
     async_function = "notify_phone"
 
     try:
@@ -671,6 +711,7 @@ def _build_thermal_temps(cpu: float, gpu: dict[str, float]) -> dict[str, float]:
 async def thermal_monitor_task(
     state: ThermalState,
     interval: float = SENSOR_INTERVAL,
+    systemd: Optional[SystemdController] = None,
 ) -> None:
     """
     Async background loop that:
@@ -680,6 +721,9 @@ async def thermal_monitor_task(
     3. Updates Prometheus metrics.
     4. Triggers emergency system shutdown if any zone exceeds its
        critical limit.
+    5. Keeps the professional model resident on the GPU when it is free
+       (see ``systemd.ensure_professional_resident`` — checked every
+       ``PROFESSIONAL_RESIDENT_CHECK_S`` seconds).
 
     Runs forever until cancelled.  Designed to be spawned as an
     ``asyncio.Task`` during proxy startup.
@@ -690,8 +734,12 @@ async def thermal_monitor_task(
         Shared thermal state — mutated in-place each iteration.
     interval : float
         Seconds between sensor polls (default from constants.SENSOR_INTERVAL).
+    systemd : Optional[SystemdController]
+        Model service manager used for professional residency; ``None``
+        disables residency (tests, headless runs without systemd).
     """
     cooldown_until: dict[str, float] = {}  # per-zone cooldown after crit warning
+    last_resident_check: float = 0.0  # monotonic — last residency attempt
 
     logger.info(
         "Thermal monitor started (interval=%.1fs, limits=%s)",
@@ -722,6 +770,20 @@ async def thermal_monitor_task(
             metric_gpu_used_vram_gb.set(gpu["vram_used_gb"])
             metric_ram_used_pct.set(ram)
 
+            # ---- Professional residency (keep-warm) -------------------------
+            # ensure_professional_resident never raises (systemctl failures are
+            # logged inside), so this cannot break the monitor loop.
+            now = time.monotonic()
+            if (
+                systemd is not None
+                and now - last_resident_check >= PROFESSIONAL_RESIDENT_CHECK_S
+            ):
+                last_resident_check = now
+                logger.debug(
+                    "Professional residency check (gpu_vram_used_gb=%.1f)",
+                    state.gpu_vram_used_gb,
+                )
+                await systemd.ensure_professional_resident(state.gpu_vram_used_gb)
             # ---- Thermal threshold enforcement -------------------------------
             # Only real temperature sensors belong in the zone map. RAM usage
             # percent is NOT a temperature and must never be compared against

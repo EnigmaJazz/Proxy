@@ -20,6 +20,13 @@ Used by:
 The response text is post-processed to drop proxy-status content
 (sentinel-prefixed triage) that the opencode client accumulates as
 assistant text.
+
+Message-path HTTP primitives route through the module-level ``BACKEND``
+instance from ``opencode_backends.py`` (openchamber-bridge-backend design,
+step 1): session create/send/fetch/abort, permission and question relay.
+The ``/event`` SSE bus and the serve lifecycle (spawn/recycle/config
+sync) stay in this module — they are serve-specific and belong to later
+steps of the design.
 """
 from __future__ import annotations
 
@@ -28,6 +35,8 @@ import json
 import os
 import re
 import time
+from datetime import datetime
+from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
 import httpx
@@ -38,9 +47,14 @@ from constants import (
     OPENCODE_SERVE_TIMEOUT,
     OPENCODE_SERVE_URL,
     OPENCODE_BRIDGE_DIRECTORY,
+    OPENCODE_SERVE_CONFIG_DIR,
+    OPENCODE_SERVE_PURE,
     OPENCODE_WORKSPACE_DIR,
+    OPCODE_CONFIG_PATH,
+    _machine,
     get_logger,
 )
+from opencode_backends import BACKEND
 
 logger = get_logger("kinver.opencode_bridge")
 
@@ -52,11 +66,27 @@ _BRIDGE_SYSTEM_PROMPT = (
     "You are an API-backed coding assistant reached through a proxy bridge. "
     "Respond in English unless the user's message is written in another "
     "language. Keep the final answer concise and in English.\n\n"
-    "The user CAN answer your follow-up questions in their next message, so "
-    "if the task is genuinely ambiguous and the decision materially changes "
-    "the result, ask a clarifying question and stop — the user's answer will "
-    "resume this same session and you may ask again if needed.  Otherwise "
-    "make reasonable assumptions, state them briefly, and complete the task."
+    "WORK CONTINUITY (MANDATORY): work through MULTIPLE steps in one turn — "
+    "after each step (tool call, file read, edit), continue with the next "
+    "step immediately.  Never end your turn after a step, never stop to "
+    "report progress, and never wait for the user to say \"continue\" — "
+    "the user expects the finished result in one stream, not a series of "
+    "continue-pings.  Keep working until the task is complete.  End your "
+    "turn only when the task is done, or when you must ask the user a "
+    "clarifying question (the user CAN answer in their next message and "
+    "the same session resumes).  When the task is ambiguous, make "
+    "reasonable assumptions, state them briefly, and continue.\n\n"
+    "NARRATE (MANDATORY): before each step, tell the user in one short "
+    "sentence what you are doing and why; after each step, tell them what "
+    "happened in one short sentence.  Never run a tool in silence — a "
+    "silent tool run looks like a dead stream to the user.\n\n"
+    "TOOL RULES (MANDATORY): the headless tool runner can wedge indefinitely "
+    "on glob/grep/read calls (their completion never arrives, stranding the "
+    "task).  Prefer `bash` for discovery and reading — `ls`, `find`, `sed`, "
+    "`head`, `tail`, `cat` with explicit paths — and avoid glob/grep/read "
+    "where possible.  When a tool call fails with a transient error (e.g. "
+    "\"Tool execution aborted\", connection resets), retry it ONCE "
+    "immediately before giving up.\n"
 )
 
 # SDD-AUTONOMOUS system prompt: used when the client picks model
@@ -65,6 +95,42 @@ _BRIDGE_SYSTEM_PROMPT = (
 # the bridge is a single request/response and the user will not answer
 # follow-ups mid-cycle.  The preflight choices are supplied in the task
 # text; the orchestrator caches them and proceeds.
+#: The exact marker the orchestrator ends its final message with when an
+#: inline phase fails to produce its artifact (the loud terminal failure
+#: of the sub-agent contract).  The cycle driver matches it to exit
+#: loudly instead of resuming.
+_SDD_TERMINAL_FAILURE_MARKER = "SDD-CYCLE-TERMINAL-FAILURE"
+
+
+#: Canonical SDD sub-agent contract. Shared verbatim with the cycle
+#: driver's task text (``build_task``) and the serve-config orchestrator
+#: prompt; the sync test ``test_sdd_subagent_contract_sites_in_sync``
+#: guards against drift.  Supersedes the old "delegate ONCE, DO NOT retry"
+#: fallback rule with the bounded contract (artifact-check-first, one
+#: retry, inline fallback, loud terminal failure).
+_SDD_SUBAGENT_CONTRACT = (
+    "SUB-AGENT CONTRACT (MANDATORY): delegate each SDD phase to its phase "
+    "sub-agent (sdd-explore/sdd-propose/sdd-spec/sdd-design/sdd-tasks/"
+    "sdd-apply/sdd-verify/sdd-archive). If the sub-agent's result does not "
+    "arrive (the task tool hangs or errors), CHECK the phase artifact on "
+    "disk FIRST: if it exists, the work landed despite the delivery "
+    "failure - the phase is complete. If it is missing, RETRY the "
+    "sub-agent ONCE. If the retry also fails, check the artifact again: "
+    "exists -> complete; missing -> perform that phase INLINE yourself "
+    "with your own tools (read/write/edit/bash) and write the artifact "
+    "yourself. NEVER delegate a phase more than twice (initial + one "
+    "retry), and never start a retry while the original sub-agent session "
+    "is still running. A phase is COMPLETE ONLY when its artifact file "
+    "exists - proposal.md, specs/<change>/spec.md, design.md, tasks.md, "
+    "the applied code + tests, verify-report.md, and finally "
+    "archive-report.md. Never skip a phase's artifact. If an inline phase "
+    "also fails to produce its artifact, STOP the cycle immediately: end "
+    "your final message with the exact marker "
+    "'" + _SDD_TERMINAL_FAILURE_MARKER + ": <phase>' and list the artifacts produced "
+    "so far - do NOT retry, do NOT continue the pipeline, do NOT ask the "
+    "user anything."
+)
+
 _SDD_AUTONOMOUS_SYSTEM_PROMPT = (
     "You are the SDD orchestrator in AUTONOMOUS mode through a proxy "
     "bridge. Run the COMPLETE Spec-Driven Development cycle for the "
@@ -82,11 +148,31 @@ _SDD_AUTONOMOUS_SYSTEM_PROMPT = (
     "progress (e.g. 'SDD: exploring', 'SDD: proposing', ...).\n"
     "- Apply the Gatekeeper between phases; on failure fix once or abort "
     "with a clear error - never loop.\n"
+    "- LOCAL-MODEL DELEGATION (MANDATORY): when delegating code work to "
+    "the LOCAL model (apply's local writer), delegate ONE FILE at a time "
+    "— one task per file — for big tasks; never bundle multiple files "
+    "into one local-model task (the local context window is limited).\n"
+    "- CONTEXT DISCIPLINE (MANDATORY): your session context accumulates "
+    "across phases and cannot be reset mid-cycle.  Keep it small: never "
+    "re-read a file you already hold; reference artifact paths "
+    "(openspec/changes/<change>/...) instead of pasting file contents back "
+    "into context; when an artifact is large, read only the sections you "
+    "need.  The artifact files on disk are the durable state — your "
+    "context is a working cache, not the record.\n"
+    "- TOOL RETRY (MANDATORY): when a tool call fails with a transient "
+    "error (e.g. \"Tool execution aborted\", connection reset), retry the "
+    "tool ONCE immediately before giving up - the serve's tool runner "
+    "intermittently aborts in-flight executions and the retry normally "
+    "succeeds.  The same rule applies to every sub-agent you delegate to "
+    "(say so in the delegation prompt).\n"
     "- Keep the final summary short: change name, artifacts produced, "
     "tests run, and any remaining risk.\n"
     "You still have full sub-agent access; use it for every phase. Do NOT "
-    "ask the user anything."
+    "ask the user anything.\n\n"
+    + _SDD_SUBAGENT_CONTRACT
 )
+
+
 
 # Recycle the opencode serve after this uptime: the serve's agent-loop
 # tool runner progressively wedges (bash hangs on trivial commands even
@@ -105,9 +191,111 @@ _EVENT_FINAL_TIMEOUT: float = 3.0
 # A tool part stuck in "running" with no output for this long is WEDGED:
 # the serve's tool runner marked the tool started but never executed it,
 # so the session stays "busy" forever while the client sees keepalives.
-_TOOL_WEDGE_AFTER_S: float = 120.0
+_TOOL_WEDGE_AFTER_S: float = 300.0
+
+#: A ``task`` tool part waits on a sub-agent session, which legitimately
+#: runs for many minutes (the TUI's SDD cycles routinely take 5-20 min
+#: per sub-agent phase).  The 120s tool threshold would abort healthy
+#: phases at the first sub-agent lull, so task parts get their own,
+#: much longer window (2026-08-09).
+_SESSION_CONTEXT_CAP_TOKENS: int = 60_000
+
+
+#: A session's context CANNOT be reset by the agent inside it (the
+#: professional-as-subagent has no tools to shed history).  The bridge is
+#: the only reset point: a pinned session whose estimated context exceeds
+#: _SESSION_CONTEXT_CAP_TOKENS is dropped on the next resume and a fresh
+#: session starts — the durable state lives in the artifact/repo files
+#: (2026-08-14, user-directed after the weight_loss cycle hit 114k tokens
+#: and paid a 7.5-minute full re-prefill).
+_TASK_WEDGE_AFTER_S: float = 600.0
+
+#: STALL-AWARE ABORT (2026-08-11): a task part running this long whose
+#: child session has dropped out of the live status map means the
+#: sub-agent finished but the delivery never propagated (upstream
+#: #11865/#23296; the serve's tool runner also wedges on glob calls,
+#: stranding the child).  Fire the wedge early so the orchestrator's
+#: artifact-check-first proceeds WITHOUT redoing the phase.
+_TASK_STALL_AFTER_S: float = 180.0
+
 # How often the stream checks the session for a wedged tool part.
 _WEDGE_CHECK_INTERVAL_S: float = 10.0
+
+# How often the stream re-announces the currently running tool command
+# from the message list (bus path).  The announce must be faster than the
+# wedge check: tools 10-60s long would otherwise run to completion
+# before the first wedge cycle and the user would never see the command.
+_ANNOUNCE_CHECK_INTERVAL_S: float = 3.0
+
+#: Idle grace after the serve reports a finished step + idle session.
+#: Multi-step turns (work-continuity) pause between steps while the model
+#: generates the next action (5-40s on this hardware), and the serve can
+#: briefly report "idle" between assistant messages — an eager return on
+#: the first idle event cut the stream mid-turn while the agent kept
+#: working (observed live 2026-08-14: the feed stopped after the grep
+#: step; the session produced 45 more parts unseen).  The stream returns
+#: only after this quiet window with NO new content; any new part resets
+#: it.
+_IDLE_GRACE_S: float = 45.0
+
+#: Fallback plugin's project-local replay log (the rate-limit-fallback
+#: plugin mirrors its log into the repo's git dir).
+_FALLBACK_REPLAY_LOG = Path(__file__).parent / ".git" / "gentle-ai" / "rate-limit-fallback.log"
+
+#: A replay window stays open for this long after its last event before
+#: the reader treats it as stale.  Replays legitimately run 5-20 min, so
+#: the horizon must exceed that; the bound exists so a phantom window
+#: (start without a terminal event) cannot pause the hold/wedge forever.
+_FALLBACK_REPLAY_STALE_S: float = 1800.0
+
+
+def _replay_in_flight_for_any_session() -> bool:
+    """True when the fallback plugin shows a replay window open for any
+    session: a ``fallback_cycle_started`` event within the staleness
+    horizon with no terminal event after it.  The wedge timer and the
+    cycle driver's hold pause while a replay is in flight; a missing or
+    unreadable log fails closed to False (today's behavior).
+    """
+    try:
+        lines = _FALLBACK_REPLAY_LOG.read_text(
+            encoding="utf-8", errors="replace",
+        ).splitlines()
+    except OSError:
+        return False
+    open_window = False
+    horizon_ms = _FALLBACK_REPLAY_STALE_S * 1000.0
+    now_ms = time.time() * 1000.0
+    for line in lines[-200:]:
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        ts = rec.get("timestamp")
+        if not isinstance(ts, str):
+            continue
+        try:
+            ms = (
+                datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+                * 1000.0
+            )
+        except ValueError:
+            continue
+        if now_ms - ms > horizon_ms:
+            continue
+        event = str(rec.get("event", ""))
+        if event == "fallback_cycle_started":
+            open_window = True
+        elif any(k in event for k in
+                 ("completed", "failed", "cleared", "settled")):
+            open_window = False
+    return open_window
+
+
+#: How often the BLOCKING path (opencode_chat) polls GET /permission while
+#: its message POST is in flight.  The blocking call has no SSE bus, so a
+#: parked permission gate is only visible through polling; 5s matches the
+#: streaming path's permission-check cadence class.
+_BLOCKING_PERMISSION_POLL_S: float = 5.0
 
 # Sentinel-prefixed proxy status the opencode client accumulates into the
 # assistant text (the proxy emits triage as the first SSE chunk).  The
@@ -272,16 +460,52 @@ async def _post_permission_response(
     errors (the caller proceeds with the pinned continuation either way).
     Never raises.
     """
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                f"{OPENCODE_SERVE_URL}/session/{session_id}/permissions/{permission_id}",
-                json={"response": response},
-                timeout=10.0,
-            )
-            return resp.status_code == 200
-    except (httpx.HTTPError, OSError):
-        return False
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        return await BACKEND.reply_permission(
+            client, session_id, permission_id, response,
+        )
+
+
+async def _abort_session_best_effort(
+    client: httpx.AsyncClient,
+    session_id: str,
+) -> None:
+    """Best-effort abort of one opencode session (blocking-path cleanup).
+
+    The blocking escalation path has no SSE bus, so it cannot watch for
+    wedged tools; when it gives up on a session (timeout, HTTP error,
+    write-permission abort) it must not leave a busy zombie behind.
+    Never raises — the backend contract guarantees it (see
+    ``OpenCodeBackend.abort_session``).
+    """
+    await BACKEND.abort_session(client, session_id)
+
+
+async def _abort_stream_session_best_effort(
+    client: httpx.AsyncClient,
+    session_id: str,
+    *,
+    session_map: Optional[dict[str, str]] = None,
+    session_key: Optional[str] = None,
+    pending_permissions: Optional[dict[str, tuple[str, bool]]] = None,
+) -> None:
+    """Streaming-path cleanup trio: best-effort abort + pin drop + pending
+    permission pop.
+
+    Every ``opencode_chat_stream`` error exit runs this so a failed or
+    abandoned request never leaves a busy agent session on the serve with
+    the ``session_map`` pin pointing at it.  Distinct from the blocking-path
+    helper ``_abort_session_best_effort`` (cycle 5) so the two paths stay
+    merge-safe.  Never raises; a falsy ``session_id`` (session create
+    failed) is a no-op.
+    """
+    if not session_id:
+        return
+    await _abort_session_best_effort(client, session_id)
+    if pending_permissions is not None:
+        pending_permissions.pop(session_id, None)
+    if session_map is not None and session_key:
+        session_map.pop(session_key, None)
 
 
 async def _handle_permission_event(
@@ -326,10 +550,7 @@ async def _handle_permission_event(
         mid = tool_info.get("messageID")
         call_id = tool_info.get("callID")
         if mid:
-            msg_resp = await client.get(
-                f"{OPENCODE_SERVE_URL}/session/{session_id}/message/{mid}",
-                timeout=10.0,
-            )
+            msg_resp = await BACKEND.fetch_message(client, session_id, mid)
             if msg_resp.status_code == 200:
                 for part in (msg_resp.json().get("parts") or []):
                     if part.get("callID") == call_id or part.get("id") == call_id:
@@ -379,7 +600,7 @@ async def _detect_pending_permission(
     event-bus path.
     """
     try:
-        resp = await client.get(f"{OPENCODE_SERVE_URL}/permission", timeout=10.0)
+        resp = await BACKEND.fetch_permissions(client)
         if resp.status_code != 200:
             return None
         for perm in resp.json():
@@ -400,11 +621,21 @@ def _strip_proxy_status_text(text: str) -> str:
 
 
 async def is_opencode_serve_running() -> bool:
-    """True when the headless opencode serve backend answers."""
+    """True when a complete HTTP response arrives from the serve transport.
+
+    Transport-liveness semantics: ANY received HTTP response — 2xx, 3xx,
+    4xx, or 5xx — proves a process holds the configured port, so a
+    non-2xx responder (version-specific, missing, or degraded /config)
+    still blocks a duplicate spawn.  Only an ``httpx.HTTPError``
+    (ConnectError / ConnectTimeout / ReadTimeout) or ``OSError`` means
+    down.  The buffered ``.get()`` completion is the received-response
+    boundary; the body is never explicitly read and the status is never
+    interpreted.
+    """
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.get(f"{OPENCODE_SERVE_URL}/config", timeout=5.0)
-            return resp.status_code == 200
+            await client.get(f"{OPENCODE_SERVE_URL}/config", timeout=3.0)
+            return True
     except (httpx.HTTPError, OSError):
         return False
 
@@ -415,37 +646,141 @@ async def ensure_opencode_serve() -> bool:
     Returns True when the backend is answering.  Spawns ``opencode serve``
     as a detached child process bound to ``OPENCODE_SERVE_URL`` — the
     proxy owns its lifecycle so no systemd unit is required.  Never raises.
+
+    Config-drift gate (REQ-5): when a serve IS running and the serve
+    template (OPCODE_CONFIG_PATH) is newer than the mtime cached at the
+    last successful spawn, the serve is recycled via ``_force_recycle_serve``
+    and respawned so the edited config actually loads.  An unreadable
+    template is treated as no-drift.
     """
+    global _serve_config_mtime
+    mtime = await asyncio.to_thread(_config_mtime)
     if await is_opencode_serve_running():
-        return True
+        if mtime is None:
+            return True  # template unreadable — treat as no-drift
+        if _serve_config_mtime is not None and mtime > _serve_config_mtime:
+            logger.warning(
+                "opencode serve config drifted (mtime %.3f > cached %.3f) — "
+                "recycling serve", mtime, _serve_config_mtime,
+            )
+            await _force_recycle_serve()
+            # Drain the old listener so the respawn can bind the port.
+            for _ in range(4):
+                if not await is_opencode_serve_running():
+                    break
+                await asyncio.sleep(0.25)
+        else:
+            if _serve_config_mtime is None:
+                # Proxy restarted while the serve survived: adopt the
+                # current template as the baseline, no recycle.
+                _serve_config_mtime = mtime
+            return True
+    return await _spawn_serve(mtime)
+
+
+
+def _sync_openai_auth_into_serve(serve_env: dict[str, str]) -> None:
+    """Refresh the serve's openai OAuth access token from the TUI/CLI
+    auth.json and copy the auth file into the serve's ISOLATED data
+    home (the chatgpt-headless route the TUI/CLI use — the env apiKey
+    alone is rejected: the ChatGPT-Plus OAuth token lacks the
+    api.responses.write scope).  Sync file I/O: callers run it via
+    asyncio.to_thread.  Never raises.
+    """
+    try:
+        with open(
+            os.path.expanduser("~/.local/share/opencode/auth.json"),
+            encoding="utf-8",
+        ) as _af:
+            _auth = json.load(_af)
+        _tok = (_auth.get("openai") or {}).get("access")
+        if _tok:
+            serve_env["OPENAI_API_KEY"] = _tok
+        # The serve's data home is ISOLATED (XDG_DATA_HOME ->
+        # serve-config), so its auth lookup would miss the TUI/CLI's
+        # auth.json (OAuth tokens) and fall back to the env apiKey
+        # (which the API rejects).  Copy the auth file into the serve's
+        # data home so the serve resolves the openai provider through
+        # the SAME chatgpt-headless OAuth route the TUI/CLI use
+        # (2026-08-09).
+        _serve_auth = os.path.join(
+            OPENCODE_SERVE_CONFIG_DIR, "opencode", "auth.json",
+        )
+        _src_auth = os.path.expanduser("~/.local/share/opencode/auth.json")
+        if os.path.exists(_src_auth):
+            os.makedirs(os.path.dirname(_serve_auth), exist_ok=True)
+            with open(_src_auth, "rb") as _sf, open(_serve_auth, "wb") as _df:
+                _df.write(_sf.read())
+            # The copy holds OAuth tokens: enforce the same 0600 the
+            # source auth.json carries (open('wb') would create it
+            # 0644 under a normal umask — world-readable).
+            try:
+                os.chmod(_serve_auth, 0o600)
+            except OSError:
+                pass
+    except (OSError, ValueError, TypeError):
+        pass
+
+async def _spawn_serve(mtime: Optional[float]) -> bool:
+    """Spawn the opencode serve with the serve-scoped config (candidate B).
+
+    Syncs the reduced template into ``OPENCODE_SERVE_CONFIG_DIR`` and
+    spawns with ``XDG_CONFIG_HOME`` pointing there, so ONLY the referenced
+    plugins load (the rate-limit-fallback plugin; the wedge-prone
+    skill-registry / review-result-artifacts / model-variants .ts plugins
+    never auto-load — the serve-config dir holds no .ts files).
+    ``OPENCODE_SERVE_PURE`` toggles candidate A (``--pure``, no plugins).
+    Records ``_serve_config_mtime`` on success so the drift gate can
+    compare.  Never raises.
+    """
+    global _serve_config_mtime
     try:
         port = OPENCODE_SERVE_URL.rsplit(":", 1)[-1]
+        await asyncio.to_thread(_sync_serve_config)
         serve_log = await asyncio.to_thread(_open_serve_log)
         # The serve inherits a minimal systemd PATH; give it the usual
-        # user paths so plugins (e.g. skill-registry → gentle-ai) resolve.
+        # user paths so the fallback plugin's gentle-ai binary resolves.
         serve_env = dict(os.environ)
         serve_env["PATH"] = (
-            "/home/linuxbrew/.linuxbrew/bin:"
-            "~/.local/bin:"
-            "~/.opencode/bin:"
-            "/usr/local/bin:/usr/bin:/bin"
+            _machine("LINUXBREW_PREFIX", os.path.expanduser("~/.linuxbrew")) + "/bin:"
+            + _machine("LOCAL_BIN_DIR", os.path.expanduser("~/.local/bin")) + ":"
+            + _machine("OPENCODE_BIN_DIR", os.path.expanduser("~/.opencode/bin")) + ":"
+            + "/usr/local/bin:/usr/bin:/bin"
         )
+        # Candidate B: serve-scoped config dir (never ~/.config/opencode).
+        serve_env["XDG_CONFIG_HOME"] = OPENCODE_SERVE_CONFIG_DIR
+        # The auth sync is sync file I/O: keep it off the event loop
+        # (Rule 3 discipline — the config sync and log opens do the same).
+        await asyncio.to_thread(_sync_openai_auth_into_serve, serve_env)
+        # Full serve isolation (2026-08-09): the serve must NOT share the
+        # TUI's data/cache locations.  The shared session DB + plugin
+        # caches caused cross-process contention (systematic plugin's
+        # models.json cache, session storage churn) and let the serve's
+        # stalls poison the TUI and vice versa.  Data (sessions) and cache
+        # now live under the serve-config dir, unique to the serve.
+        serve_env["XDG_DATA_HOME"] = OPENCODE_SERVE_CONFIG_DIR
+        serve_env["XDG_CACHE_HOME"] = os.path.join(OPENCODE_SERVE_CONFIG_DIR, "cache")
+        args = [
+            OPENCODE_BIN, "serve", "--port", port, "--hostname", "127.0.0.1",
+        ]
+        if OPENCODE_SERVE_PURE:
+            args.append("--pure")  # candidate A fallback: no plugins at all
         proc = await asyncio.create_subprocess_exec(
-            OPENCODE_BIN,
-            "serve",
-            "--port", port,
-            "--hostname", "127.0.0.1",
+            *args,
             stdout=serve_log,
             stderr=serve_log,
             start_new_session=True,
             cwd=OPENCODE_WORKSPACE_DIR,
             env=serve_env,
         )
-        logger.info("Opened opencode serve (pid=%s) on %s", proc.pid, OPENCODE_SERVE_URL)
+        logger.info(
+            "Opened opencode serve (pid=%s) on %s", proc.pid, OPENCODE_SERVE_URL,
+        )
         # Wait briefly for the listener to come up.
         for _ in range(10):
             await asyncio.sleep(0.5)
             if await is_opencode_serve_running():
+                _serve_config_mtime = mtime
                 return True
     except asyncio.CancelledError:
         # Cancellation must propagate (never swallow it).
@@ -463,6 +798,8 @@ async def opencode_chat(
     provider_id: str = "kinver",
     timeout: float = OPENCODE_SERVE_TIMEOUT,
     system_prompt: str = _BRIDGE_SYSTEM_PROMPT,
+    autonomous: bool = False,
+    directory: Optional[str] = None,
 ) -> str:
     """Send a task to headless opencode and return the assistant text.
 
@@ -470,54 +807,146 @@ async def opencode_chat(
     the agent finishes), and concatenates the ``text`` parts.  Proxy-status
     sentinel segments are stripped from the result.  Returns an error
     string on failure (escalation-friendly, never raises).
+
+    While the message POST is in flight the call polls ``GET /permission``
+    (``_BLOCKING_PERMISSION_POLL_S`` cadence): READ asks are auto-allowed,
+    WRITE/git asks are NOT granted (headless callers have no user to relay
+    a question to) — the session is aborted and a clear error is returned
+    instead of burning the full timeout on a parked agent.  ``autonomous``
+    preserves the streaming path's auto-allow-all semantics.  On every
+    non-success exit the created session is aborted best-effort so no busy
+    zombie is left on the serve.
+
+    A network-class failure after a successful first ensure triggers one
+    bounded respawn: the serve is force-recycled, re-ensured, and the whole
+    call retried exactly once.  HTTP-status errors and permission aborts
+    never retry.
     """
     if not await ensure_opencode_serve():
         return "[OpenCode Bridge Failed: opencode serve not reachable.]"
     async with httpx.AsyncClient() as client:
-        try:
-            # ---- 1. Create a fresh session --------------------------------
-            resp = await client.post(
-                f"{OPENCODE_SERVE_URL}/session",
-                params={"directory": OPENCODE_BRIDGE_DIRECTORY},
-                timeout=30.0,
-            )
-            if resp.status_code != 200:
-                return f"[OpenCode Bridge Error: session HTTP {resp.status_code}]"
-            session_id = resp.json().get("id")
-            if not session_id:
-                return "[OpenCode Bridge Error: no session id returned.]"
+        text, network_failed = await _opencode_chat_attempt(
+            client, user_text, agent=agent, model_id=model_id,
+            provider_id=provider_id, timeout=timeout,
+            system_prompt=system_prompt, autonomous=autonomous,
+            directory=directory,
+        )
+        if not network_failed:
+            return text
+        # The serve died mid-call (network-class failure after a successful
+        # ensure): recycle once, re-ensure, and retry the whole call once.
+        # No loop — a failed re-ensure or failed retry returns its error.
+        await _force_recycle_serve("blocking-path respawn")
+        if not await ensure_opencode_serve():
+            return "[OpenCode Bridge Failed: opencode serve not reachable.]"
+        text, _ = await _opencode_chat_attempt(
+            client, user_text, agent=agent, model_id=model_id,
+            provider_id=provider_id, timeout=timeout,
+            system_prompt=system_prompt, autonomous=autonomous,
+            directory=directory,
+        )
+        return text
 
-            # ---- 2. Post the message (blocks until the agent finishes) ----
-            payload: dict[str, Any] = {
-                "agent": agent,
-                "system": system_prompt,
-                "parts": [{"type": "text", "text": user_text}],
-            }
-            if model_id:
-                payload["model"] = {
-                    "modelID": model_id,
-                    "providerID": provider_id,
-                    "variant": "default",
-                }
-            resp = await client.post(
-                f"{OPENCODE_SERVE_URL}/session/{session_id}/message",
-                json=payload,
-                timeout=timeout,
+
+async def _opencode_chat_attempt(
+    client: httpx.AsyncClient,
+    user_text: str,
+    *,
+    agent: str,
+    model_id: Optional[str],
+    provider_id: str,
+    timeout: float,
+    system_prompt: str,
+    autonomous: bool,
+    directory: Optional[str] = None,
+) -> tuple[str, bool]:
+    """One blocking attempt: create session, POST with permission polling,
+    extract text.
+
+    Returns ``(result_string, network_failed)``.  ``network_failed`` is True
+    ONLY for the network-class paths (httpx.HTTPError/OSError/ValueError) so
+    the caller can trigger the bounded respawn; HTTP-status errors, missing
+    ids, empty responses, and permission aborts return False.  Never raises.
+    """
+    try:
+        # ---- 1. Create a fresh session --------------------------------
+        resp = await BACKEND.create_session(
+            client, directory=directory or OPENCODE_BRIDGE_DIRECTORY,
+        )
+        if resp.status_code != 200:
+            return f"[OpenCode Bridge Error: session HTTP {resp.status_code}]", False
+        session_id = resp.json().get("id")
+        if not session_id:
+            return "[OpenCode Bridge Error: no session id returned.]", False
+
+        # ---- 2. Post the message, watching for permission gates ------
+        # The POST runs as a task so the poller below can watch GET
+        # /permission concurrently (httpx clients are concurrency-safe).
+        post_task = asyncio.create_task(
+            BACKEND.send_message(
+                client, session_id,
+                agent=agent, system_prompt=system_prompt, user_text=user_text,
+                model_id=model_id, provider_id=provider_id, timeout=timeout,
             )
-            if resp.status_code != 200:
-                return f"[OpenCode Bridge Error: message HTTP {resp.status_code}]"
-            data = resp.json()
-            parts = data.get("parts", [])
-            chunks = [
-                str(p.get("text") or "")
-                for p in parts
-                if p.get("type") == "text" and p.get("text")
-            ]
-            return _strip_proxy_status_text("".join(chunks)).strip() or (
-                "[OpenCode Bridge Error: empty response.]"
-            )
-        except (httpx.HTTPError, OSError, ValueError) as exc:
-            return f"[OpenCode Bridge Network Error: {str(exc)}]"
+        )
+        try:
+            last_poll = time.monotonic()
+            while True:
+                if post_task.done():
+                    # Raises httpx/OSError on transport failure.
+                    resp = post_task.result()
+                    break
+                if time.monotonic() - last_poll >= _BLOCKING_PERMISSION_POLL_S:
+                    last_poll = time.monotonic()
+                    perm = await _detect_pending_permission(client, session_id)
+                    if perm is not None:
+                        question = await _handle_permission_event(
+                            client, session_id, perm, {},
+                            autonomous=autonomous,
+                        )
+                        if question:
+                            # Interactive-mode WRITE/git ask on a headless
+                            # blocking call: no user can answer, and the
+                            # queue-worker path must never grant writes
+                            # unprompted — abort and surface a clear error
+                            # instead of streaming keepalives or granting.
+                            await _abort_session_best_effort(client, session_id)
+                            return (
+                                "[OpenCode Bridge Error: agent requested write "
+                                "permission — headless escalation cannot relay "
+                                "questions; session aborted.]",
+                                False,
+                            )
+                await asyncio.sleep(min(0.25, _BLOCKING_PERMISSION_POLL_S))
+        except (httpx.HTTPError, OSError) as exc:
+            await _abort_session_best_effort(client, session_id)
+            return f"[OpenCode Bridge Network Error: {str(exc)}]", True
+        finally:
+            if not post_task.done():
+                post_task.cancel()
+        if resp.status_code != 200:
+            await _abort_session_best_effort(client, session_id)
+            return f"[OpenCode Bridge Error: message HTTP {resp.status_code}]", False
+        data = resp.json()
+        parts = data.get("parts", [])
+        chunks = [
+            str(p.get("text") or "")
+            for p in parts
+            if p.get("type") == "text" and p.get("text")
+        ]
+        return (
+            _strip_proxy_status_text("".join(chunks)).strip()
+            or "[OpenCode Bridge Error: empty response.]",
+            False,
+        )
+    except (httpx.ConnectError, httpx.ConnectTimeout,
+            httpx.RemoteProtocolError, OSError) as exc:
+        return f"[OpenCode Bridge Network Error: {str(exc)}]", True
+    except (httpx.HTTPError, ValueError) as exc:
+        # ReadTimeout / malformed body: the serve may be healthy and the
+        # agent still working.  NEVER recycle on these — the respawn would
+        # SIGTERM the serve and destroy every concurrent session.
+        return f"[OpenCode Bridge Error: {str(exc)}]", False
 
 
 async def opencode_chat_stream(
@@ -533,6 +962,7 @@ async def opencode_chat_stream(
     system_prompt: str = _BRIDGE_SYSTEM_PROMPT,
     timeout: float = OPENCODE_SERVE_TIMEOUT,
     autonomous: bool = False,
+    directory: Optional[str] = None,
 ) -> AsyncIterator[tuple[str, str]]:
     """Stream a task through headless opencode, yielding assistant content live.
 
@@ -555,6 +985,11 @@ async def opencode_chat_stream(
     # cycle never runs on a progressively-wedged tool runner.
     if autonomous:
         await _force_recycle_serve()
+    # Recycle BEFORE ensure: the recycle SIGTERMs the serve (low memory or
+    # uptime > _SERVE_RECYCLE_AFTER_S) and never respawns, so running it
+    # after ensure would break the next request with a spurious ConnectError.
+    # The ensure below respawns a fresh serve when a recycle fired.
+    await _recycle_serve_if_low_memory()
     if not await ensure_opencode_serve():
         yield ("status", "[OpenCode Bridge Failed: opencode serve not reachable.]")
         return
@@ -566,52 +1001,170 @@ async def opencode_chat_stream(
     )
     async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
         try:
-            await _recycle_serve_if_low_memory()
             protected = set(session_map.values()) if session_map else None
             await _abort_zombie_sessions(client, protected)
             session_id = (
                 session_map.get(session_key)
                 if session_map and session_key else None
             )
+            # Set when the user's message answered a pending question (the
+            # resume path posts it as a question reply, so no prompt POST).
+            skip_prompt = False
+            # A pending question request owned by the pinned session (the
+            # agent's question tool is waiting on the user).  Detected
+            # BEFORE the busy check: a question session is legitimately
+            # busy and must never be aborted as stuck.
+            pending_question_id: Optional[str] = None
+            pending_question_count = 0
+            if session_id:
+                pending_question_id, pending_question_count = await _find_pending_question(
+                    client, session_id,
+                )
             if session_id:
                 # Follow-up in the same conversation: reuse the pinned agent
                 # session so it retains its tool state and context.  But a
                 # session that is STILL BUSY (a previously hung agent tool)
                 # can never accept new work — abort it, drop the pin, and
                 # start fresh instead of queueing behind a zombie.
+                # A session the serve no longer LISTS is stale: the serve was
+                # recycled (or the session was dropped), so posting to the
+                # pinned id would fail every retry — drop the pin and start
+                # fresh.  Only a SUCCESSFUL status fetch may trigger the
+                # drop; a transport-error fetch keeps the pin conservatively.
+                # A session's real existence must NOT be inferred from
+                # /session/status: the serve's status map only holds BUSY
+                # sessions — idle sessions are deleted from it on
+                # completion (upstream SessionStatus.set deletes on idle,
+                # observed live 2026-08-13 on 1.18.18).  A healthy idle
+                # pinned session is therefore absent from the map, and
+                # reading that absence as "session gone" dropped EVERY
+                # pin on the follow-up: each "continue" started a fresh
+                # session and the agent lost the task context
+                # ('runs a few commands and then stops').  Existence is
+                # probed with GET /session/<id> (200 = live, 404 =
+                # genuinely gone — serve recycled or dropped).  The status
+                # fetch remains only for the busy-stuck abort below.
+                fetch_ok = False
+                exists = True
                 try:
-                    st_resp = await client.get(
-                        f"{OPENCODE_SERVE_URL}/session/status", timeout=10.0,
-                    )
-                    st_map = st_resp.json()
-                    st = (st_map.get(session_id) or {}).get("type")
+                    get_resp = await BACKEND.session_exists(client, session_id)
+                    fetch_ok = True
+                    exists = get_resp.status_code == 200
+                except (httpx.HTTPError, ValueError):
+                    pass
+                st = None
+                try:
+                    st_resp = await BACKEND.fetch_session_status(client)
+                    st = (st_resp.json().get(session_id) or {}).get("type")
                 except (httpx.HTTPError, ValueError):
                     st = None
-                if st == "busy" and not just_approved_permission:
-                    # A session that just resumed after a permission
-                    # approval is legitimately busy executing the approved
-                    # tool (or generating its summary) — do NOT abort it.
-                    # Only a busy session with NO such resume is stuck.
-                    logger.warning(
-                        "pinned session %s is busy (likely stuck) — aborting and starting fresh",
+                if fetch_ok and not exists:
+                    # Stale pin: a successful existence probe shows the
+                    # session is gone — no abort POST is needed (aborting
+                    # a nonexistent session adds noise).
+                    logger.info(
+                        "pinned session %s no longer on serve — dropping pin and starting fresh",
                         session_id[:16],
                     )
-                    try:
-                        await client.post(
-                            f"{OPENCODE_SERVE_URL}/session/{session_id}/abort",
-                            timeout=10.0,
-                        )
-                    except (httpx.HTTPError, OSError):
-                        pass
                     pending_permissions.pop(session_id, None)
                     if session_map is not None and session_key:
                         session_map.pop(session_key, None)
                     session_id = None
+                elif st == "busy" and not just_approved_permission and not pending_question_id:
+                    # A session that just resumed after a permission
+                    # approval is legitimately busy executing the approved
+                    # tool (or generating its summary) — do NOT abort it.
+                    # Only a busy session with NO such resume is stuck.
+                    # Same for a session with a pending question (the agent
+                    # is waiting on the user, not stuck).
+                    logger.warning(
+                        "pinned session %s is busy (likely stuck) — aborting and starting fresh",
+                        session_id[:16],
+                    )
+                    await _abort_stream_session_best_effort(
+                        client, session_id,
+                        session_map=session_map, session_key=session_key,
+                        pending_permissions=pending_permissions,
+                    )
+                    session_id = None
+            # True when the session_id came from the session map (a pin),
+            # NOT from a fresh POST /session below — only resumed sessions
+            # seed the poll-state with pre-existing history.
+            resumed = session_id is not None
+            user_mids: set[str] = set()
+            asst_mid: Optional[str] = None
+            text_lens: dict[str, int] = {}
+            tool_state: dict[str, str] = {}
+            # Tool parts already surfaced as a 🔧 status by the polling
+            # announce (bus path) — never re-announce them.
+            announced_tool_pids: set[str] = set()
+            pending_done = False
+            session_busy = True  # assume working until a status event says idle
+            seen_question_pids: set[str] = set()
+            running_question_times: list[float] = []
+            if resumed:
+                # Seed part state for the resumed conversation so the
+                # polling fallback never replays history or re-surfaces a
+                # stale question that kills the stream.  Best-effort.  The
+                # seeding also records running-question start times (the
+                # orphan check below uses them — no extra message-list GET,
+                # so the seeded read stays the FIRST one) and returns a
+                # rough context-token estimate for the bridge-level reset:
+                # an over-cap session cannot shed its own history, so the
+                # next resume starts fresh (durable state lives in the
+                # artifact files).
+                est = await _seed_resumed_session_state(
+                    client, session_id, user_mids, text_lens,
+                    tool_state, seen_question_pids, running_question_times,
+                )
+                if est > _SESSION_CONTEXT_CAP_TOKENS:
+                    logger.info(
+                        "pinned session %s over the context cap (%d tokens) "
+                        "— starting fresh", session_id[:16], est,
+                    )
+                    if session_map is not None and session_key:
+                        session_map.pop(session_key, None)
+                    session_id = None
+                    resumed = False
+            # A pending QUESTION from the previous turn: the agent is
+            # waiting on the user (the question tool parks the current
+            # step).  The user's message IS the answer — post it to the
+            # serve's question reply endpoint so the tool completes and
+            # the agent continues with the answer in context.  Posting
+            # the answer as a new prompt instead leaves the step
+            # blocked forever (observed live 2026-08-14: a
+            # 'notification channel' question stayed running 8+ minutes
+            # across 5 user messages that all only got keepalives).
+            if session_id:
+                if pending_question_id and pending_question_count:
+                    await _post_question_answer(
+                        client, session_id, pending_question_id, user_text,
+                        pending_question_count,
+                    )
+                    skip_prompt = True
+                elif (
+                    running_question_times
+                    and time.time() * 1000 - max(running_question_times) > 60_000
+                ):
+                    # The question part is parked in "running" but the
+                    # serve holds NO pending request for it — the
+                    # question is orphaned (serve recycled or the ask
+                    # was lost) and can never be answered.  Abort and
+                    # start fresh; the resilient wrapper retries the
+                    # full task.
+                    logger.warning(
+                        "orphaned pending question in session %s — aborting and starting fresh",
+                        session_id[:16],
+                    )
+                    await _abort_stream_session_best_effort(
+                        client, session_id,
+                        session_map=session_map, session_key=session_key,
+                        pending_permissions=pending_permissions,
+                    )
+                    session_id = None
             if not session_id:
-                resp = await client.post(
-                    f"{OPENCODE_SERVE_URL}/session",
-                    params={"directory": OPENCODE_BRIDGE_DIRECTORY},
-                    timeout=30.0,
+                resp = await BACKEND.create_session(
+                    client, directory=directory or OPENCODE_BRIDGE_DIRECTORY,
                 )
                 if resp.status_code != 200:
                     yield ("status", f"[OpenCode Bridge Error: session HTTP {resp.status_code}]")
@@ -622,35 +1175,27 @@ async def opencode_chat_stream(
                     return
                 if session_map is not None and session_key:
                     session_map[session_key] = session_id
-            payload: dict[str, Any] = {
-                "agent": agent,
-                "system": system_prompt,
-                "parts": [{"type": "text", "text": user_text}],
-            }
-            if model_id:
-                payload["model"] = {
-                    "modelID": model_id,
-                    "providerID": provider_id,
-                    "variant": "default",
-                }
-
-            user_mids: set[str] = set()
-            asst_mid: Optional[str] = None
-            text_lens: dict[str, int] = {}
-            tool_state: dict[str, str] = {}
-            pending_done = False
-            session_busy = True  # assume working until a status event says idle
             # Open the event bus BEFORE sending the message: the bus is
             # fire-and-forget (no replay), so connecting after prompt_async
             # misses the early events (user message, assistant start, first
             # reasoning/tool parts) and the stream would look empty.
             async with client.stream("GET", f"{OPENCODE_SERVE_URL}/event") as ev:
-                async_resp = await client.post(
-                    f"{OPENCODE_SERVE_URL}/session/{session_id}/prompt_async",
-                    json=payload,
-                    timeout=30.0,
-                )
-                if async_resp.status_code != 204:
+                async_resp = None
+                if not skip_prompt:
+                    async_resp = await BACKEND.send_prompt(
+                        client, session_id,
+                        agent=agent, system_prompt=system_prompt,
+                        user_text=user_text, model_id=model_id,
+                        provider_id=provider_id,
+                    )
+                if async_resp is not None and async_resp.status_code != 204:
+                    # Session was created and pinned before this POST — do
+                    # not leak it on a failed prompt.
+                    await _abort_stream_session_best_effort(
+                        client, session_id,
+                        session_map=session_map, session_key=session_key,
+                        pending_permissions=pending_permissions,
+                    )
                     yield ("status", f"[OpenCode Bridge Error: prompt HTTP {async_resp.status_code}]")
                     return
 
@@ -666,6 +1211,13 @@ async def opencode_chat_stream(
                 ev_iter = ev.aiter_lines()
                 started = time.monotonic()
                 bus_last_wedge_check = time.monotonic()
+                # First quiet timeout announces immediately (due from the
+                # start), then every _ANNOUNCE_CHECK_INTERVAL_S.
+                bus_last_announce_check = time.monotonic() - _ANNOUNCE_CHECK_INTERVAL_S
+                # Multi-step turns report idle briefly between steps: the
+                # stream returns only after this quiet window with no new
+                # content (see _IDLE_GRACE_S).
+                idle_grace_started: Optional[float] = None
                 while True:
                     # Bounded total duration: a hung agent tool (e.g. a
                     # package-manager command stuck on a lock) leaves the
@@ -677,16 +1229,11 @@ async def opencode_chat_stream(
                             "opencode bridge timeout after %.0fs — aborting session %s",
                             OPENCODE_SERVE_TIMEOUT, session_id[:16],
                         )
-                        try:
-                            await client.post(
-                                f"{OPENCODE_SERVE_URL}/session/{session_id}/abort",
-                                timeout=10.0,
-                            )
-                        except (httpx.HTTPError, OSError):
-                            pass
-                        if session_map is not None and session_key:
-                            session_map.pop(session_key, None)
-                        pending_permissions.pop(session_id, None)
+                        await _abort_stream_session_best_effort(
+                            client, session_id,
+                            session_map=session_map, session_key=session_key,
+                            pending_permissions=pending_permissions,
+                        )
                         yield ("status", "[OpenCode Bridge Error: timed out waiting for the agent]",)
                         return
                     try:
@@ -717,30 +1264,27 @@ async def opencode_chat_stream(
                         # st == "idle" check below alone never returns and
                         # the bridge burns the full OPENCODE_SERVE_TIMEOUT.
                         # Completion is detectable from the message list: a
-                        # step-finish with no new content across two
-                        # consecutive poll cycles means the agent is done.
-                        finish_quiet_cycles = 0
+                        # step-finish with no new content across the idle
+                        # grace window means the agent is done (multi-step
+                        # turns pause between steps — see _IDLE_GRACE_S).
+                        idle_since: Optional[float] = None
                         while True:
                             if time.monotonic() - started > timeout:
                                 logger.error(
                                     "opencode bridge timeout during polling — aborting session %s",
                                     session_id[:16],
                                 )
-                                try:
-                                    await client.post(
-                                        f"{OPENCODE_SERVE_URL}/session/{session_id}/abort",
-                                        timeout=10.0,
-                                    )
-                                except (httpx.HTTPError, OSError):
-                                    pass
-                                if session_map is not None and session_key:
-                                    session_map.pop(session_key, None)
-                                pending_permissions.pop(session_id, None)
+                                await _abort_stream_session_best_effort(
+                                    client, session_id,
+                                    session_map=session_map, session_key=session_key,
+                                    pending_permissions=pending_permissions,
+                                )
                                 yield ("status", "[OpenCode Bridge Error: timed out waiting for the agent]")
                                 return
                             cycle_content = False
                             async for delta in _poll_session_deltas(
                                 client, session_id, user_mids, text_lens, tool_state,
+                                seen_question_pids,
                             ):
                                 if delta[0] == "question":
                                     yield delta
@@ -751,6 +1295,7 @@ async def opencode_chat_stream(
                                 yield delta
                                 cycle_content = True
                                 last_emit = time.monotonic()
+                                idle_since = None  # the agent is working
                             # A RUNNING tool in the newest assistant
                             # message means the agent is still working — a
                             # freshly started tool produces no content delta
@@ -762,10 +1307,7 @@ async def opencode_chat_stream(
                             if pending_done and not cycle_content:
                                 still_running = False
                                 try:
-                                    msg_resp = await client.get(
-                                        f"{OPENCODE_SERVE_URL}/session/{session_id}/message",
-                                        timeout=10.0,
-                                    )
+                                    msg_resp = await BACKEND.fetch_messages(client, session_id)
                                     if msg_resp.status_code == 200:
                                         msgs = msg_resp.json()
                                         for m in msgs:
@@ -782,17 +1324,28 @@ async def opencode_chat_stream(
                                 except (httpx.HTTPError, OSError, ValueError):
                                     pass
                                 if still_running:
-                                    finish_quiet_cycles = 0
+                                    idle_since = None
                                     # Do not emit "done" — the agent is mid
                                     # tool; keep the stream alive.
                                     cycle_content = True
                             # Multi-step agents pause between steps; a
                             # finished session shows a step-finish then goes
-                            # quiet.  Two consecutive cycles with a step-
-                            # finish and zero new content = done.
-                            if pending_done and not cycle_content:
-                                finish_quiet_cycles += 1
-                                if finish_quiet_cycles >= 2:
+                            # quiet.  UNIFIED idle grace: a finished step OR
+                            # an idle session, with zero new content across
+                            # the grace window = done (the model's inter-step
+                            # generation takes 5-40s on this hardware, and
+                            # the serve can briefly report idle between
+                            # steps).  New content or a busy status resets
+                            # the timer.
+                            try:
+                                st_resp = await BACKEND.fetch_session_status(client)
+                                st = (st_resp.json().get(session_id) or {}).get("type")
+                            except (httpx.HTTPError, ValueError):
+                                st = None
+                            if (pending_done or st == "idle") and not cycle_content:
+                                if idle_since is None:
+                                    idle_since = time.monotonic()
+                                elif time.monotonic() - idle_since > _IDLE_GRACE_S:
                                     # The agent looks done, but it may be
                                     # parked on a permission the bridge
                                     # never answered.  Resolve it BEFORE
@@ -810,29 +1363,20 @@ async def opencode_chat_stream(
                                             return
                                     return
                             else:
-                                finish_quiet_cycles = 0
-                            try:
-                                st_resp = await client.get(
-                                    f"{OPENCODE_SERVE_URL}/session/status", timeout=10.0,
-                                )
-                                st = (st_resp.json().get(session_id) or {}).get("type")
-                            except (httpx.HTTPError, ValueError):
-                                st = None
-                            if st == "idle":
-                                pending_perm = await _detect_pending_permission(client, session_id)
-                                if pending_perm:
-                                    question = await _handle_permission_event(
-                                        client, session_id, pending_perm,
-                                        pending_permissions, autonomous=autonomous,
-                                    )
-                                    if question:
-                                        yield ("question", question)
-                                        return
-                                return
+                                idle_since = None
                             # Real agent work with no new parts (long bash
                             # run, model generation) must not read as a
-                            # dead stream: emit a keepalive after quiet.
-                            if time.monotonic() - last_emit > _EVENT_QUIET_TIMEOUT:
+                            # dead stream: emit a keepalive after quiet —
+                            # UNLESS the idle grace is counting (the agent
+                            # finished; the stream is only waiting out the
+                            # grace — see the bus-path guard).
+                            if (
+                                time.monotonic() - last_emit > _EVENT_QUIET_TIMEOUT
+                                and not (
+                                    (pending_done or st == "idle")
+                                    and not cycle_content
+                                )
+                            ):
                                 yield (
                                     "status",
                                     "⏳ still working… "
@@ -862,28 +1406,40 @@ async def opencode_chat_stream(
                                         return
                                     continue
                                 if await _detect_wedged_tool(client, session_id):
-                                    try:
-                                        await client.post(
-                                            f"{OPENCODE_SERVE_URL}/session/{session_id}/abort",
-                                            timeout=10.0,
-                                        )
-                                    except (httpx.HTTPError, OSError):
-                                        pass
-                                    if session_map is not None and session_key:
-                                        session_map.pop(session_key, None)
-                                    pending_permissions.pop(session_id, None)
-                                    try:
-                                        pid = await asyncio.to_thread(_find_serve_pid, OPENCODE_SERVE_URL.rsplit(":", 1)[-1])
-                                        if pid:
-                                            os.kill(pid, 15)
-                                    except (OSError, ProcessLookupError):
-                                        pass
-                                    yield ("status", "[OpenCode Bridge Error: agent tool runner wedged — session aborted, serve recycled. Please retry.]")
+                                    await _abort_stream_session_best_effort(
+                                        client, session_id,
+                                        session_map=session_map, session_key=session_key,
+                                        pending_permissions=pending_permissions,
+                                    )
+                                    # NOTE: never kill the serve here.  The
+                                    # serve hosts OTHER sessions (concurrent
+                                    # cycles); recycling it for one wedged
+                                    # tool destroys every live session (seen
+                                    # 2026-08-08: a wedged bash in one cycle
+                                    # SIGTERMed the serve mid-other-cycle).
+                                    # The session abort frees the tool runner;
+                                    # the autonomous force-recycle handles
+                                    # serve health at the next long call.
+                                    yield ("status", "[OpenCode Bridge Error: agent tool runner wedged — session aborted. Please retry.]")
                                     return
                             await asyncio.sleep(1.0)
                     except asyncio.TimeoutError:
                         if pending_done and not session_busy:
-                            return
+                            # A finished step + idle session looks done —
+                            # but multi-step turns (work-continuity) pause
+                            # between steps while the model generates the
+                            # next action, and the serve can briefly report
+                            # idle between assistant messages.  Return only
+                            # after the idle grace with NO new content;
+                            # the catch-up poll below delivers the next
+                            # step's parts and resets the grace when the
+                            # agent continues.
+                            if idle_grace_started is None:
+                                idle_grace_started = time.monotonic()
+                            elif time.monotonic() - idle_grace_started > _IDLE_GRACE_S:
+                                return
+                        else:
+                            idle_grace_started = None
                         # A parked WRITE tool never emits permission.updated
                         # (opencode 1.18.15 write/edit tools omit the SSE
                         # event; only bash emits it), so the event-bus path
@@ -904,27 +1460,58 @@ async def opencode_chat_stream(
                                     return
                                 continue
                             if await _detect_wedged_tool(client, session_id):
-                                try:
-                                    await client.post(
-                                        f"{OPENCODE_SERVE_URL}/session/{session_id}/abort",
-                                        timeout=10.0,
-                                    )
-                                except (httpx.HTTPError, OSError):
-                                    pass
-                                if session_map is not None and session_key:
-                                    session_map.pop(session_key, None)
-                                pending_permissions.pop(session_id, None)
-                                try:
-                                    pid = await asyncio.to_thread(_find_serve_pid, OPENCODE_SERVE_URL.rsplit(":", 1)[-1])
-                                    if pid:
-                                        os.kill(pid, 15)
-                                except (OSError, ProcessLookupError):
-                                    pass
-                                yield ("status", "[OpenCode Bridge Error: agent tool runner wedged — session aborted, serve recycled. Please retry.]")
+                                await _abort_stream_session_best_effort(
+                                    client, session_id,
+                                    session_map=session_map, session_key=session_key,
+                                    pending_permissions=pending_permissions,
+                                )
+                                # NOTE: never kill the serve here — see the
+                                # polling-wedge path above (2026-08-08: the
+                                # serve hosts concurrent sessions; killing it
+                                # destroys them all).
+                                yield ("status", "[OpenCode Bridge Error: agent tool runner wedged — session aborted. Please retry.]")
                                 return
+                        # Command-level visibility even when the SSE bus
+                        # drops running-state updates: announce the
+                        # currently running tool from the message list, on
+                        # its own faster cadence (the 10s wedge timer would
+                        # miss tools that finish within a cycle).
+                        if time.monotonic() - bus_last_announce_check >= _ANNOUNCE_CHECK_INTERVAL_S:
+                            bus_last_announce_check = time.monotonic()
+                            announce = await _current_running_tool(
+                                client, session_id, tool_state, announced_tool_pids,
+                            )
+                            if announce:
+                                yield ("status", announce)
+                        # Catch-up poll: the serve's SSE drops events
+                        # (upstream #35066 — text and tool deltas vanish
+                        # while the bus stays open), so the user missed the
+                        # agent's narration until the next poll/continue.
+                        # The message list holds the parts; poll on quiet
+                        # timeouts (deduped by part id/length) and deliver
+                        # them live.  New content also keeps the stream
+                        # open while the agent keeps working.
+                        async for delta in _poll_session_deltas(
+                            client, session_id, user_mids, text_lens, tool_state,
+                            seen_question_pids,
+                        ):
+                            if delta[0] == "question":
+                                yield delta
+                                return
+                            if delta[0] == "_step_finish":
+                                pending_done = True
+                                continue
+                            yield delta
+                            idle_grace_started = None  # the agent is working
                         # Keep the client connection alive during long tool
-                        # phases (and show the agent is still working).
-                        yield ("status", "⏳ still working…")
+                        # phases (and show the agent is still working).  The
+                        # idle-grace tail is NOT work — the agent finished
+                        # and the stream is waiting out the 45s grace — so
+                        # stop the "still working" keepalives there (the
+                        # frontend's 90s stall-killer is longer than the
+                        # grace).
+                        if not (pending_done and not session_busy):
+                            yield ("status", "⏳ still working…")
                         continue
                     if not line.startswith("data: "):
                         continue
@@ -977,6 +1564,13 @@ async def opencode_chat_stream(
                         elif role == "assistant" and asst_mid is None:
                             asst_mid = mid
                             if info.get("error"):
+                                # The agent errored out — clean up the
+                                # session instead of leaking it.
+                                await _abort_stream_session_best_effort(
+                                    client, session_id,
+                                    session_map=session_map, session_key=session_key,
+                                    pending_permissions=pending_permissions,
+                                )
                                 yield ("status", f"[OpenCode Bridge Error: {info['error']}]")
                                 return
                     elif etype == "message.part.updated":
@@ -988,6 +1582,7 @@ async def opencode_chat_stream(
                             continue
                         async for delta in _yield_part_deltas(
                             part, text_lens, tool_state, session_id, client,
+                            seen_question_pids,
                         ):
                             if delta[0] == "_step_finish":
                                 pending_done = True
@@ -997,7 +1592,120 @@ async def opencode_chat_stream(
                             else:
                                 yield delta
         except (httpx.HTTPError, OSError, ValueError) as exc:
+            if session_id:
+                # A transient mid-stream failure must not strand the agent
+                # (possibly still running) with the pin pointing at it.
+                await _abort_stream_session_best_effort(
+                    client, session_id,
+                    session_map=session_map, session_key=session_key,
+                    pending_permissions=pending_permissions,
+                )
             yield ("status", f"[OpenCode Bridge Network Error: {str(exc)}]")
+
+
+async def _find_pending_question(
+    client: httpx.AsyncClient,
+    session_id: str,
+) -> tuple[Optional[str], int]:
+    """Look up a pending question request owned by ``session_id``.
+
+    The agent's question tool parks the session's current step until the
+    user answers (POST /question/<id>/reply).  The serve keeps pending
+    question requests in memory and lists them at GET /question; the
+    entry carries the request id needed for the reply.  Never raises;
+    returns (request_id, question_count) or (None, 0).
+    """
+    try:
+        resp = await BACKEND.fetch_questions(client)
+        if resp.status_code != 200:
+            return None, 0
+        for entry in resp.json():
+            if entry.get("sessionID") == session_id:
+                qs = entry.get("questions") or []
+                return str(entry.get("id") or ""), len(qs)
+    except (httpx.HTTPError, OSError, ValueError):
+        pass
+    return None, 0
+
+
+async def _post_question_answer(
+    client: httpx.AsyncClient,
+    session_id: str,
+    question_id: str,
+    answer: str,
+    question_count: int,
+) -> bool:
+    """POST the user's answer to the serve's question reply endpoint.
+
+    The question tool completes with the answer and the agent continues
+    with it in context.  Returns True when the serve accepted the reply.
+    Never raises — the backend logs and returns False on transport errors
+    (see ``OpenCodeBackend.reply_question``).
+    """
+    return await BACKEND.reply_question(
+        client, session_id, question_id, answer, question_count,
+    )
+
+
+
+
+async def opencode_chat_stream_resilient(
+    user_text: str,
+    **kwargs: Any,
+) -> AsyncIterator[tuple[str, str]]:
+    """``opencode_chat_stream`` with one automatic retry on a fresh serve.
+
+    The headless serve's tool runner fails at a high rate (upstream defect
+    family anomalyco/opencode #35066: glob/grep/read error or wedge, and a
+    tool error can kill the session processing silently).  When the first
+    attempt ends in a bridge failure WITHOUT delivering any assistant text
+    or question, the serve is recycled (fresh runner) and the FULL task is
+    retried once — the same bounded-retry pattern the SDD cycle driver
+    uses.  A stream that delivered text or ended in a question is never
+    retried (the agent produced output or is waiting for the user); a
+    failed attempt that already delivered text surfaces its error as-is so
+    the partial result is never duplicated.  Autonomous mode (SDD cycle)
+    is never auto-retried: the cycle driver owns its recovery.  Never
+    raises; yields (kind, text) tuples exactly like the underlying stream.
+    """
+    if kwargs.get("autonomous"):
+        async for kind, payload in opencode_chat_stream(user_text, **kwargs):
+            yield kind, payload
+        return
+
+    attempt1: list[tuple[str, str]] = []
+    failed: Optional[str] = None
+    delivered = False  # any text or question surfaced to the caller
+    async for kind, payload in opencode_chat_stream(user_text, **kwargs):
+        if kind in ("text", "question"):
+            delivered = True
+            for k, p in attempt1:
+                yield k, p
+            attempt1.clear()
+            yield kind, payload
+            if kind == "question":
+                return  # agent is waiting on the user — never retry
+            continue
+        if isinstance(payload, str) and payload.startswith("[OpenCode Bridge"):
+            failed = payload
+        attempt1.append((kind, payload))
+    if failed and not delivered:
+        # The first attempt died before producing any output: recycle the
+        # serve (its tool runner is suspect) and retry the full task once.
+        logger.warning(
+            "opencode bridge attempt failed (%s) — retrying once on a fresh serve",
+            failed[:80],
+        )
+        yield (
+            "status",
+            "[OpenCode Bridge: attempt failed — retrying once on a fresh serve…]\n",
+        )
+        await _force_recycle_serve("plain bridge auto-retry")
+        async for kind, payload in opencode_chat_stream(user_text, **kwargs):
+            yield kind, payload
+        return
+    for k, p in attempt1:
+        yield k, p
 
 
 # ---------------------------------------------------------------------------
@@ -1009,6 +1717,11 @@ async def opencode_escalation(stage: int, prompt: str) -> str:
 
     Directs the user prompt to the opencode gentle-orchestrator agent
     OpenRouter.  ``stage`` is informational (passed through to logging).
+
+    Conservative by design: this headless worker path runs with
+    ``autonomous=False`` — READ permissions are auto-allowed, WRITE/git
+    asks abort the session with a clear error (no user is present to
+    relay a question, and unprompted grants are never issued).
     """
     logger.info("OpenCode escalation (stage=%d): %r", stage, prompt[:200])
     return await opencode_chat(prompt, agent=OPENCODE_AGENT)
@@ -1021,6 +1734,7 @@ async def _yield_part_deltas(
     tool_state: dict[str, str],
     session_id: str,
     client: httpx.AsyncClient,
+    seen_question_pids: Optional[set[str]] = None,
 ) -> AsyncIterator[tuple[str, str]]:
     """Yield stream deltas for one opencode part (shared by the event bus
     and the polling fallback).
@@ -1057,6 +1771,12 @@ async def _yield_part_deltas(
     if ptype == "tool":
         name = str(part.get("tool") or "")
         if name == "question":
+            # Seeded history — suppress the stale question BEFORE the
+            # fetch-retry loop: the part existed before this request, so
+            # re-yielding it would stop the stream with the user's old
+            # question instead of streaming the new turn.
+            if seen_question_pids and pid in seen_question_pids:
+                return
             # The agent is asking the user.  The event part often omits the
             # input; fetch the persisted part to read state.input.questions[].
             # A single question OR a MULTI-GROUP preflight (SDD Session
@@ -1099,10 +1819,7 @@ async def _yield_part_deltas(
                         # Preferred: the part's own message (carries input).
                         mid = part.get("messageID") or ""
                         if mid:
-                            msg_resp = await client.get(
-                                f"{OPENCODE_SERVE_URL}/session/{session_id}/message/{mid}",
-                                timeout=10.0,
-                            )
+                            msg_resp = await BACKEND.fetch_message(client, session_id, mid)
                             if msg_resp.status_code == 200:
                                 fetched = True
                                 for p2 in (msg_resp.json().get("parts") or []):
@@ -1132,10 +1849,7 @@ async def _yield_part_deltas(
                         # question part by its persisted id (it carries the
                         # complete multi-group input there).
                         try:
-                            msg_resp = await client.get(
-                                f"{OPENCODE_SERVE_URL}/session/{session_id}/message",
-                                timeout=10.0,
-                            )
+                            msg_resp = await BACKEND.fetch_messages(client, session_id)
                             if msg_resp.status_code == 200:
                                 fetched = True
                                 for m in msg_resp.json():
@@ -1204,7 +1918,18 @@ async def _yield_part_deltas(
                 if cmd:
                     yield ("status", f"🔧 {name}: {cmd[:120]}\n")
                 else:
-                    yield ("status", f"🔧 {name}…\n")
+                    # Non-bash tools (glob/grep/read) carry no command:
+                    # show the pattern/path so the user still sees what
+                    # the tool is doing.
+                    pattern = str(inp.get("pattern") or "") if isinstance(inp, dict) else ""
+                    if pattern:
+                        yield ("status", f"🔧 {name}: {pattern[:80]}\n")
+                    else:
+                        path = str(inp.get("filePath") or "") if isinstance(inp, dict) else ""
+                        if path:
+                            yield ("status", f"🔧 {name}: {path[:100]}\n")
+                        else:
+                            yield ("status", f"🔧 {name}…\n")
             elif state == "completed":
                 yield ("status", f"✅ {name} done\n")
             elif state == "error":
@@ -1212,18 +1937,71 @@ async def _yield_part_deltas(
         return
 
 
-async def _detect_wedged_tool(client: httpx.AsyncClient, session_id: str) -> bool:
-    """Detect a tool part stuck in "running" with no output.
+async def _current_running_tool(
+    client: httpx.AsyncClient,
+    session_id: str,
+    tool_state: dict[str, str],
+    announced: set[str],
+) -> Optional[str]:
+    """Best-effort status for the NEWEST running tool part not yet
+    announced, read from the persisted message list.
 
-    The serve's tool runner can mark a tool part as started (status
-    "running") but never actually execute it, leaving the session busy
-    forever.  A running tool part with no output whose start is older than
-    ``_TOOL_WEDGE_AFTER_S`` is wedged, not working.  Never raises.
+    The serve's SSE bus drops tool running-state updates (upstream defect
+    family anomalyco/opencode #35066 — completions arrive, 'running'
+    events often do not), so the event-bus path never emits the 🔧 command
+    status for a long-running tool and the user sees only keepalives.
+    Polling the message list is immune to the drops.  Parts already
+    processed by the delta path (``tool_state``) are skipped — they were
+    announced on their own state transition.  Never raises; returns None
+    when nothing new is running.
     """
     try:
-        resp = await client.get(
-            f"{OPENCODE_SERVE_URL}/session/{session_id}/message", timeout=10.0,
-        )
+        resp = await BACKEND.fetch_messages(client, session_id)
+        if resp.status_code != 200:
+            return None
+        for m in reversed(resp.json()):
+            if (m.get("info") or {}).get("role") != "assistant":
+                continue
+            for p in reversed(m.get("parts") or []):
+                if p.get("type") != "tool" or p.get("tool") == "question":
+                    continue
+                pid = str(p.get("id") or "")
+                st = p.get("state") or {}
+                if st.get("status") != "running":
+                    continue
+                if pid in tool_state or pid in announced:
+                    return None
+                announced.add(pid)
+                # Also record the state in tool_state so the delta path
+                # (a later-arriving SSE running event) skips the same part
+                # instead of announcing it a second time.
+                tool_state[pid] = "running"
+                inp = st.get("input") if isinstance(st, dict) else None
+                cmd = str((inp or {}).get("command") or "") if isinstance(inp, dict) else ""
+                if cmd:
+                    return f"🔧 {p.get('tool')}: {cmd[:120]}\n"
+                pattern = str((inp or {}).get("pattern") or "") if isinstance(inp, dict) else ""
+                if pattern:
+                    return f"🔧 {p.get('tool')}: {pattern[:80]}\n"
+                path = str((inp or {}).get("filePath") or "") if isinstance(inp, dict) else ""
+                if path:
+                    return f"🔧 {p.get('tool')}: {path[:100]}\n"
+                return f"🔧 {p.get('tool')}…\n"
+    except (httpx.HTTPError, OSError, ValueError):
+        return None
+    return None
+
+
+async def _child_wedged(client: httpx.AsyncClient, child_id: str) -> bool:
+    """True when the child session's own tool runner is wedged: a
+    running tool part (not ``question``) with no output, started past
+    the tool-wedge threshold.  The serve's runner degrades
+    progressively (bash/glob/read all strand), so a wedged child never
+    finishes and the parent's delivery is stuck with it.  Failure reads
+    False (no extra early abort).  Never raises.
+    """
+    try:
+        resp = await BACKEND.fetch_messages(client, child_id)
         if resp.status_code != 200:
             return False
         now_ms = int(time.time() * 1000)
@@ -1237,8 +2015,106 @@ async def _detect_wedged_tool(client: httpx.AsyncClient, session_id: str) -> boo
                 start = (st.get("time") or {}).get("start")
                 if start is None:
                     continue
-                elapsed_s = (now_ms - int(start)) / 1000
                 if now_ms - int(start) > _TOOL_WEDGE_AFTER_S * 1000:
+                    return True
+    except (httpx.HTTPError, OSError, ValueError):
+        return False
+    return False
+
+
+async def _session_live(client: httpx.AsyncClient, session_id: str) -> bool:
+    """True when the session appears in the serve's live status map
+    (the map holds the active sessions; a finished session drops out).
+    Failure to fetch reads True — the stall-abort never fires on a
+    transport error.  Never raises.
+    """
+    try:
+        resp = await BACKEND.fetch_session_status(client)
+        if resp.status_code != 200:
+            return True
+        st_map = resp.json()
+        if not isinstance(st_map, dict):
+            return True
+        return session_id in st_map
+    except (httpx.HTTPError, OSError, ValueError):
+        return True
+
+
+async def _detect_wedged_tool(client: httpx.AsyncClient, session_id: str) -> bool:
+    """Detect a tool part stuck in "running" with no output.
+
+    The serve's tool runner can mark a tool part as started (status
+    "running") but never actually execute it, leaving the session busy
+    forever.  A running tool part with no output whose start is older than
+    ``_TOOL_WEDGE_AFTER_S`` is wedged, not working.  Never raises.
+
+    STALE-PART GUARD (2026-08-08): tool parts started BEFORE the current
+    serve process are debris from a dead serve (the serve dies silently
+    under load; the session storage survives and the pinned session is
+    resumed on a fresh serve).  Aborting the session for stale debris
+    kills a healthy resumed cycle, so parts older than the serve's start
+    are ignored.
+    """
+    try:
+        serve_start_ms = await asyncio.to_thread(_serve_start_epoch_ms)
+        resp = await BACKEND.fetch_messages(client, session_id)
+        if resp.status_code != 200:
+            return False
+        now_ms = int(time.time() * 1000)
+        for m in resp.json():
+            for p in m.get("parts") or []:
+                if p.get("type") != "tool" or p.get("tool") == "question":
+                    continue
+                st = p.get("state") or {}
+                if st.get("status") != "running" or st.get("output"):
+                    continue
+                start = (st.get("time") or {}).get("start")
+                if start is None:
+                    continue
+                start_ms = int(start)
+                if serve_start_ms is not None and start_ms < serve_start_ms:
+                    # Stale part from a previous serve — not a live wedge.
+                    continue
+                elapsed_s = (now_ms - start_ms) / 1000
+                threshold_s = (
+                    _TASK_WEDGE_AFTER_S if p.get("tool") == "task"
+                    else _TOOL_WEDGE_AFTER_S
+                )
+                # STALL-AWARE ABORT (2026-08-11): the sub-agent's
+                # completion never propagates to the parent's task part
+                # (upstream #11865/#23296; the serve's tool runner also
+                # wedges on glob calls, stranding the child).  A task
+                # part old enough whose child has dropped out of the
+                # live status map means the work finished but the
+                # delivery is stuck: fire early so the orchestrator's
+                # artifact-check-first proceeds WITHOUT redoing the
+                # phase.
+                if p.get("tool") == "task" and start_ms < now_ms - _TASK_STALL_AFTER_S * 1000:
+                    child_id = (p.get("state") or {}).get(
+                        "metadata", {},
+                    ).get("sessionId")
+                    if child_id and (
+                        not await _session_live(client, child_id)
+                        or await _child_wedged(client, child_id)
+                    ):
+                        logger.warning(
+                            "stalled task delivery: child %s not live or "
+                            "wedged while task part runs %.0fs — session %s",
+                            str(child_id)[:16], elapsed_s,
+                            str(session_id)[:16],
+                        )
+                        return True
+                if now_ms - start_ms > threshold_s * 1000:
+                    # REPLAY CARVE-OUT (2026-08-10): a fallback-model
+                    # replay can legitimately run 5-20 min with the task
+                    # part silent (the replayed turn streams no output
+                    # until it lands).  Do not wedge while the fallback
+                    # log shows a replay in flight; fails closed to the
+                    # pre-carve-out behavior when the log is unreadable.
+                    if p.get("tool") == "task" and await asyncio.to_thread(
+                        _replay_in_flight_for_any_session,
+                    ):
+                        continue
                     logger.warning(
                         "wedged tool part %r running without output for %.0fs — session %s",
                         p.get("tool"), elapsed_s, str(session_id)[:16],
@@ -1249,20 +2125,158 @@ async def _detect_wedged_tool(client: httpx.AsyncClient, session_id: str) -> boo
     return False
 
 
+def _serve_start_epoch_ms() -> Optional[int]:
+    """Epoch-ms when the current serve process started (from /proc), or
+    None when it cannot be determined (no stale guard)."""
+    try:
+        pid = _find_serve_pid(OPENCODE_SERVE_URL.rsplit(":", 1)[-1])
+        if not pid:
+            return None
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+            parts = fh.read().split()
+        start_ticks = int(parts[21])
+        with open("/proc/uptime", encoding="utf-8") as fh:
+            uptime_s = float(fh.read().split()[0])
+        start_s = time.time() - uptime_s + start_ticks / os.sysconf("SC_CLK_TCK")
+        return int(start_s * 1000)
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+async def _session_busy_on_current_serve(
+    client: httpx.AsyncClient, session_id: str, serve_start_ms: int,
+) -> bool:
+    """True when the session has a tool part that is RUNNING on the current
+    serve (started after the serve process).  Such sessions are quiet-but-
+    working (e.g. a cycle's main session during a sub-agent phase) and must
+    not be swept as zombies.  Never raises.
+    """
+    try:
+        resp = await BACKEND.fetch_messages(client, session_id)
+        if resp.status_code != 200:
+            return False
+        for m in resp.json():
+            for p in m.get("parts") or []:
+                if p.get("type") != "tool" or p.get("tool") == "question":
+                    continue
+                st = p.get("state") or {}
+                if st.get("status") != "running" or st.get("output"):
+                    continue
+                start = (st.get("time") or {}).get("start")
+                if start is not None and int(start) >= serve_start_ms:
+                    return True
+    except (httpx.HTTPError, OSError, ValueError):
+        pass
+    return False
+
+
+async def _session_over_context_cap(
+    client: httpx.AsyncClient, session_id: str,
+) -> bool:
+    """Rough token estimate of a session's accumulated context.
+
+    Text/reasoning parts only, ~4 chars per token.  The agent inside the
+    session cannot reset its own context (no tools), so the bridge resets
+    it: a pinned session whose estimate exceeds the cap is dropped on the
+    next resume and a fresh session starts.  Never raises; any fetch
+    failure keeps the pin (False).
+    """
+    try:
+        resp = await BACKEND.fetch_messages(client, session_id)
+        if resp.status_code != 200:
+            return False
+        body = resp.json()
+        if not isinstance(body, list):
+            return False
+        total = 0
+        for m in body:
+            for p in m.get("parts") or []:
+                if p.get("type") in ("text", "reasoning"):
+                    total += len(str(p.get("text") or "")) // 4
+        return total > _SESSION_CONTEXT_CAP_TOKENS
+    except (httpx.HTTPError, OSError, ValueError):
+        return False
+
+
+async def _seed_resumed_session_state(
+    client: httpx.AsyncClient,
+    session_id: str,
+    user_mids: set[str],
+    text_lens: dict[str, int],
+    tool_state: dict[str, str],
+    seen_question_pids: set[str],
+    running_question_times: Optional[list[float]] = None,
+) -> None:
+    """Best-effort seed of per-call part state for a RESUMED pinned session.
+
+    The per-call text_lens/tool_state/user_mids are normally fed only by
+    live events; when the /event bus closes, the polling fallback re-scans
+    the FULL message list and re-yields history (old text, thinking, tool
+    chunks, and a stale question that stops the stream).  Seeding the
+    existing part state (text lengths, tool states, assistant message ids,
+    question part ids) once before the prompt lets the polling deltas
+    suppress everything that existed BEFORE this request.  Never raises:
+    a failed seed degrades to the current replay behavior.
+
+    ``running_question_times`` (optional list) collects the start times of
+    any question tool parts still parked in "running" — the orphaned-
+    question check uses them without a second message-list GET.
+
+    Returns the estimated context size in tokens (text/reasoning chars /
+    4, 0 when the fetch failed) — the bridge-level context cap check.
+    """
+    total_chars = 0
+    try:
+        resp = await BACKEND.fetch_messages(client, session_id)
+        if resp.status_code != 200:
+            return 0
+        body = resp.json()
+        if not isinstance(body, list):
+            # Malformed/dict bodies (e.g. an error object) must not raise.
+            return 0
+        for m in body:
+            role = (m.get("info") or {}).get("role")
+            if role == "assistant":
+                mid = m.get("id")
+                if mid:
+                    user_mids.add(mid)
+                for p in m.get("parts") or []:
+                    pid = str(p.get("id") or "")
+                    ptype = p.get("type")
+                    if ptype in ("text", "reasoning"):
+                        text = str(p.get("text") or "")
+                        total_chars += len(text)
+                        if text:
+                            text_lens[pid] = len(text)
+                    elif ptype == "tool":
+                        status = str((p.get("state") or {}).get("status") or "")
+                        if status:
+                            tool_state[pid] = status
+                        if p.get("tool") == "question" and pid:
+                            seen_question_pids.add(pid)
+                            if running_question_times is not None and status == "running":
+                                start = (p.get("state") or {}).get("time") or {}
+                                s = start.get("start")
+                                if s is not None:
+                                    running_question_times.append(float(s))
+    except (httpx.HTTPError, OSError, ValueError):
+        return 0
+    return total_chars // 4
+
+
 async def _poll_session_deltas(
     client: httpx.AsyncClient,
     session_id: str,
     user_mids: set[str],
     text_lens: dict[str, int],
     tool_state: dict[str, str],
+    seen_question_pids: Optional[set[str]] = None,
 ) -> AsyncIterator[tuple[str, str]]:
     """Poll a session's message list for new parts (used when the /event SSE
     bus closes but the session is still busy).  Yields deltas; the CALLER
     checks the session status and decides when to stop polling."""
     try:
-        resp = await client.get(
-            f"{OPENCODE_SERVE_URL}/session/{session_id}/message", timeout=10.0,
-        )
+        resp = await BACKEND.fetch_messages(client, session_id)
         if resp.status_code != 200:
             return
         for m in resp.json():
@@ -1273,6 +2287,7 @@ async def _poll_session_deltas(
                     continue
                 async for delta in _yield_part_deltas(
                     p, text_lens, tool_state, session_id, client,
+                    seen_question_pids,
                 ):
                     if delta[0] == "question":
                         yield delta
@@ -1283,6 +2298,24 @@ async def _poll_session_deltas(
 
 
 
+
+
+_DRAIN_PROBES = 4
+_DRAIN_PROBE_S = 0.25
+
+
+async def _drain_serve_shutdown() -> None:
+    """Boundedly wait for the killed serve listener to stop.
+
+    is_opencode_serve_running() answers True mid-SIGTERM, so
+    ensure_opencode_serve would otherwise skip the respawn and the stream
+    POSTs into a dying listener.  Poll a few times and return — never
+    raises, never exceeds the budget.
+    """
+    for _ in range(_DRAIN_PROBES):
+        if not await is_opencode_serve_running():
+            return
+        await asyncio.sleep(_DRAIN_PROBE_S)
 
 
 async def _recycle_serve_if_low_memory() -> None:
@@ -1308,33 +2341,117 @@ async def _recycle_serve_if_low_memory() -> None:
         logger.warning("Recycling opencode serve: %s", reason)
         pid = await asyncio.to_thread(_find_serve_pid, port)
         if pid:
+            if not await asyncio.to_thread(_pid_is_serve, pid, port):
+                # Pid-reuse race guard: this pid no longer belongs to the
+                # serve (it died and the OS recycled the pid between the
+                # scan and the kill).  Skip the kill; the serve stays
+                # absent and the next ensure respawns a fresh one.
+                logger.warning(
+                    "skipping recycle: pid %s no longer matches the serve", pid,
+                )
+                return
             try:
                 os.kill(pid, 15)
             except (OSError, ProcessLookupError):
                 pass
+            await _drain_serve_shutdown()
     except (OSError, ValueError):
         return
 
 
-async def _force_recycle_serve() -> None:
+async def _force_recycle_serve(reason: str = "long-lived call") -> None:
     """Kill the opencode serve unconditionally so the next
     ``ensure_opencode_serve`` respawns a fresh one.
 
-    Used by long-lived calls (SDD-autonomous mode): the serve's tool runner
-    progressively wedges (bash hangs on trivial commands), and an SDD cycle
-    can burn a full hour on a wedged runner.  A fresh serve at cycle start
-    removes that risk.  Never raises.
+    Used by long-lived calls (SDD-autonomous mode) and the config-drift
+    gate (REQ-5): the serve's tool runner progressively wedges (bash hangs
+    on trivial commands), and an SDD cycle can burn a full hour on a
+    wedged runner.  A fresh serve at cycle start removes that risk.  The
+    drift gate recycles when the serve template changes under a running
+    serve.  Never raises.
     """
     try:
         port = OPENCODE_SERVE_URL.rsplit(":", 1)[-1]
         pid = await asyncio.to_thread(_find_serve_pid, port)
         if pid:
-            logger.warning("Forcing opencode serve recycle (long-lived call)")
+            if not await asyncio.to_thread(_pid_is_serve, pid, port):
+                # Pid-reuse race guard: the found pid no longer belongs to
+                # the serve — never signal a reused pid.  The serve stays
+                # absent and the next ensure respawns a fresh one.
+                logger.warning(
+                    "skipping force-recycle: pid %s no longer matches the serve", pid,
+                )
+                return
+            logger.warning("Forcing opencode serve recycle (%s)", reason)
             os.kill(pid, 15)
+            await _drain_serve_shutdown()
     except (OSError, ProcessLookupError):
         pass
     except (OSError, ValueError):
         return
+
+
+# F5 (tasks 4.4): the config-mtime cache lives module-level, NOT on
+# proxy.app.state — the spawn gate (ensure_opencode_serve) is a
+# bridge-internal function with no request/app handle (pending_permissions
+# is threaded IN from routes as a plain dict; this cache is owned by the
+# spawn gate itself, so there is no clean app.state channel).  Design.md
+# chose module-level; review-accepted via F5.  Set after every successful
+# spawn; drives the REQ-5 drift recycle.
+_serve_config_mtime: Optional[float] = None
+
+
+def _config_mtime() -> Optional[float]:
+    """mtime of OPCODE_CONFIG_PATH, or None when unreadable (no drift)."""
+    try:
+        return os.path.getmtime(OPCODE_CONFIG_PATH)
+    except OSError:
+        return None
+
+
+def _sync_serve_config() -> None:
+    """Idempotently copy the serve template + fallback-plugin config into the
+    serve-config dir.
+
+    opencode is an XDG app: with XDG_CONFIG_HOME=OPENCODE_SERVE_CONFIG_DIR it
+    reads <dir>/opencode/opencode.jsonc — so the template lands in the
+    ``opencode/`` subdir (empirically verified 2026-08-08: the file at the
+    XDG base root is NOT read).  The reduced file there (file:// plugin ref
+    for the fallback plugin ONLY, no .ts plugin files) is the serve's whole
+    config.  The fallback plugin resolves its OWN config
+    (rate-limit-fallback.json) via $XDG_CONFIG_HOME/opencode/ too — without
+    a copy there it initializes with its defaults (logging OFF, which
+    would blind the REQ-4 fallback-log evidence), so the proxy syncs the
+    user's plugin config alongside the template.  Copies are skipped when
+    the destination already matches, so repeated spawns do not churn the
+    dir."""
+    dst_dir = os.path.join(OPENCODE_SERVE_CONFIG_DIR, "opencode")
+    os.makedirs(dst_dir, exist_ok=True)
+    _copy_if_changed(
+        OPCODE_CONFIG_PATH, os.path.join(dst_dir, "opencode.jsonc"),
+    )
+    plugin_cfg = os.path.expanduser(
+        "~/.config/opencode/rate-limit-fallback.json"
+    )
+    if os.path.exists(plugin_cfg):
+        _copy_if_changed(
+            plugin_cfg, os.path.join(dst_dir, "rate-limit-fallback.json"),
+        )
+
+
+def _copy_if_changed(src: str, dst: str) -> None:
+    """Copy ``src`` to ``dst`` when the contents differ (idempotent)."""
+    with open(src, encoding="utf-8") as fh:
+        data = fh.read()
+    try:
+        with open(dst, encoding="utf-8") as fh:
+            if fh.read() == data:
+                return
+    except OSError:
+        pass
+    with open(dst, "w", encoding="utf-8") as fh:
+        fh.write(data)
+    logger.info("Synced opencode serve config template -> %s", dst)
 
 
 def _serve_health(port: str) -> tuple[bool, Optional[float]]:
@@ -1390,6 +2507,45 @@ def _memory_pressure() -> bool:
     return False
 
 
+def _cmdline_matches_serve(cmd: str, port: str) -> bool:
+    """True when a normalized /proc cmdline belongs to the opencode serve
+    bound to ``port``.
+
+    /proc/<pid>/cmdline separates argv with NUL bytes, not spaces — the old
+    space-form match NEVER matched any process, so serve recycling (age,
+    low-memory, wedge recovery) silently did nothing and a wedged tool
+    runner lived forever.  NULs are normalized to spaces and the argv is
+    tokenized before matching.  PORT MATCHING IS EXACT ONLY: neither a
+    longer advertised value (--port 189990 vs search "18999") nor a shorter
+    search (--port 18999 vs search "1899") may match (prefix-false-positive
+    bug, cycle 9).
+    """
+    tokens = cmd.replace("\x00", " ").split()
+    if not any("opencode" in tok for tok in tokens) or "serve" not in tokens:
+        return False
+    if f"--port={port}" in tokens:
+        return True
+    for i, tok in enumerate(tokens):
+        if tok == "--port" and i + 1 < len(tokens) and tokens[i + 1] == port:
+            return True
+    return False
+
+
+def _pid_is_serve(pid: int, port: str) -> bool:
+    """Re-verify ``pid`` still belongs to the opencode serve before a kill.
+
+    Guards the pid-reuse TOCTOU race: the pid found by ``_find_serve_pid``
+    may have died and been recycled by the OS between the scan and the
+    kill.  Unreadable/missing cmdline counts as mismatch (never raises).
+    """
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            cmd = fh.read().decode("utf-8", "ignore")
+        return _cmdline_matches_serve(cmd, port)
+    except OSError:
+        return False
+
+
 def _find_serve_pid(port: str) -> Optional[int]:
     """Locate the opencode serve process pid by scanning /proc cmdlines."""
     try:
@@ -1399,13 +2555,7 @@ def _find_serve_pid(port: str) -> Optional[int]:
             try:
                 with open(f"/proc/{entry}/cmdline", "rb") as fh:
                     cmd = fh.read().decode("utf-8", "ignore")
-                # /proc/<pid>/cmdline separates argv with NUL bytes, not
-                # spaces — the old space-form match NEVER matched any
-                # process, so serve recycling (age, low-memory, wedge
-                # recovery) silently did nothing and a wedged tool runner
-                # lived forever.  Normalize NULs to spaces before matching.
-                cmd = cmd.replace("\x00", " ")
-                if "opencode" in cmd and "serve" in cmd and f"--port {port}" in cmd:
+                if _cmdline_matches_serve(cmd, port):
                     return int(entry)
             except (OSError, ValueError):
                 continue
@@ -1435,11 +2585,12 @@ async def _abort_zombie_sessions(
     handles the genuinely stuck pinned session instead.
     """
     try:
-        resp = await client.get(f"{OPENCODE_SERVE_URL}/session", timeout=10.0)
+        resp = await BACKEND.list_sessions(client)
         if resp.status_code != 200:
             return
         now_ms = int(time.time() * 1000)
         threshold_ms = 240_000
+        serve_start_ms = await asyncio.to_thread(_serve_start_epoch_ms)
         for s in resp.json():
             sid = s.get("id")
             if not sid:
@@ -1449,15 +2600,23 @@ async def _abort_zombie_sessions(
                 continue
             updated = ((s.get("time") or {}).get("updated") or 0)
             if updated and now_ms - updated > threshold_ms:
+                if (
+                    serve_start_ms is not None
+                    and updated >= serve_start_ms
+                    and await _session_busy_on_current_serve(
+                        client, sid, serve_start_ms,
+                    )
+                ):
+                    # Quiet but working (sub-agent phase) — not a zombie.
+                    logger.debug(
+                        "opencode session %s quiet but busy — skipped by sweep",
+                        str(sid)[:16],
+                    )
+                    continue
                 logger.warning(
                     "opencode zombie session %s idle for %.0fs — aborting",
                     str(sid)[:16], (now_ms - updated) / 1000,
                 )
-                try:
-                    await client.post(
-                        f"{OPENCODE_SERVE_URL}/session/{sid}/abort", timeout=10.0,
-                    )
-                except (httpx.HTTPError, OSError):
-                    pass
+                await BACKEND.abort_session(client, sid)
     except (httpx.HTTPError, OSError, ValueError):
         return

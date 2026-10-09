@@ -399,7 +399,9 @@ class SystemdController:
             # of non-restart).  Probe the recorded model's port: a live port
             # means a heavy model genuinely owns the GPU (routing owns it),
             # a dead port means the record is stale — clear it and proceed
-            # to (re)start professional.  The probe never raises.
+            # to (re)start professional.  The probe never raises, but the
+            # port lookup can — an unresolvable port is also a stale record.
+            recorded_port: Optional[int] = None
             try:
                 recorded_port = await self.get_port(self._active_heavy_model)
                 if await self.probe_model_port(recorded_port):
@@ -412,7 +414,8 @@ class SystemdController:
             logger.warning(
                 "Cleared stale active-heavy-model state '%s' "
                 "(port %s not serving)",
-                self._active_heavy_model, recorded_port,
+                self._active_heavy_model,
+                recorded_port if recorded_port is not None else "unresolved",
             )
             self._active_heavy_model = None
         if gpu_vram_used_gb >= GPU_BUSY_VRAM_GB:

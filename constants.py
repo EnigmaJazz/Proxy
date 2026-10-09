@@ -782,14 +782,19 @@ SENSOR_INTERVAL: float = 3.0
 # ---------------------------------------------------------------------------
 # Professional model residency (keep-warm)
 #
-# The proxy keeps the professional model (35B MoE, ~20GB VRAM) LOADED on the
+# The proxy keeps the professional model (35B MoE) LOADED on the 12 GB
 # GPU whenever the GPU is not serving another heavy model and not busy with
 # other heavy work (e.g. gaming/rendering), eliminating cold-start latency for
 # the most common route.  The thermal monitor drives the check cadence.
 # ---------------------------------------------------------------------------
 PROFESSIONAL_RESIDENT_ENABLED: bool = True     # kill toggle for residency
 PROFESSIONAL_RESIDENT_CHECK_S: float = 60.0    # how often the monitor checks
-GPU_BUSY_VRAM_GB: float = 22.0                 # vram_used_gb >= this → GPU busy with OTHER work
+# vram_used_gb >= this → GPU busy with OTHER work, so professional is not
+# (re)loaded on top of it.  An idle desktop holds about 0.6 GB; professional
+# itself fills most of the card, so a resident professional also reads as
+# busy, which is harmless (the check only gates a load).  The old 22.0 could
+# never be reached on the 12 GB card (2026-10-08 freeze).
+GPU_BUSY_VRAM_GB: float = 3.0
 
 # ---------------------------------------------------------------------------
 # Outbound image downscaling (R1 carve-out)

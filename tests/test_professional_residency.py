@@ -66,6 +66,32 @@ class TestEnsureProfessionalResident:
         assert ctrl.active_heavy_model == "professional"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("exc", [RuntimeError("no unit"), OSError("systemctl")])
+    async def test_stale_recorded_state_port_lookup_failure_starts_professional(
+        self, systemd: tuple[Any, Any], monkeypatch: pytest.MonkeyPatch,
+        exc: Exception,
+    ) -> None:
+        """The recorded model's port cannot even be resolved (``get_port``
+        raises) → the record is treated as stale and professional is started.
+        Regression: the stale-state warning formatted an unbound
+        ``recorded_port`` and raised ``UnboundLocalError`` out of the
+        'never raises' residency check."""
+        _, ctrl = systemd
+        ctrl.active_heavy_model = "coder"
+        started: list[str] = []
+        probe_mock = AsyncMock()
+        monkeypatch.setattr(ctrl, "get_port", AsyncMock(side_effect=exc))
+        monkeypatch.setattr(ctrl, "probe_model_port", probe_mock)
+        monkeypatch.setattr(ctrl, "is_active", AsyncMock(return_value=False))
+        monkeypatch.setattr(ctrl, "start_service", _recorder(started))
+
+        await ctrl.ensure_professional_resident(gpu_vram_used_gb=10.0)
+
+        probe_mock.assert_not_awaited()
+        assert started == ["professional"]
+        assert ctrl.active_heavy_model == "professional"
+
+    @pytest.mark.asyncio
     async def test_does_not_load_when_heavy_model_active(
         self, systemd: tuple[Any, Any], monkeypatch: pytest.MonkeyPatch,
     ) -> None:

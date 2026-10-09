@@ -43,6 +43,10 @@ def systemd() -> tuple[Any, Any]:
     return fresh, cls()
 
 
+#: VRAM usage of an idle desktop — well under ``GPU_BUSY_VRAM_GB``.
+_FREE_VRAM_GB = 0.5
+
+
 def _recorder(calls: list[str]) -> Any:
     """Return an async start_service stand-in that records its domain."""
     async def _record(domain: str) -> None:
@@ -60,7 +64,7 @@ class TestEnsureProfessionalResident:
         monkeypatch.setattr(ctrl, "is_active", AsyncMock(return_value=False))
         monkeypatch.setattr(ctrl, "start_service", _recorder(started))
 
-        await ctrl.ensure_professional_resident(gpu_vram_used_gb=10.0)
+        await ctrl.ensure_professional_resident(gpu_vram_used_gb=_FREE_VRAM_GB)
 
         assert started == ["professional"]
         assert ctrl.active_heavy_model == "professional"
@@ -85,7 +89,7 @@ class TestEnsureProfessionalResident:
         monkeypatch.setattr(ctrl, "is_active", AsyncMock(return_value=False))
         monkeypatch.setattr(ctrl, "start_service", _recorder(started))
 
-        await ctrl.ensure_professional_resident(gpu_vram_used_gb=10.0)
+        await ctrl.ensure_professional_resident(gpu_vram_used_gb=_FREE_VRAM_GB)
 
         probe_mock.assert_not_awaited()
         assert started == ["professional"]
@@ -106,7 +110,7 @@ class TestEnsureProfessionalResident:
         monkeypatch.setattr(ctrl, "is_active", is_active_mock)
         monkeypatch.setattr(ctrl, "start_service", start_mock)
 
-        await ctrl.ensure_professional_resident(gpu_vram_used_gb=10.0)
+        await ctrl.ensure_professional_resident(gpu_vram_used_gb=_FREE_VRAM_GB)
 
         start_mock.assert_not_awaited()
         is_active_mock.assert_not_awaited()
@@ -126,7 +130,7 @@ class TestEnsureProfessionalResident:
         monkeypatch.setattr(ctrl, "is_active", AsyncMock(return_value=False))
         monkeypatch.setattr(ctrl, "start_service", _recorder(started))
 
-        await ctrl.ensure_professional_resident(gpu_vram_used_gb=10.0)
+        await ctrl.ensure_professional_resident(gpu_vram_used_gb=_FREE_VRAM_GB)
 
         assert started == ["professional"]
         assert ctrl.active_heavy_model == "professional"
@@ -145,7 +149,7 @@ class TestEnsureProfessionalResident:
         monkeypatch.setattr(ctrl, "is_active", is_active_mock)
         monkeypatch.setattr(ctrl, "start_service", start_mock)
 
-        await ctrl.ensure_professional_resident(gpu_vram_used_gb=10.0)
+        await ctrl.ensure_professional_resident(gpu_vram_used_gb=_FREE_VRAM_GB)
 
         start_mock.assert_not_awaited()
         is_active_mock.assert_not_awaited()
@@ -180,7 +184,7 @@ class TestEnsureProfessionalResident:
         monkeypatch.setattr(ctrl, "is_active", is_active_mock)
         monkeypatch.setattr(ctrl, "start_service", start_mock)
 
-        await ctrl.ensure_professional_resident(gpu_vram_used_gb=10.0)
+        await ctrl.ensure_professional_resident(gpu_vram_used_gb=_FREE_VRAM_GB)
 
         start_mock.assert_not_awaited()
         is_active_mock.assert_not_awaited()
@@ -195,7 +199,7 @@ class TestEnsureProfessionalResident:
         monkeypatch.setattr(ctrl, "is_active", AsyncMock(return_value=True))
         monkeypatch.setattr(ctrl, "start_service", start_mock)
 
-        await ctrl.ensure_professional_resident(gpu_vram_used_gb=10.0)
+        await ctrl.ensure_professional_resident(gpu_vram_used_gb=_FREE_VRAM_GB)
 
         start_mock.assert_not_awaited()
         assert ctrl.active_heavy_model is None
@@ -212,7 +216,7 @@ class TestEnsureProfessionalResident:
         monkeypatch.setattr(ctrl, "is_active", AsyncMock(return_value=False))
         monkeypatch.setattr(ctrl, "start_service", _boom)
 
-        await ctrl.ensure_professional_resident(gpu_vram_used_gb=10.0)
+        await ctrl.ensure_professional_resident(gpu_vram_used_gb=_FREE_VRAM_GB)
 
         assert ctrl.active_heavy_model is None
 
@@ -228,7 +232,7 @@ class TestEnsureProfessionalResident:
         start_mock = AsyncMock()
         monkeypatch.setattr(ctrl, "start_service", start_mock)
 
-        await ctrl.ensure_professional_resident(gpu_vram_used_gb=10.0)
+        await ctrl.ensure_professional_resident(gpu_vram_used_gb=_FREE_VRAM_GB)
 
         start_mock.assert_not_awaited()
         assert ctrl.active_heavy_model is None

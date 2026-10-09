@@ -71,7 +71,7 @@ try:
     from pyrsmi import rocUtil  # type: ignore
     logger.info("pyrsmi loaded – AMD GPU telemetry available")
 except ImportError:
-    logger.warning("pyrsmi not installed – GPU temps will be zero")
+    logger.warning("pyrsmi not installed – using the amdgpu sysfs fallback")
     PYRSMI_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
@@ -183,13 +183,41 @@ def _read_amdgpu_hwmon() -> dict[str, float]:
     return result
 
 
+def _read_amdgpu_vram_used_gb(drm_root: Path = Path("/sys/class/drm")) -> float:
+    """
+    Read used VRAM in GiB from the ``amdgpu`` DRM sysfs counters.
+
+    Reads ``mem_info_vram_used`` of the AMD card (PCI vendor ``0x1002``)
+    with the largest ``mem_info_vram_total``: on a machine with an iGPU and
+    a discrete card, the discrete card is the one the models run on.
+    Returns 0.0 when no AMD card exposes the counters or a read fails.
+    """
+    best_total = 0
+    used_bytes = 0
+    try:
+        for device in sorted(drm_root.glob("card*/device")):
+            try:
+                if (device / "vendor").read_text().strip() != "0x1002":
+                    continue
+                total = int((device / "mem_info_vram_total").read_text())
+                used = int((device / "mem_info_vram_used").read_text())
+            except (OSError, ValueError):
+                continue
+            if total > best_total:
+                best_total, used_bytes = total, used
+    except OSError:
+        logger.debug("amdgpu DRM sysfs unreadable", exc_info=True)
+        return 0.0
+    return used_bytes / (1024**3)
+
+
 def get_gpu_temps() -> dict[str, float]:
     """
     Return dict with keys: edge, junction, vram, vram_used_gb (all floats).
 
     Uses pyrsmi (ROCm) for direct AMD GPU telemetry when available.
-    Falls back to the ``amdgpu`` hwmon sysfs interface (always present
-    with the amdgpu kernel driver) when pyrsmi is unavailable.
+    Falls back to the ``amdgpu`` hwmon and DRM sysfs interfaces (always
+    present with the amdgpu kernel driver) when pyrsmi is unavailable.
     Returns zeros if both sources fail.
     """
     result: dict[str, float] = {"edge": 0.0, "junction": 0.0, "vram": 0.0, "vram_used_gb": 0.0}
@@ -213,9 +241,12 @@ def get_gpu_temps() -> dict[str, float]:
         except (OSError, ValueError, RuntimeError):
             logger.exception("pyrsmi readout failed — falling back to hwmon")
 
-    # Fallback: read amdgpu hwmon sysfs (edge, junction, VRAM temps only)
+    # Fallback: amdgpu hwmon sysfs for temperatures, DRM sysfs for VRAM
+    # usage (hwmon has no usage counter; without this the residency
+    # "GPU busy" guard saw 0.0 GB forever — 2026-10-08 freeze).
     hwmon_temps = _read_amdgpu_hwmon()
     result.update(hwmon_temps)
+    result["vram_used_gb"] = _read_amdgpu_vram_used_gb()
     return result
 
 

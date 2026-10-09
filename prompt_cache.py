@@ -11,6 +11,12 @@ The proxy ALSO registers system messages it observes on the wire
 (first-seen per caller) so an unregistered frontend prompt gets primed
 automatically on the next idle window.
 
+Status: DISABLED (2026-08-12, commit 2e408fc).  The session KV-cache does
+the real work and the prime never reduced the first-request prefill, so
+the calls were removed from the residency monitor loop (hardware.py) and
+the request path (routes.py).  Nothing calls ``prime()`` in production;
+the module and its tests are kept so priming can be re-enabled.
+
 Design notes
 ------------
 - Priming is best-effort and never raises: a failure just means the
@@ -39,8 +45,9 @@ logger = get_logger("prompt_cache")
 #: runtime and the nanobot/OpenWebUI defaults can be seeded by callers.
 # F6 note (2026-08-11): ``_PROMPTS`` / ``_LAST_PRIMED`` are runtime-mutable
 # module-level registries (Rule 6 carve-out, same precedent as the
-# ``_serve_config_mtime`` scalar in opencode_bridge.py): the priming runs
-# from the residency monitor loop (hardware.py) AND the request path
+# ``_serve_config_mtime`` scalar in opencode_bridge.py): when wired (it is
+# currently disabled, see the module docstring), the priming runs from the
+# residency monitor loop (hardware.py) AND the request path
 # (routes.py) with no app.state handle in the monitor, so threading app
 # state through would couple the cache to the FastAPI app.  The registries
 # are small, per-process, and die with the process.  ``_NANOBOT_PYTHON_VERSION``

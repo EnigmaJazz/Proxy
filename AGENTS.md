@@ -106,9 +106,13 @@ project-specific.
 
    **Documented carve-out — prompt priming registries** (`prompt_cache.py`
    `_PROMPTS` / `_LAST_PRIMED`): runtime-mutable module-level registries
-   for the frontend system-prompt priming. The priming runs from the
-   residency monitor loop (hardware.py) AND the request path (routes.py)
-   with no app.state handle in the monitor, so threading app state through
+   for the frontend system-prompt priming. Priming is currently DISABLED
+   (2026-08-12, commit 2e408fc: the session KV-cache does the real work and
+   the prime never reduced the first-request prefill), so nothing in the
+   residency monitor loop (hardware.py) or the request path (routes.py)
+   calls it; the module, its registries and its tests are kept so it can
+   be re-enabled. When wired, the priming runs from those two places with
+   no app.state handle in the monitor, so threading app state through
    would couple the cache to the FastAPI app. Accepted as a project
    exception (2026-08-11, F6 note in `prompt_cache.py`); the registries
    are small, per-process, and die with the process.

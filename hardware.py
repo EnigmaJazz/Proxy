@@ -753,7 +753,7 @@ async def thermal_monitor_task(
                     state.gpu_vram_used_gb,
                 )
                 await systemd.ensure_professional_resident(state.gpu_vram_used_gb)
-            # ---- Thermal threshold enforcement ----------------            # ---- Thermal threshold enforcement -------------------------------
+            # ---- Thermal threshold enforcement -------------------------------
             # Only real temperature sensors belong in the zone map. RAM usage
             # percent is NOT a temperature and must never be compared against
             # °C thresholds (it used to power the host off at 80% RAM via a

@@ -1173,6 +1173,90 @@ class TestPinnedContinuationVsGate:
         assert "Opencode" not in seen_task[0]
 
 
+class TestPinnedPermissionResume:
+    """T5 (ct-58464): the pinned-continuation resume answers a pending
+    permission only on a backend that relays permissions.  The secure
+    backend must never POST an answer."""
+
+    async def _drive_resume(
+        self, gate_client: Any, monkeypatch: pytest.MonkeyPatch, *, backend: Any,
+    ) -> list[tuple[str, str, str]]:
+        from routes import _pending_permissions_state, _resolve_session_id
+
+        task = "write a script to check for updates"
+        sid = _resolve_session_id(
+            [{"role": "user", "content": task}], proxy.app,
+        )
+        monkeypatch.setattr(
+            proxy.app.state, "opencode_sessions", {sid: "ses_0001"},
+            raising=False,
+        )
+        monkeypatch.setattr(
+            proxy.app.state, "opencode_pending_permissions",
+            {"ses_0001": ("perm_1", True)},
+            raising=False,
+        )
+
+        posted: list[tuple[str, str, str]] = []
+
+        async def _record_post(session_id, permission_id, response):
+            posted.append((session_id, permission_id, response))
+            return True
+
+        async def _persist_noop(app) -> None:
+            return None
+
+        async def _fake_stream(text, *args, **kwargs):
+            yield ("text", "done")
+
+        monkeypatch.setattr("routes._post_permission_response", _record_post)
+        monkeypatch.setattr("routes._persist_opencode_sessions", _persist_noop)
+        monkeypatch.setattr("routes.BACKEND", backend)
+        monkeypatch.setattr("routes.opencode_chat_stream_resilient", _fake_stream)
+
+        with patch(
+            "routes.classify_with_frontdesk",
+            new=AsyncMock(return_value=_classification("CODE")),
+        ):
+            response = await gate_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "auto",
+                    "messages": [
+                        {"role": "user", "content": task},
+                        {"role": "assistant", "content": "Done."},
+                        {"role": "user", "content": "go ahead"},
+                    ],
+                    "stream": True,
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            await response.aread()
+        return posted
+
+    @pytest.mark.asyncio
+    async def test_resume_posts_answer_under_relay_backend(
+        self, gate_client: Any, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from opencode_backends import ServeBackend
+
+        posted = await self._drive_resume(
+            gate_client, monkeypatch, backend=ServeBackend(),
+        )
+        assert posted == [("ses_0001", "perm_1", "once")]
+
+    @pytest.mark.asyncio
+    async def test_resume_never_posts_under_secure_backend(
+        self, gate_client: Any, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from opencode_backends import SecureBackend
+
+        posted = await self._drive_resume(
+            gate_client, monkeypatch, backend=SecureBackend(),
+        )
+        assert posted == []
+
+
 class TestKeywordHeuristicsTightened:
     """Regression (2026-08-07): golden-set gaps closed by the keyword nets.
 

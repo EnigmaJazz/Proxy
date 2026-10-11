@@ -46,6 +46,7 @@ from constants import (
     OPENCODE_BIN,
     OPENCODE_SERVE_TIMEOUT,
     OPENCODE_SERVE_URL,
+    OPENCODE_SECURE_SERVE_URL,
     OPENCODE_BRIDGE_DIRECTORY,
     OPENCODE_SERVE_CONFIG_DIR,
     OPENCODE_SERVE_PURE,
@@ -520,12 +521,52 @@ async def is_opencode_serve_running() -> bool:
         return False
 
 
+async def _secure_serve_answering() -> bool:
+    """Pure health probe for the systemd-owned secure server.
+
+    ANY received HTTP response proves a process holds the secure port
+    (the same transport-liveness semantics as ``is_opencode_serve_running``);
+    only a transport error (``httpx.HTTPError`` / ``OSError``) means down.
+    Never raises, and never touches the serve-lifecycle helpers — it probes
+    ``OPENCODE_SECURE_SERVE_URL`` directly, so no spawn/recycle/probe against
+    the bridge-owned serve runs under the secure backend.
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.get(f"{OPENCODE_SECURE_SERVE_URL}/config", timeout=3.0)
+            return True
+    except (httpx.HTTPError, OSError):
+        return False
+
+
+def _serve_unreachable_message() -> str:
+    """The bridge-failure text for ``ensure_opencode_serve`` returning False.
+
+    On a backend that owns no server (the secure backend) the message names
+    the systemd-owned server so the operator knows the proxy will not start
+    it; the serve backends keep the original byte-identical string.
+    """
+    if not BACKEND.owns_server:
+        return (
+            "[OpenCode Bridge Failed: the systemd-owned secure opencode "
+            f"server ({OPENCODE_SECURE_SERVE_URL}) is not answering; start "
+            "secure-opencode.service (the proxy never starts it).]"
+        )
+    return "[OpenCode Bridge Failed: opencode serve not reachable.]"
+
+
 async def ensure_opencode_serve() -> bool:
     """Ensure the opencode serve backend is up (spawn if missing).
 
     Returns True when the backend is answering.  Spawns ``opencode serve``
     as a detached child process bound to ``OPENCODE_SERVE_URL`` — the
     proxy owns its lifecycle so no systemd unit is required.  Never raises.
+
+    On a backend that does NOT own its server (``BACKEND.owns_server`` is
+    False — the systemd-owned secure server), this degenerates to a pure
+    health probe: no spawn, no config sync, no auth copy and no signal.
+    A down secure server returns False and the callers fail with an error
+    naming it; the proxy never starts it.
 
     Config-drift gate (REQ-5): when a serve IS running and the serve
     template (OPCODE_CONFIG_PATH) is newer than the mtime cached at the
@@ -534,6 +575,8 @@ async def ensure_opencode_serve() -> bool:
     template is treated as no-drift.
     """
     global _serve_config_mtime
+    if not BACKEND.owns_server:
+        return await _secure_serve_answering()
     mtime = await asyncio.to_thread(_config_mtime)
     if await is_opencode_serve_running():
         if mtime is None:
@@ -613,6 +656,11 @@ async def _spawn_serve(mtime: Optional[float]) -> bool:
     Records ``_serve_config_mtime`` on success so the drift gate can
     compare.  Never raises.
     """
+    if not BACKEND.owns_server:
+        # Systemd-owned server (secure backend): the proxy never spawns,
+        # config-syncs or auth-copies it — the whole spawn cluster is a
+        # no-op and ensure_opencode_serve stays a pure health probe.
+        return False
     global _serve_config_mtime
     try:
         port = OPENCODE_SERVE_URL.rsplit(":", 1)[-1]
@@ -701,7 +749,7 @@ async def opencode_chat(
     never retry.
     """
     if not await ensure_opencode_serve():
-        return "[OpenCode Bridge Failed: opencode serve not reachable.]"
+        return _serve_unreachable_message()
     async with httpx.AsyncClient() as client:
         text, network_failed = await _opencode_chat_attempt(
             client, user_text, agent=agent, model_id=model_id,
@@ -716,7 +764,7 @@ async def opencode_chat(
         # No loop — a failed re-ensure or failed retry returns its error.
         await _force_recycle_serve("blocking-path respawn")
         if not await ensure_opencode_serve():
-            return "[OpenCode Bridge Failed: opencode serve not reachable.]"
+            return _serve_unreachable_message()
         text, _ = await _opencode_chat_attempt(
             client, user_text, agent=agent, model_id=model_id,
             provider_id=provider_id, timeout=timeout,
@@ -861,7 +909,7 @@ async def opencode_chat_stream(
     # The ensure below respawns a fresh serve when a recycle fired.
     await _recycle_serve_if_low_memory()
     if not await ensure_opencode_serve():
-        yield ("status", "[OpenCode Bridge Failed: opencode serve not reachable.]")
+        yield ("status", _serve_unreachable_message())
         return
     # Rule 6: pending-permission state lives on app.state in routes.py and is
     # threaded in; standalone callers (scripts/tests) fall back to a fresh
@@ -2101,6 +2149,8 @@ async def _recycle_serve_if_low_memory() -> None:
     Killing the serve lets the next ``ensure_opencode_serve`` respawn a
     fresh one.  Never raises.
     """
+    if not BACKEND.owns_server:
+        return
     try:
         port = OPENCODE_SERVE_URL.rsplit(":", 1)[-1]
         pressure, elapsed = await asyncio.to_thread(_serve_health, port)
@@ -2142,6 +2192,8 @@ async def _force_recycle_serve(reason: str = "long-lived call") -> None:
     drift gate recycles when the serve template changes under a running
     serve.  Never raises.
     """
+    if not BACKEND.owns_server:
+        return
     try:
         port = OPENCODE_SERVE_URL.rsplit(":", 1)[-1]
         pid = await asyncio.to_thread(_find_serve_pid, port)
@@ -2197,6 +2249,9 @@ def _sync_serve_config() -> None:
     user's plugin config alongside the template.  Copies are skipped when
     the destination already matches, so repeated spawns do not churn the
     dir."""
+    if not BACKEND.owns_server:
+        # Secure backend: the server's config is systemd-owned; nothing to sync.
+        return
     dst_dir = os.path.join(OPENCODE_SERVE_CONFIG_DIR, "opencode")
     os.makedirs(dst_dir, exist_ok=True)
     _copy_if_changed(

@@ -31,9 +31,10 @@ daemon machinery (``ensure_openchamber_daemon`` / ``_run_cli``) and
 TRANSLATE the CLI's JSON payloads into the serve's HTTP contract (status
 code + ``.json()`` body) so the bridge call sites stay byte-identical.
 The ``OPENCODE_BACKEND`` env selector resolves ``BACKEND``: the literal
-``"openchamber"`` picks the CLI transport, anything else keeps the serve
-transport (production default until the evidence gate flips it — design
-§6).  The openchamber transport is the CLI subprocess (design §3.3), NOT
+``"openchamber"`` picks the CLI transport, the literal ``"secure"`` picks
+the systemd-owned secure-server transport, and anything else keeps the
+serve transport (production default until the evidence gate flips it —
+design §6; the secure transport is bridge v4, T4).  The openchamber transport is the CLI subprocess (design §3.3), NOT
 the daemon's HTTP/UI API (explicitly out of scope, design §8); the
 daemon is spawned and owned by ``opencode_chamber.py``.
 """
@@ -50,7 +51,12 @@ from typing import Any, Optional
 import httpx
 
 import opencode_chamber as chamber
-from constants import OPENCHAMBER_SERVE_URL, OPENCODE_SERVE_URL, get_logger
+from constants import (
+    OPENCHAMBER_SERVE_URL,
+    OPENCODE_SECURE_SERVE_URL,
+    OPENCODE_SERVE_URL,
+    get_logger,
+)
 
 # Same logger name as the bridge: the relocated transport code must keep
 # producing byte-identical log lines (e.g. the question-reply warnings).
@@ -71,6 +77,13 @@ class OpenCodeBackend(ABC):
     client parameter, and the serve-specific permission/question/status/
     list/send-message primitives that have no openchamber analogue).
     """
+
+    #: Whether this transport owns its server's lifecycle.  True by default
+    #: (the serve and openchamber transports spawn/recycle their backend);
+    #: ``SecureBackend`` sets it False because the secure-opencode server is
+    #: systemd-owned and the proxy must never spawn, recycle, reconfigure,
+    #: auth-copy or signal it.
+    owns_server: bool = True
 
     # -- Session lifecycle (the design's core five) ---------------------
 
@@ -242,6 +255,12 @@ class ServeBackend(OpenCodeBackend):
     state lives in the caller's dicts and per-request ``httpx`` clients.
     """
 
+    #: The serve base URL this transport talks to.  Parameterized (rather
+    #: than hardcoding ``OPENCODE_SERVE_URL``) so ``SecureBackend`` can reuse
+    #: this whole implementation against the systemd-owned secure server —
+    #: the secure server speaks the same serve HTTP surface.
+    base_url: str = OPENCODE_SERVE_URL
+
     async def create_session(
         self,
         client: httpx.AsyncClient,
@@ -256,7 +275,7 @@ class ServeBackend(OpenCodeBackend):
         call.  Transport errors propagate to the caller's try/except.
         """
         return await client.post(
-            f"{OPENCODE_SERVE_URL}/session",
+            f"{self.base_url}/session",
             params={"directory": directory},
             timeout=30.0,
         )
@@ -281,7 +300,7 @@ class ServeBackend(OpenCodeBackend):
         same as the session-create POST.
         """
         return await client.post(
-            f"{OPENCODE_SERVE_URL}/session/{session_id}/prompt_async",
+            f"{self.base_url}/session/{session_id}/prompt_async",
             json=_build_send_payload(
                 agent=agent, system_prompt=system_prompt, user_text=user_text,
                 model_id=model_id, provider_id=provider_id,
@@ -303,7 +322,7 @@ class ServeBackend(OpenCodeBackend):
         identical to the inline behavior.
         """
         return await client.get(
-            f"{OPENCODE_SERVE_URL}/session/{session_id}/message", timeout=10.0,
+            f"{self.base_url}/session/{session_id}/message", timeout=10.0,
         )
 
     async def session_exists(
@@ -324,7 +343,7 @@ class ServeBackend(OpenCodeBackend):
         Timeout 10s.
         """
         return await client.get(
-            f"{OPENCODE_SERVE_URL}/session/{session_id}", timeout=10.0,
+            f"{self.base_url}/session/{session_id}", timeout=10.0,
         )
 
     async def abort_session(
@@ -341,7 +360,7 @@ class ServeBackend(OpenCodeBackend):
         """
         try:
             await client.post(
-                f"{OPENCODE_SERVE_URL}/session/{session_id}/abort",
+                f"{self.base_url}/session/{session_id}/abort",
                 timeout=10.0,
             )
         except (httpx.HTTPError, OSError):
@@ -369,7 +388,7 @@ class ServeBackend(OpenCodeBackend):
         inline — the caller's task.result()/except surfaces them.
         """
         return await client.post(
-            f"{OPENCODE_SERVE_URL}/session/{session_id}/message",
+            f"{self.base_url}/session/{session_id}/message",
             json=_build_send_payload(
                 agent=agent, system_prompt=system_prompt, user_text=user_text,
                 model_id=model_id, provider_id=provider_id,
@@ -390,7 +409,7 @@ class ServeBackend(OpenCodeBackend):
         multi-group input).  Timeout 10s, same as inline.
         """
         return await client.get(
-            f"{OPENCODE_SERVE_URL}/session/{session_id}/message/{message_id}",
+            f"{self.base_url}/session/{session_id}/message/{message_id}",
             timeout=10.0,
         )
 
@@ -406,7 +425,7 @@ class ServeBackend(OpenCodeBackend):
         completion — see ``session_exists``).  Timeout 10s.
         """
         return await client.get(
-            f"{OPENCODE_SERVE_URL}/session/status", timeout=10.0,
+            f"{self.base_url}/session/status", timeout=10.0,
         )
 
     async def list_sessions(
@@ -418,7 +437,7 @@ class ServeBackend(OpenCodeBackend):
         The zombie sweep reads this to find busy-but-stale sessions to
         abort.  Timeout 10s.
         """
-        return await client.get(f"{OPENCODE_SERVE_URL}/session", timeout=10.0)
+        return await client.get(f"{self.base_url}/session", timeout=10.0)
 
     async def fetch_permissions(
         self,
@@ -431,7 +450,7 @@ class ServeBackend(OpenCodeBackend):
         The caller filters by session id and relayed-permission type.
         Timeout 10s.
         """
-        return await client.get(f"{OPENCODE_SERVE_URL}/permission", timeout=10.0)
+        return await client.get(f"{self.base_url}/permission", timeout=10.0)
 
     async def reply_permission(
         self,
@@ -448,7 +467,7 @@ class ServeBackend(OpenCodeBackend):
         """
         try:
             resp = await client.post(
-                f"{OPENCODE_SERVE_URL}/session/{session_id}/permissions/{permission_id}",
+                f"{self.base_url}/session/{session_id}/permissions/{permission_id}",
                 json={"response": response},
                 timeout=10.0,
             )
@@ -467,7 +486,7 @@ class ServeBackend(OpenCodeBackend):
         pending requests in memory and lists them here; the entry carries
         the request id needed for the reply.  Timeout 10s.
         """
-        return await client.get(f"{OPENCODE_SERVE_URL}/question", timeout=10.0)
+        return await client.get(f"{self.base_url}/question", timeout=10.0)
 
     async def reply_question(
         self,
@@ -484,7 +503,7 @@ class ServeBackend(OpenCodeBackend):
         """
         try:
             resp = await client.post(
-                f"{OPENCODE_SERVE_URL}/question/{question_id}/reply",
+                f"{self.base_url}/question/{question_id}/reply",
                 json={"answers": [[answer] for _ in range(max(1, question_count))]},
                 timeout=15.0,
             )
@@ -504,6 +523,23 @@ class ServeBackend(OpenCodeBackend):
                 exc_info=True,
             )
         return False
+
+
+class SecureBackend(ServeBackend):
+    """The systemd-owned secure-opencode server transport (bridge v4, T4).
+
+    The secure server on ``OPENCODE_SECURE_SERVE_URL`` (127.0.0.1:4096) was
+    launched by systemd with its own config, so it speaks the SAME serve
+    HTTP surface as ``ServeBackend`` — this class only overrides the base
+    URL and the ownership flag rather than copying the 13 method bodies.
+
+    ``owns_server`` is False: the proxy performs a health probe only and
+    never spawns, recycles, config-syncs, auth-copies or signals this
+    server.  The systemd unit is the user's to manage.
+    """
+
+    base_url: str = OPENCODE_SECURE_SERVE_URL
+    owns_server: bool = False
 
 
 # -- OpenChamber CLI transport (design step 3, 2026-08-22) ------------------
@@ -1098,21 +1134,28 @@ class OpenChamberBackend(OpenCodeBackend):
 
 
 #: The bridge's active backend, resolved ONCE at import.  The
-#: ``OPENCODE_BACKEND`` env selects the transport: the literal
-#: ``"openchamber"`` picks ``OpenChamberBackend`` (the CLI transport,
-#: design step 3); ANY other value (unset, "serve", unknown) keeps the
-#: production default ``ServeBackend`` until the evidence gate flips it
-#: (design §6 — one env line, no redeploy).
+#: ``OPENCODE_BACKEND`` env selects the transport:
+#:   * the literal ``"secure"`` picks ``SecureBackend`` — the
+#:     systemd-owned secure-opencode server on ``OPENCODE_SECURE_SERVE_URL``
+#:     (127.0.0.1:4096).  It owns no server: ensure is a health probe only
+#:     and no spawn/recycle/config-sync/auth-copy/SIGTERM path runs.
+#:   * the literal ``"openchamber"`` picks ``OpenChamberBackend`` (the CLI
+#:     transport, design step 3).
+#:   * ANY other value (unset, "serve", unknown) keeps the production
+#:     default ``ServeBackend`` until the evidence gate flips it (design §6
+#:     — one env line, no redeploy).
 #:
-#: ``ServeBackend`` is STATELESS (session/request state lives in the
-#: caller's dicts and per-request httpx clients), so this module-level
-#: service reference carries no mutable state — the same class of
-#: exception the F5/F6 carve-outs document for ``opencode_bridge``.
+#: ``ServeBackend`` and ``SecureBackend`` are STATELESS (session/request
+#: state lives in the caller's dicts and per-request httpx clients), so
+#: this module-level service reference carries no mutable state — the same
+#: class of exception the F5/F6 carve-outs document for ``opencode_bridge``.
 #: ``OpenChamberBackend`` holds one bounded per-instance map
 #: (``_session_dirs`` — F8, see the class) because the CLI needs ``--dir``
 #: on every call.
 BACKEND: OpenCodeBackend = (
-    OpenChamberBackend()
+    SecureBackend()
+    if os.environ.get("OPENCODE_BACKEND") == "secure"
+    else OpenChamberBackend()
     if os.environ.get("OPENCODE_BACKEND") == "openchamber"
     else ServeBackend()
 )

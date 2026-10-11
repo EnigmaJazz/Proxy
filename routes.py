@@ -48,7 +48,6 @@ from constants import (
     _HEAVY_MODEL_KEYS,
     MODEL_LABELS,
     OPENCODE_AGENT,
-    OPENCODE_SDD_DIRECTORY,
     OPENCODE_BRIDGE_DIRECTORY,
     OPENCODE_SERVE_TIMEOUT,
     RUNTIME_CONTEXT_WINDOWS,
@@ -2592,7 +2591,6 @@ async def _opencode_task_response(
     just_approved_permission: bool = False,
     system_prompt: str = _BRIDGE_SYSTEM_PROMPT,
     timeout: float = OPENCODE_SERVE_TIMEOUT,
-    autonomous: bool = False,
     directory: Optional[str] = None,
 ) -> Response:
     """Run a task through the opencode bridge and return the response.
@@ -2605,9 +2603,6 @@ async def _opencode_task_response(
     When ``session_map``/``session_key`` are given the opencode agent session
     is pinned per conversation so follow-ups resume the same agent (it keeps
     its state and can answer clarifying questions).
-
-    ``autonomous`` marks SDD-autonomous mode (model "opencode-sdd"): the
-    bridge auto-allows every permission ask instead of relaying it (REQ-2).
     """
     if not task_text:
         return JSONResponse(
@@ -2616,14 +2611,11 @@ async def _opencode_task_response(
         )
 
     async def _stream() -> AsyncIterator[str]:
-        # The SDD-autonomous path operates on the OpenSpec store in the
-        # proxy repo, NOT the nanobot workspace the plain bridge sessions
-        # use — default the directory per mode.
+        # Default the session directory to the bridge workspace when the
+        # caller did not provide one.
         stream_directory = directory
         if stream_directory is None:
-            stream_directory = (
-                OPENCODE_SDD_DIRECTORY if autonomous else OPENCODE_BRIDGE_DIRECTORY
-            )
+            stream_directory = OPENCODE_BRIDGE_DIRECTORY
         # The status line carries the TASK's identity so the stream can be
         # discriminated from any other task asked in the meantime: the SDD
         # change name (when the task text declares one) plus the task's
@@ -2647,7 +2639,6 @@ async def _opencode_task_response(
             just_approved_permission=just_approved_permission,
             system_prompt=system_prompt,
             timeout=timeout,
-            autonomous=autonomous,
             directory=stream_directory,
         ):
             if kind == "text" and text_delta:
@@ -2710,9 +2701,7 @@ async def _opencode_task_response(
     resp_parts: list[str] = []
     stream_directory = directory
     if stream_directory is None:
-        stream_directory = (
-            OPENCODE_SDD_DIRECTORY if autonomous else OPENCODE_BRIDGE_DIRECTORY
-        )
+        stream_directory = OPENCODE_BRIDGE_DIRECTORY
     async for kind, text_delta in opencode_chat_stream_resilient(
         task_text,
         agent=OPENCODE_AGENT,
@@ -2722,7 +2711,6 @@ async def _opencode_task_response(
         just_approved_permission=just_approved_permission,
         system_prompt=system_prompt,
         timeout=timeout,
-        autonomous=autonomous,
         directory=stream_directory,
     ):
         if kind == "text" and text_delta:
@@ -2985,7 +2973,6 @@ async def _handle_opencode_command(user_text: str, app: FastAPI) -> Response:
         task_text,
         client_stream=True,
         pending_permissions=_pending_permissions_state(app),
-        autonomous=False,
     )
 
 

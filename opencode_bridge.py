@@ -89,12 +89,6 @@ _BRIDGE_SYSTEM_PROMPT = (
     "immediately before giving up.\n"
 )
 
-# SDD-AUTONOMOUS system prompt: used when the client picks model
-# "opencode-sdd".  The orchestrator must run the COMPLETE SDD cycle in ONE
-# long-lived turn — no clarifying questions, no per-phase chat — because
-# the bridge is a single request/response and the user will not answer
-# follow-ups mid-cycle.  The preflight choices are supplied in the task
-# text; the orchestrator caches them and proceeds.
 #: The exact marker the orchestrator ends its final message with when an
 #: inline phase fails to produce its artifact (the loud terminal failure
 #: of the sub-agent contract).  The cycle driver matches it to exit
@@ -130,49 +124,6 @@ _SDD_SUBAGENT_CONTRACT = (
     "so far - do NOT retry, do NOT continue the pipeline, do NOT ask the "
     "user anything."
 )
-
-_SDD_AUTONOMOUS_SYSTEM_PROMPT = (
-    "You are the SDD orchestrator in AUTONOMOUS mode through a proxy "
-    "bridge. Run the COMPLETE Spec-Driven Development cycle for the "
-    "requested change in ONE continuous turn: session preflight (use the "
-    "choices already given in the task text - do NOT ask), init guard, "
-    "then proposal, spec, design, tasks, apply, verify, archive "
-    "back-to-back, delegating each phase to the appropriate sub-agent.\n\n"
-    "CRITICAL RULES:\n"
-    "- Never stop to ask a clarifying question or present the interactive "
-    "proceed/adjust/stop menu. The user cannot answer mid-cycle on this "
-    "channel; the whole cycle must complete autonomously in this turn.\n"
-    "- If the preflight choices are embedded in the task text, treat them "
-    "as the user-supplied session preflight and do not re-ask.\n"
-    "- Stream concise status lines between phases so the caller sees "
-    "progress (e.g. 'SDD: exploring', 'SDD: proposing', ...).\n"
-    "- Apply the Gatekeeper between phases; on failure fix once or abort "
-    "with a clear error - never loop.\n"
-    "- LOCAL-MODEL DELEGATION (MANDATORY): when delegating code work to "
-    "the LOCAL model (apply's local writer), delegate ONE FILE at a time "
-    "— one task per file — for big tasks; never bundle multiple files "
-    "into one local-model task (the local context window is limited).\n"
-    "- CONTEXT DISCIPLINE (MANDATORY): your session context accumulates "
-    "across phases and cannot be reset mid-cycle.  Keep it small: never "
-    "re-read a file you already hold; reference artifact paths "
-    "(openspec/changes/<change>/...) instead of pasting file contents back "
-    "into context; when an artifact is large, read only the sections you "
-    "need.  The artifact files on disk are the durable state — your "
-    "context is a working cache, not the record.\n"
-    "- TOOL RETRY (MANDATORY): when a tool call fails with a transient "
-    "error (e.g. \"Tool execution aborted\", connection reset), retry the "
-    "tool ONCE immediately before giving up - the serve's tool runner "
-    "intermittently aborts in-flight executions and the retry normally "
-    "succeeds.  The same rule applies to every sub-agent you delegate to "
-    "(say so in the delegation prompt).\n"
-    "- Keep the final summary short: change name, artifacts produced, "
-    "tests run, and any remaining risk.\n"
-    "You still have full sub-agent access; use it for every phase. Do NOT "
-    "ask the user anything.\n\n"
-    + _SDD_SUBAGENT_CONTRACT
-)
-
-
 
 # Recycle the opencode serve after this uptime: the serve's agent-loop
 # tool runner progressively wedges (bash hangs on trivial commands even
@@ -513,23 +464,19 @@ async def _handle_permission_event(
     session_id: str,
     perm: dict[str, Any],
     pending_permissions: dict[str, tuple[str, bool]],
-    *,
-    autonomous: bool,
 ) -> Optional[str]:
     """Handle one permission request from the opencode serve.
 
     THE single permission handler, shared by all four relay paths (the
     polling-wedge check, the event-bus-timeout check, the ``permission.updated``
     SSE event, and the completion resolver) so the read→auto-allow /
-    write→relay / autonomous→auto-allow policy lives in ONE place.
+    write→relay policy lives in ONE place.
 
     ``perm`` is either an SSE event ``properties`` dict (keys: id, type,
     title, metadata, tool) or a GET /permission record (keys: id,
     permission, patterns, tool).  Returns None when the request was
-    HANDLED silently (read auto-allowed, or an autonomous-mode auto-allow
-    with no client surface and no pending state); returns a question
-    string when the USER must decide (interactive-mode write/git ask).
-    Never raises.
+    HANDLED silently (read auto-allowed); returns a question string when
+    the USER must decide (write/git ask).  Never raises.
     """
     pid = str(perm.get("id") or "")
     perm_type = str(perm.get("permission") or perm.get("type") or "")
@@ -559,13 +506,6 @@ async def _handle_permission_event(
                         break
     except (httpx.HTTPError, OSError, ValueError):
         pass
-    if autonomous:
-        # SDD-autonomous mode: the user pre-approved the whole cycle, so
-        # every relayed ask (write/edit/bash/git) is auto-allowed — POST
-        # "always" with NO client surface and NO pending state.  Bounded by
-        # _post_permission_response (10s timeout, never raises).
-        await _post_permission_response(session_id, pid, "always")
-        return None
     if _classify_permission_access(perm_type, tool_name, cmd) == "read":
         await _post_permission_response(session_id, pid, "always")
         return None
@@ -798,7 +738,6 @@ async def opencode_chat(
     provider_id: str = "kinver",
     timeout: float = OPENCODE_SERVE_TIMEOUT,
     system_prompt: str = _BRIDGE_SYSTEM_PROMPT,
-    autonomous: bool = False,
     directory: Optional[str] = None,
 ) -> str:
     """Send a task to headless opencode and return the assistant text.
@@ -812,8 +751,7 @@ async def opencode_chat(
     (``_BLOCKING_PERMISSION_POLL_S`` cadence): READ asks are auto-allowed,
     WRITE/git asks are NOT granted (headless callers have no user to relay
     a question to) — the session is aborted and a clear error is returned
-    instead of burning the full timeout on a parked agent.  ``autonomous``
-    preserves the streaming path's auto-allow-all semantics.  On every
+    instead of burning the full timeout on a parked agent.  On every
     non-success exit the created session is aborted best-effort so no busy
     zombie is left on the serve.
 
@@ -828,7 +766,7 @@ async def opencode_chat(
         text, network_failed = await _opencode_chat_attempt(
             client, user_text, agent=agent, model_id=model_id,
             provider_id=provider_id, timeout=timeout,
-            system_prompt=system_prompt, autonomous=autonomous,
+            system_prompt=system_prompt,
             directory=directory,
         )
         if not network_failed:
@@ -842,7 +780,7 @@ async def opencode_chat(
         text, _ = await _opencode_chat_attempt(
             client, user_text, agent=agent, model_id=model_id,
             provider_id=provider_id, timeout=timeout,
-            system_prompt=system_prompt, autonomous=autonomous,
+            system_prompt=system_prompt,
             directory=directory,
         )
         return text
@@ -857,7 +795,6 @@ async def _opencode_chat_attempt(
     provider_id: str,
     timeout: float,
     system_prompt: str,
-    autonomous: bool,
     directory: Optional[str] = None,
 ) -> tuple[str, bool]:
     """One blocking attempt: create session, POST with permission polling,
@@ -902,7 +839,6 @@ async def _opencode_chat_attempt(
                     if perm is not None:
                         question = await _handle_permission_event(
                             client, session_id, perm, {},
-                            autonomous=autonomous,
                         )
                         if question:
                             # Interactive-mode WRITE/git ask on a headless
@@ -961,7 +897,6 @@ async def opencode_chat_stream(
     just_approved_permission: bool = False,
     system_prompt: str = _BRIDGE_SYSTEM_PROMPT,
     timeout: float = OPENCODE_SERVE_TIMEOUT,
-    autonomous: bool = False,
     directory: Optional[str] = None,
 ) -> AsyncIterator[tuple[str, str]]:
     """Stream a task through headless opencode, yielding assistant content live.
@@ -980,11 +915,6 @@ async def opencode_chat_stream(
     "question" → the agent is waiting for user input (stop streaming).
     On failure yields a status tuple (never raises).
     """
-    # SDD-autonomous mode (model "opencode-sdd", explicit flag — not the
-    # old timeout inference): force a fresh serve BEFORE spawning so the
-    # cycle never runs on a progressively-wedged tool runner.
-    if autonomous:
-        await _force_recycle_serve()
     # Recycle BEFORE ensure: the recycle SIGTERMs the serve (low memory or
     # uptime > _SERVE_RECYCLE_AFTER_S) and never respawns, so running it
     # after ensure would break the next request with a spurious ConnectError.
@@ -1356,7 +1286,7 @@ async def opencode_chat_stream(
                                     if pending_perm:
                                         question = await _handle_permission_event(
                                             client, session_id, pending_perm,
-                                            pending_permissions, autonomous=autonomous,
+                                            pending_permissions,
                                         )
                                         if question:
                                             yield ("question", question)
@@ -1399,7 +1329,7 @@ async def opencode_chat_stream(
                                 if pending_perm:
                                     question = await _handle_permission_event(
                                         client, session_id, pending_perm,
-                                        pending_permissions, autonomous=autonomous,
+                                        pending_permissions,
                                     )
                                     if question:
                                         yield ("question", question)
@@ -1417,9 +1347,7 @@ async def opencode_chat_stream(
                                     # tool destroys every live session (seen
                                     # 2026-08-08: a wedged bash in one cycle
                                     # SIGTERMed the serve mid-other-cycle).
-                                    # The session abort frees the tool runner;
-                                    # the autonomous force-recycle handles
-                                    # serve health at the next long call.
+                                    # The session abort frees the tool runner.
                                     yield ("status", "[OpenCode Bridge Error: agent tool runner wedged — session aborted. Please retry.]")
                                     return
                             await asyncio.sleep(1.0)
@@ -1453,7 +1381,7 @@ async def opencode_chat_stream(
                             if pending_perm:
                                 question = await _handle_permission_event(
                                     client, session_id, pending_perm,
-                                    pending_permissions, autonomous=autonomous,
+                                    pending_permissions,
                                 )
                                 if question:
                                     yield ("question", question)
@@ -1533,12 +1461,10 @@ async def opencode_chat_stream(
                         # bridge wedges).  Auto-allow READ external-dir
                         # commands; WRITE and git commands yield a question
                         # and stop so the USER decides on the next request
-                        # (the session stays pinned).  Autonomous mode
-                        # auto-allows everything (REQ-2).
+                        # (the session stays pinned).
                         if props.get("type") in _RELAYED_PERMISSION_TYPES:
                             question = await _handle_permission_event(
                                 client, session_id, props, pending_permissions,
-                                autonomous=autonomous,
                             )
                             if question:
                                 yield ("question", question)
@@ -1664,15 +1590,9 @@ async def opencode_chat_stream_resilient(
     uses.  A stream that delivered text or ended in a question is never
     retried (the agent produced output or is waiting for the user); a
     failed attempt that already delivered text surfaces its error as-is so
-    the partial result is never duplicated.  Autonomous mode (SDD cycle)
-    is never auto-retried: the cycle driver owns its recovery.  Never
-    raises; yields (kind, text) tuples exactly like the underlying stream.
+    the partial result is never duplicated.  Never raises; yields (kind,
+    text) tuples exactly like the underlying stream.
     """
-    if kwargs.get("autonomous"):
-        async for kind, payload in opencode_chat_stream(user_text, **kwargs):
-            yield kind, payload
-        return
-
     attempt1: list[tuple[str, str]] = []
     failed: Optional[str] = None
     delivered = False  # any text or question surfaced to the caller
@@ -1718,10 +1638,10 @@ async def opencode_escalation(stage: int, prompt: str) -> str:
     Directs the user prompt to the opencode gentle-orchestrator agent
     OpenRouter.  ``stage`` is informational (passed through to logging).
 
-    Conservative by design: this headless worker path runs with
-    ``autonomous=False`` — READ permissions are auto-allowed, WRITE/git
-    asks abort the session with a clear error (no user is present to
-    relay a question, and unprompted grants are never issued).
+    Conservative by design: this headless worker path auto-allows READ
+    permissions; WRITE/git asks abort the session with a clear error (no
+    user is present to relay a question, and unprompted grants are never
+    issued).
     """
     logger.info("OpenCode escalation (stage=%d): %r", stage, prompt[:200])
     return await opencode_chat(prompt, agent=OPENCODE_AGENT)
@@ -2363,10 +2283,9 @@ async def _force_recycle_serve(reason: str = "long-lived call") -> None:
     """Kill the opencode serve unconditionally so the next
     ``ensure_opencode_serve`` respawns a fresh one.
 
-    Used by long-lived calls (SDD-autonomous mode) and the config-drift
-    gate (REQ-5): the serve's tool runner progressively wedges (bash hangs
-    on trivial commands), and an SDD cycle can burn a full hour on a
-    wedged runner.  A fresh serve at cycle start removes that risk.  The
+    Used by the plain-bridge auto-retry and the config-drift gate (REQ-5):
+    the serve's tool runner progressively wedges (bash hangs on trivial
+    commands), so a fresh serve before a retry removes that risk.  The
     drift gate recycles when the serve template changes under a running
     serve.  Never raises.
     """

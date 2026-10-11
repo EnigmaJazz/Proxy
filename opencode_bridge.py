@@ -265,20 +265,9 @@ _STATUS_SEGMENT_RE = re.compile(
 # session workspace.  In headless serve mode there is no interactive user
 # to answer, so an unanswered gate silently auto-rejects AND leaves the
 # tool wedged in "running" — the root cause of the bridge wedges.  The
-# bridge auto-allows READ commands and asks the USER about WRITE commands.
-# Pending write permissions are keyed by session id so the next request
-# (which resumes the pinned session) can answer them.
-
-# Bounded WRITE classifier for the external_directory gate: any redirect,
-# a whole-word "write", or one of these mutating command tokens marks the
-# command WRITE (needs user approval); everything else (cat/ls/head on
-# /etc or /home) is READ and auto-allowed.  echo-with-redirect is covered
-# by the ">" check alone.
-_EXTERNAL_WRITE_TOKENS: tuple[str, ...] = (
-    "mv ", "cp ", "rm ", "touch ", "mkdir ", "rmdir ", "ln ",
-    "chmod ", "chown ", "tee ", "sed -i", "install ", "dd ",
-    "git commit", "git push", "git reset", "git checkout", "printf ",
-)
+# bridge relays every permission it sees to the USER.  Pending permissions
+# are keyed by session id so the next request (which resumes the pinned
+# session) can answer them.
 
 _PERMISSION_QUESTION_TEMPLATE: str = (
     "🔒 The coding agent wants to access a path outside its workspace.\n\n"
@@ -331,49 +320,6 @@ def _permission_target(perm: dict[str, Any]) -> str:
 _RELAYED_PERMISSION_TYPES: tuple[str, ...] = (
     "external_directory", "bash", "write", "edit",
 )
-
-
-def _classify_external_access(cmd: str) -> str:
-    """Classify a permissioned external-directory command as "read"/"write".
-
-    Bounded heuristic (kept intentionally simple): any redirect or a known
-    mutating command token ⇒ "write"; everything else (``cat /etc/os-release``,
-    ``ls /home``, ``head -5 /etc/passwd``) ⇒ "read".
-    """
-    c = (cmd or "").strip()
-    if ">" in c:
-        return "write"
-    if re.search(r"\bwrite\b", c):
-        return "write"
-    if any(token in c for token in _EXTERNAL_WRITE_TOKENS):
-        return "write"
-    return "read"
-
-
-_WRITE_TOOL_TYPES: frozenset[str] = frozenset({
-    "write", "edit", "patch", "create", "append", "delete", "remove",
-})
-
-
-def _classify_permission_access(perm_type: str, tool_name: str, cmd: str) -> str:
-    """Classify a permissioned external access as "read"/"write".
-
-    Type-aware first (F2): a permission whose TYPE is itself a write tool
-    ("write"/"edit"/"patch"/...) is a WRITE by definition — the cmd
-    heuristic must NOT run on it, because write/edit permission records
-    carry no bash command and an empty cmd would read as "read"
-    (auto-allowing the write even in interactive mode).  A ``write``/
-    ``edit`` TOOL on an external_directory gate is likewise WRITE.  Bash
-    commands fall back to ``_classify_external_access`` (redirects / known
-    mutating tokens ⇒ write; cat/ls/head ⇒ read).  Used by both the event-
-    bus permission handler and the polling resolver so a ``write`` tool to
-    an external dir surfaces a question instead of being auto-allowed.
-    """
-    if perm_type in _WRITE_TOOL_TYPES:
-        return "write"
-    if perm_type == "external_directory" and tool_name in _WRITE_TOOL_TYPES:
-        return "write"
-    return _classify_external_access(cmd)
 
 
 def _parse_permission_answer(answer: str, *, write: bool = False) -> str:
@@ -469,29 +415,28 @@ async def _handle_permission_event(
 
     THE single permission handler, shared by all four relay paths (the
     polling-wedge check, the event-bus-timeout check, the ``permission.updated``
-    SSE event, and the completion resolver) so the read→auto-allow /
-    write→relay policy lives in ONE place.
+    SSE event, and the completion resolver) so the relay policy lives in
+    ONE place.
 
     ``perm`` is either an SSE event ``properties`` dict (keys: id, type,
     title, metadata, tool) or a GET /permission record (keys: id,
-    permission, patterns, tool).  Returns None when the request was
-    HANDLED silently (read auto-allowed); returns a question string when
-    the USER must decide (write/git ask).  Never raises.
+    permission, patterns, tool).  Returns None only when the record is
+    malformed; otherwise returns a question string for the USER to decide
+    (write/git ask).  Never raises.
     """
     pid = str(perm.get("id") or "")
     perm_type = str(perm.get("permission") or perm.get("type") or "")
     if not pid or not perm_type:
         return None
-    # Pull the command for read/write classification: SSE events carry it
-    # in metadata.command/title; GET /permission records carry patterns and
-    # the tool part's state.input.command.
+    # Pull the command for the question display: SSE events carry it in
+    # metadata.command/title; GET /permission records carry patterns and the
+    # tool part's state.input.command.
     cmd = ""
     meta = perm.get("metadata") or {}
     if isinstance(meta, dict):
         cmd = str(meta.get("command") or "")
     cmd = cmd or str(perm.get("title") or "")
     cmd = cmd or str((perm.get("patterns") or [""])[0])
-    tool_name = ""
     try:
         tool_info = perm.get("tool") or {}
         mid = tool_info.get("messageID")
@@ -501,14 +446,10 @@ async def _handle_permission_event(
             if msg_resp.status_code == 200:
                 for part in (msg_resp.json().get("parts") or []):
                     if part.get("callID") == call_id or part.get("id") == call_id:
-                        tool_name = str(part.get("tool") or "")
                         cmd = str(((part.get("state") or {}).get("input") or {}).get("command") or cmd)
                         break
     except (httpx.HTTPError, OSError, ValueError):
         pass
-    if _classify_permission_access(perm_type, tool_name, cmd) == "read":
-        await _post_permission_response(session_id, pid, "always")
-        return None
     pending_permissions[session_id] = (pid, True)
     template = (_GIT_PERMISSION_QUESTION_TEMPLATE
                 if perm_type == "bash"
@@ -536,8 +477,7 @@ async def _detect_pending_permission(
     ``permission.updated`` SSE event entirely — the GET /permission record
     carries ``permission: "write"`` / ``"edit"`` as its value, which
     ``_RELAYED_PERMISSION_TYPES`` now matches (task 1.9), so write/edit
-    asks are caught here and relayed/auto-allowed exactly like the
-    event-bus path.
+    asks are caught here and relayed exactly like the event-bus path.
     """
     try:
         resp = await BACKEND.fetch_permissions(client)
@@ -748,10 +688,10 @@ async def opencode_chat(
     string on failure (escalation-friendly, never raises).
 
     While the message POST is in flight the call polls ``GET /permission``
-    (``_BLOCKING_PERMISSION_POLL_S`` cadence): READ asks are auto-allowed,
-    WRITE/git asks are NOT granted (headless callers have no user to relay
-    a question to) — the session is aborted and a clear error is returned
-    instead of burning the full timeout on a parked agent.  On every
+    (``_BLOCKING_PERMISSION_POLL_S`` cadence): permission asks are NOT
+    granted (headless callers have no user to relay a question to) — the
+    session is aborted and a clear error is returned instead of burning
+    the full timeout on a parked agent.  On every
     non-success exit the created session is aborted best-effort so no busy
     zombie is left on the serve.
 
@@ -929,10 +869,9 @@ async def opencode_chat_stream(
     pending_permissions = (
         pending_permissions if pending_permissions is not None else {}
     )
+    session_id: Optional[str] = None
     async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
         try:
-            protected = set(session_map.values()) if session_map else None
-            await _abort_zombie_sessions(client, protected)
             session_id = (
                 session_map.get(session_key)
                 if session_map and session_key else None
@@ -941,9 +880,7 @@ async def opencode_chat_stream(
             # resume path posts it as a question reply, so no prompt POST).
             skip_prompt = False
             # A pending question request owned by the pinned session (the
-            # agent's question tool is waiting on the user).  Detected
-            # BEFORE the busy check: a question session is legitimately
-            # busy and must never be aborted as stuck.
+            # agent's question tool is waiting on the user).
             pending_question_id: Optional[str] = None
             pending_question_count = 0
             if session_id:
@@ -952,14 +889,11 @@ async def opencode_chat_stream(
                 )
             if session_id:
                 # Follow-up in the same conversation: reuse the pinned agent
-                # session so it retains its tool state and context.  But a
-                # session that is STILL BUSY (a previously hung agent tool)
-                # can never accept new work — abort it, drop the pin, and
-                # start fresh instead of queueing behind a zombie.
+                # session so it retains its tool state and context.
                 # A session the serve no longer LISTS is stale: the serve was
                 # recycled (or the session was dropped), so posting to the
                 # pinned id would fail every retry — drop the pin and start
-                # fresh.  Only a SUCCESSFUL status fetch may trigger the
+                # fresh.  Only a SUCCESSFUL existence probe may trigger the
                 # drop; a transport-error fetch keeps the pin conservatively.
                 # A session's real existence must NOT be inferred from
                 # /session/status: the serve's status map only holds BUSY
@@ -972,8 +906,7 @@ async def opencode_chat_stream(
                 # session and the agent lost the task context
                 # ('runs a few commands and then stops').  Existence is
                 # probed with GET /session/<id> (200 = live, 404 =
-                # genuinely gone — serve recycled or dropped).  The status
-                # fetch remains only for the busy-stuck abort below.
+                # genuinely gone — serve recycled or dropped).
                 fetch_ok = False
                 exists = True
                 try:
@@ -982,12 +915,6 @@ async def opencode_chat_stream(
                     exists = get_resp.status_code == 200
                 except (httpx.HTTPError, ValueError):
                     pass
-                st = None
-                try:
-                    st_resp = await BACKEND.fetch_session_status(client)
-                    st = (st_resp.json().get(session_id) or {}).get("type")
-                except (httpx.HTTPError, ValueError):
-                    st = None
                 if fetch_ok and not exists:
                     # Stale pin: a successful existence probe shows the
                     # session is gone — no abort POST is needed (aborting
@@ -999,23 +926,6 @@ async def opencode_chat_stream(
                     pending_permissions.pop(session_id, None)
                     if session_map is not None and session_key:
                         session_map.pop(session_key, None)
-                    session_id = None
-                elif st == "busy" and not just_approved_permission and not pending_question_id:
-                    # A session that just resumed after a permission
-                    # approval is legitimately busy executing the approved
-                    # tool (or generating its summary) — do NOT abort it.
-                    # Only a busy session with NO such resume is stuck.
-                    # Same for a session with a pending question (the agent
-                    # is waiting on the user, not stuck).
-                    logger.warning(
-                        "pinned session %s is busy (likely stuck) — aborting and starting fresh",
-                        session_id[:16],
-                    )
-                    await _abort_stream_session_best_effort(
-                        client, session_id,
-                        session_map=session_map, session_key=session_key,
-                        pending_permissions=pending_permissions,
-                    )
                     session_id = None
             # True when the session_id came from the session map (a pin),
             # NOT from a fresh POST /session below — only resumed sessions
@@ -1032,7 +942,7 @@ async def opencode_chat_stream(
             session_busy = True  # assume working until a status event says idle
             seen_question_pids: set[str] = set()
             running_question_times: list[float] = []
-            if resumed:
+            if resumed and session_id is not None:
                 # Seed part state for the resumed conversation so the
                 # polling fallback never replays history or re-surfaces a
                 # stale question that kills the stream.  Best-effort.  The
@@ -1278,10 +1188,9 @@ async def opencode_chat_stream(
                                 elif time.monotonic() - idle_since > _IDLE_GRACE_S:
                                     # The agent looks done, but it may be
                                     # parked on a permission the bridge
-                                    # never answered.  Resolve it BEFORE
-                                    # returning: READ -> auto-allow (tool
-                                    # proceeds), WRITE -> surface a question
-                                    # so the next request answers it.
+                                    # has not relayed yet.  Resolve it BEFORE
+                                    # returning: surface the question so the
+                                    # next request answers it.
                                     pending_perm = await _detect_pending_permission(client, session_id)
                                     if pending_perm:
                                         question = await _handle_permission_event(
@@ -1458,9 +1367,9 @@ async def opencode_chat_stream(
                         # bash gate fires for git ask-rules (commit/push/
                         # reset/rebase).  A headless serve auto-rejects
                         # silently and leaves the tool stuck "running" (the
-                        # bridge wedges).  Auto-allow READ external-dir
-                        # commands; WRITE and git commands yield a question
-                        # and stop so the USER decides on the next request
+                        # bridge wedges).  A permission ask is relayed as a
+                        # question; the stream stops so the USER decides on
+                        # the next request.
                         # (the session stays pinned).
                         if props.get("type") in _RELAYED_PERMISSION_TYPES:
                             question = await _handle_permission_event(
@@ -1638,10 +1547,9 @@ async def opencode_escalation(stage: int, prompt: str) -> str:
     Directs the user prompt to the opencode gentle-orchestrator agent
     OpenRouter.  ``stage`` is informational (passed through to logging).
 
-    Conservative by design: this headless worker path auto-allows READ
-    permissions; WRITE/git asks abort the session with a clear error (no
-    user is present to relay a question, and unprompted grants are never
-    issued).
+    Conservative by design: this headless worker path never grants a
+    permission; a permission ask aborts the session with a clear error (no
+    user is present to relay the question).
     """
     logger.info("OpenCode escalation (stage=%d): %r", stage, prompt[:200])
     return await opencode_chat(prompt, agent=OPENCODE_AGENT)
@@ -2063,61 +1971,6 @@ def _serve_start_epoch_ms() -> Optional[int]:
         return None
 
 
-async def _session_busy_on_current_serve(
-    client: httpx.AsyncClient, session_id: str, serve_start_ms: int,
-) -> bool:
-    """True when the session has a tool part that is RUNNING on the current
-    serve (started after the serve process).  Such sessions are quiet-but-
-    working (e.g. a cycle's main session during a sub-agent phase) and must
-    not be swept as zombies.  Never raises.
-    """
-    try:
-        resp = await BACKEND.fetch_messages(client, session_id)
-        if resp.status_code != 200:
-            return False
-        for m in resp.json():
-            for p in m.get("parts") or []:
-                if p.get("type") != "tool" or p.get("tool") == "question":
-                    continue
-                st = p.get("state") or {}
-                if st.get("status") != "running" or st.get("output"):
-                    continue
-                start = (st.get("time") or {}).get("start")
-                if start is not None and int(start) >= serve_start_ms:
-                    return True
-    except (httpx.HTTPError, OSError, ValueError):
-        pass
-    return False
-
-
-async def _session_over_context_cap(
-    client: httpx.AsyncClient, session_id: str,
-) -> bool:
-    """Rough token estimate of a session's accumulated context.
-
-    Text/reasoning parts only, ~4 chars per token.  The agent inside the
-    session cannot reset its own context (no tools), so the bridge resets
-    it: a pinned session whose estimate exceeds the cap is dropped on the
-    next resume and a fresh session starts.  Never raises; any fetch
-    failure keeps the pin (False).
-    """
-    try:
-        resp = await BACKEND.fetch_messages(client, session_id)
-        if resp.status_code != 200:
-            return False
-        body = resp.json()
-        if not isinstance(body, list):
-            return False
-        total = 0
-        for m in body:
-            for p in m.get("parts") or []:
-                if p.get("type") in ("text", "reasoning"):
-                    total += len(str(p.get("text") or "")) // 4
-        return total > _SESSION_CONTEXT_CAP_TOKENS
-    except (httpx.HTTPError, OSError, ValueError):
-        return False
-
-
 async def _seed_resumed_session_state(
     client: httpx.AsyncClient,
     session_id: str,
@@ -2126,7 +1979,7 @@ async def _seed_resumed_session_state(
     tool_state: dict[str, str],
     seen_question_pids: set[str],
     running_question_times: Optional[list[float]] = None,
-) -> None:
+) -> int:
     """Best-effort seed of per-call part state for a RESUMED pinned session.
 
     The per-call text_lens/tool_state/user_mids are normally fed only by
@@ -2481,61 +2334,3 @@ def _find_serve_pid(port: str) -> Optional[int]:
     except OSError:
         pass
     return None
-
-
-async def _abort_zombie_sessions(
-    client: httpx.AsyncClient,
-    protected_ids: Optional[set[str]] = None,
-) -> None:
-    """Abort sessions that are stuck (busy with no recent activity).
-
-    The opencode serve processes agent sessions through a sequential tool
-    runner: a hung tool (e.g. an agent bash call that never completes)
-    leaves the session busy FOREVER and blocks every later task behind it —
-    which made the bridge look like it "consistently fails" after one
-    zombie session accumulated.  A busy session whose last update is older
-    than a few minutes is stuck, not working; abort it so new tasks get a
-    free slot.  Never raises (best-effort hygiene).
-
-    ``protected_ids`` holds sessions currently pinned as active
-    conversations in the session map.  Pinned sessions sit idle BY DESIGN
-    between user messages (clarifying questions, multi-turn coding), so
-    they are never swept here — the busy-status check at resume time
-    handles the genuinely stuck pinned session instead.
-    """
-    try:
-        resp = await BACKEND.list_sessions(client)
-        if resp.status_code != 200:
-            return
-        now_ms = int(time.time() * 1000)
-        threshold_ms = 240_000
-        serve_start_ms = await asyncio.to_thread(_serve_start_epoch_ms)
-        for s in resp.json():
-            sid = s.get("id")
-            if not sid:
-                continue
-            if protected_ids and sid in protected_ids:
-                # Pinned conversation waiting on the user — not a zombie.
-                continue
-            updated = ((s.get("time") or {}).get("updated") or 0)
-            if updated and now_ms - updated > threshold_ms:
-                if (
-                    serve_start_ms is not None
-                    and updated >= serve_start_ms
-                    and await _session_busy_on_current_serve(
-                        client, sid, serve_start_ms,
-                    )
-                ):
-                    # Quiet but working (sub-agent phase) — not a zombie.
-                    logger.debug(
-                        "opencode session %s quiet but busy — skipped by sweep",
-                        str(sid)[:16],
-                    )
-                    continue
-                logger.warning(
-                    "opencode zombie session %s idle for %.0fs — aborting",
-                    str(sid)[:16], (now_ms - updated) / 1000,
-                )
-                await BACKEND.abort_session(client, sid)
-    except (httpx.HTTPError, OSError, ValueError):
-        return

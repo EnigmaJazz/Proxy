@@ -434,7 +434,7 @@ class TestOpenCodeChat:
             {"type": "reasoning", "text": "thinking..."},
             {"type": "step-finish", "text": None},
         ]
-        result = await opencode_chat("write a test", agent="gentle-orchestrator")
+        result = await opencode_chat("write a test")
         assert result == "DONE"
         urls = [u for _, u in fake_client.calls]
         assert any(u.endswith("/session") for u in urls)
@@ -1052,7 +1052,7 @@ class TestEscalation:
     async def test_escalation_returns_chat_text(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        async def _fake_chat(text: str, *, agent: str = "gentle-orchestrator") -> str:
+        async def _fake_chat(text: str) -> str:
             return f"handled:{text}"
 
         monkeypatch.setattr(opencode_bridge, "opencode_chat", _fake_chat)
@@ -1082,7 +1082,7 @@ class TestRoutesOpenCode:
         captured: list[str] = []
 
         async def _fake_stream(
-            text: str, *, agent: str = "gentle-orchestrator",
+            text: str,
             session_map: Optional[dict[str, str]] = None,
             session_key: Optional[str] = None,
             pending_permissions: Optional[dict[str, tuple[str, bool]]] = None,
@@ -1111,7 +1111,7 @@ class TestRoutesOpenCode:
         from routes import _handle_opencode_request
 
         async def _fake_stream(
-            text: str, *, agent: str = "gentle-orchestrator",
+            text: str,
             session_map: Optional[dict[str, str]] = None,
             session_key: Optional[str] = None,
             pending_permissions: Optional[dict[str, tuple[str, bool]]] = None,
@@ -1149,7 +1149,7 @@ class TestRoutesOpenCode:
         captured: list[str] = []
 
         async def _fake_stream(
-            text: str, *, agent: str = "gentle-orchestrator",
+            text: str,
             session_map: Optional[dict[str, str]] = None,
             session_key: Optional[str] = None,
             pending_permissions: Optional[dict[str, tuple[str, bool]]] = None,

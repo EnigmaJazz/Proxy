@@ -2632,7 +2632,6 @@ async def _opencode_task_response(
         _resp_text: list[str] = []
         async for kind, text_delta in opencode_chat_stream_resilient(
             task_text,
-            agent=OPENCODE_AGENT,
             session_map=session_map,
             session_key=session_key,
             pending_permissions=pending_permissions,
@@ -2703,7 +2702,6 @@ async def _opencode_task_response(
         stream_directory = OPENCODE_BRIDGE_DIRECTORY
     async for kind, text_delta in opencode_chat_stream_resilient(
         task_text,
-        agent=OPENCODE_AGENT,
         session_map=session_map,
         session_key=session_key,
         pending_permissions=pending_permissions,

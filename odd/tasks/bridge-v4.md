@@ -175,9 +175,46 @@ only after its checks were observed.
   `scripts/register-project.ts`, then restart `sandbox-broker.service` and
   `secure-opencode.service`. Alternatively, change `OPENCODE_BRIDGE_DIRECTORY` to a
   directory that is already registered. Ask the user which.
+  - REGISTRATION DONE 2026-10-11 (via `scripts/register-project.ts`); the RESTART is
+    DEFERRED. Output facts: `id: workspace`; local bootstrap; `.atl/` + `.codegraph/`
+    created in the registered workspace; broker env + launcher root added.
+  - DEFERRED because another project has live sessions — a restart of
+    `sandbox-broker.service` / `secure-opencode.service` would drop them. User action
+    when those sessions are clear (exact pending command):
+    `systemctl restart sandbox-broker.service secure-opencode.service`
+  - Checkbox stays UNCHECKED until the user confirms both restarts.
 - [ ] **T8 (ct-58465)** Full test suite, then a live probe: one bridged request on port
   4096 whose `grep` permission prompt is resolved by the user through `opencode-perm`.
   - T8 must VERIFY the mitigation transfer: confirm the secure server's own agent config (the agent the server selects) carries the orchestration and tool guidance the bridge prompt used to impose — the bash-first / retry-ONCE tool discipline against the known upstream serve tool wedge, and the multi-step work-continuity expectation. If that config lacks it, bridge streams can regress to the documented wedge/hang behaviour even though this review approved the prompt shrink (T6 advisory R4-prompt-mitigation-transfer).
+  - T8 runbook (probe prepared, NOT yet run — restart for T7 is pending):
+    1. **Precondition check** — the probe checks and prints, each PASS/FAIL/UNKNOWN with
+       evidence: the proxy process env has `OPENCODE_BACKEND=secure` (read from the
+       unit's MainPID `/proc/<pid>/environ` / `Environment=`, else the probe's own env);
+       the secure server answers `GET OPENCODE_SECURE_SERVE_URL + "/config"` (URL read
+       from `constants`, bounded timeout); `OPENCODE_BRIDGE_DIRECTORY` exists and is a
+       directory; the workspace carries the registration artifacts (`.atl/`,
+       `.codegraph/`) — a missing artifact is reported as "looks PRE-RESTART", not
+       guessed.
+    2. **Single probe command** — `.venv/bin/python scripts/probe_secure_bridge.py`
+       (one bridged request: proxy public `POST /v1/chat/completions` with
+       `model: "opencode"`, streamed; the prompt forces glob → grep → read → write of a
+       new file OUTSIDE the workspace — the likely permission trigger). Exit codes:
+       0 ok, 1 acceptance failed, 2 blocking precondition failed, 3 parked on a manual
+       prompt, 4 inconclusive.
+    3. **Manual prompt resolution (NOT automatable)** — if the write-outside step parks,
+       the stream shows `🔐 waiting on a permission prompt …`; the probe waits a bounded
+       window (`--prompt-wait`, default 600s) printing what it waits for, then exits 3.
+       The user resolves out-of-band with `opencode-perm once <id>` (or
+       `opencode-perm deny <id>`; form taken from the T0 mapping, not re-verified by the
+       probe), then re-runs. A fully-preallowed server config (NO prompt) is a valid,
+       reportable outcome, not a failure.
+    4. **Mitigation-transfer check** — T6 advisory R4-prompt-mitigation-transfer: confirm
+       the secure server's own agent config (the agent it selects) carries the bash-first
+       / retry-ONCE tool discipline against the known serve tool wedge AND the multi-step
+       work-continuity expectation the shrunken bridge prompt no longer imposes. Inspect
+       the `GET /config` body the probe fetches (its top-level keys + agent names are
+       printed). If that config lacks the guidance, bridge streams can regress to the
+       documented wedge/hang.
 - [ ] **T9 (ct-58671)** After the probe passes, delete the bridge-owned server code, the
   serve config template, `opencode_chamber.py` and `OpenChamberBackend`, with their
   constants and tests.
@@ -277,3 +314,6 @@ non-trivial files). T7 and the T8 probe need the user.
 - 2026-10-11: T6 DONE — the bridge chooses no model and carries only the channel prompt. Commit 692e52a (5 files, +210/-93). Host suite 586 passed; the .gga hook PASSED (no bypass). PART A: `_BRIDGE_SYSTEM_PROMPT` (opencode_bridge.py:70-83) shrunk to the channel contract only — KEPT the API-facing identity line, the language policy, the single-stream reply clause, the turn-end/interactive-question contract and the NARRATE stream-liveness block; DROPPED the WORK CONTINUITY multi-step orchestration, the reasonable-assumptions guidance and the serve-specific TOOL RULES (glob/grep/bash wedge workaround). The header comment now states the agent config owns orchestration and tool policy. PART B: the model-override producer is gone — the `model` block in `_build_send_payload` and the whole `model_id`/`provider_id` parameter chain from the ABC through ServeBackend, OpenChamberBackend, opencode_chat / _opencode_chat_attempt / opencode_chat_stream and every forward. It was already dormant (no request-path caller ever passed a non-None model_id), so this removes dead capability and makes the invariant structural. PART C verified, not changed: every config-producing path already early-returns under a non-owning backend, so the proxy already uses no serve config of its own (T9 owns deleting the dormant code). Tests: `test_bridge_prompt_carries_only_channel_contract` (kept lines present, dropped directives absent), `test_send_signatures_carry_no_model_override_params`, `test_send_payload_never_carries_model_override`, and `TestRelayEveryPermission` closing the carried R3-read-permission-coverage advisory — it proved ALL THREE relay assertions for the formerly-auto-allowed external_directory class were missing (blocking path, event-bus path, idle resolver) and adds them.
 - 2026-10-11: T6 REVIEW OUTCOME — APPROVED, authority burned (lineage review-6c8716f4feaf045c, high, 4/4 lenses). The risk lens found no findings and read the override removal as a hardening change that closes a prompt-injection-style vector; readability and reliability were clean.
 - 2026-10-11: T6 advisories carried (both non-blocking): R4-prompt-mitigation-transfer (WARNING, disposition "worsened", opencode_bridge.py:74-78) the prompt rewrite drops two prompt-level stall mitigations — the WORK CONTINUITY multi-step discipline (per-step turn-ending cost ~65 manual continue pings per task, observed 2026-08-14) and the TOOL RULES bash-first + retry-ONCE guard against the serve's indefinite glob/grep/read tool wedge — and transfers both to the server's own agent config, which NOTHING in this candidate inspects or verifies; if that config lacks an equivalent tool policy, bridge streams regress to the documented wedge behaviour, where the bridge's own detection only emits a deduped status and keeps the stream alive without unsticking the task. R4-openchamber-permission-blind-spot (WARNING, pre-existing, opencode_backends.py:95) OpenChamberBackend advertises answers_permissions True while its polling discovery returns no records, so a permission outside a live SSE window is never detected — the same finding as T5's R4-003, tracked to disappear with openchamber's deletion in T9.
+
+- T8 route evidence — route: delegated; specialist: odd-apply; trigger: secure policy (all mutations delegated) + new script.
+- 2026-10-11: T8 PROBE PREPARED (NOT yet run). Added `scripts/probe_secure_bridge.py` — a runnable probe of the secure bridge path: precondition checks (proxy `OPENCODE_BACKEND=secure`, secure `GET /config`, workspace exists, registration artifacts), ONE bridged request through the proxy's public chat-completions endpoint (`model: "opencode"`, streamed) with a tool-sequence prompt (glob → grep → read → write OUTSIDE the workspace), the five T8 acceptance facts, and an explicit bounded manual-permission-prompt path (exit 3). Tracker: T7 registration recorded (restart DEFERRED), T8 runbook block added. Checks observed: `python3 -m py_compile scripts/probe_secure_bridge.py` clean (worker python3 3.13.5; no httpx/fastapi/pytest/network, so neither the host suite nor the probe itself can run in the sandbox). The probe was NOT run against the live server; the broker/secure restart is still pending (T7).

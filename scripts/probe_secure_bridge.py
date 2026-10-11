@@ -3,9 +3,16 @@
 
 Checks the secure-bridge preconditions, then sends exactly ONE bridged request
 through the proxy's PUBLIC API (``POST /v1/chat/completions`` with
-``model: "opencode"``, streamed).  The prompt forces the agent to exercise tools
-in sequence: a glob, a grep, a read of a known file, and a WRITE of a new file
-OUTSIDE the workspace (the write is the likely permission trigger).
+``model: "opencode"``, streamed).  The prompt asks the agent to exercise tools
+in sequence: a glob, a grep, a read of a known file, and the OUTCOME of a new
+file OUTSIDE the workspace (the write — the likely permission trigger — which a
+read-only agent MUST delegate to a writable worker through its subagent/task
+tool).
+
+NOTE (glob/grep scoping): the glob and grep steps target the same directory as
+the read step; when glob/grep report ``search path does not exist`` while read
+succeeds there, that is the ENVIRONMENT's normal tool scoping — not a bridge
+result and not a bridge failure.  The probe does not try to fix it.
 
 This is a CLI: stdout IS the deliverable (the streamed reply plus the
 PASS/FAIL/UNKNOWN report), so the ``print()`` calls below are the AGENTS.md
@@ -38,6 +45,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -69,6 +77,10 @@ EXIT_UNKNOWN = 4
 #: ``🔧 <name>`` (opencode_bridge._yield_part_deltas).  Duplicated so the probe
 #: stays import-light and runs even if the bridge module cannot import.
 _TOOLS = ("glob", "grep", "read", "write")
+#: Tool names for a subagent/delegation invocation.  The opencode delegation
+#: tool is ``task`` (``subagent`` covers an alias); the bridge renders any tool
+#: as ``✅ <name> done`` / ``🔧 <name>`` / ``⚠️ <name> failed``.
+_DELEGATION_TOOLS = ("task", "subagent")
 #: Exact content the agent must write to the outside-workspace file.
 _WRITE_CONTENT = "secure-bridge-probe-ok"
 #: Prefix of the token in the known read file.
@@ -98,6 +110,7 @@ class ProbeOutcome:
     completed_tools: list[str] = field(default_factory=list)
     running_tools: list[str] = field(default_factory=list)
     failed_tools: list[str] = field(default_factory=list)
+    delegation_signals: list[str] = field(default_factory=list)
     text: list[str] = field(default_factory=list)
     stream_error: str = ""
 
@@ -269,12 +282,15 @@ def _build_prompt(
             "   and report its first line.",
         ]
     lines += [
-        f"4. WRITE: use the write tool to create a NEW file at the absolute path "
-        f"{write_path}",
-        f"   (OUTSIDE the current workspace) with exactly this content: {_WRITE_CONTENT}",
+        f"4. WRITE OUTCOME: the file at the absolute path {write_path} (OUTSIDE the",
+        f"   current workspace) must exist with exactly this content: {_WRITE_CONTENT}",
+        "   You may be a read-only agent: if you have no write/edit/apply_patch tool of",
+        "   your own, you MUST delegate this write to a writable worker using your",
+        "   subagent / delegation (task) tool, and make sure the delegated write lands.",
         "",
         "Finally reply with a short numbered summary: for each step, name the tool you",
-        "used and whether it completed.",
+        "used and whether it completed. For step 4 say whether you wrote directly or",
+        "delegated, and if you delegated, name the delegate.",
     ]
     return "\n".join(lines)
 
@@ -305,6 +321,15 @@ def _apply_chunk(chunk: dict[str, Any], outcome: ProbeOutcome, marker: str) -> N
             outcome.running_tools.append(tool)
         if f"⚠️ {tool} failed" in text and tool not in outcome.failed_tools:
             outcome.failed_tools.append(tool)
+    for tool in _DELEGATION_TOOLS:
+        if tool in outcome.delegation_signals:
+            continue
+        if (
+            f"✅ {tool} done" in text
+            or f"🔧 {tool}" in text
+            or f"⚠️ {tool} failed" in text
+        ):
+            outcome.delegation_signals.append(tool)
 
 
 async def _pump_lines(resp: httpx.Response, queue: "asyncio.Queue[Optional[str]]") -> None:
@@ -433,10 +458,46 @@ def _scan_sessions(data_dir: Path, since: float, *, cap: int = 20000) -> Optiona
     return newest[1] if newest else None
 
 
+#: Delegation verbs/phrases the agent's own summary may use.
+_DELEGATION_CUES = ("delegat", "subagent", "sub-agent", "handed off", "handed over")
+#: A delegation statement that NAMES the delegate (``... to <Name>``).  Used
+#: only as a prose fallback: never a PASS basis without the file on disk.
+_DELEGATE_NAME_RE = re.compile(
+    r"(?:delegat\w*|handed (?:off|over))\s+"
+    r"(?:the\s+\S+\s+)?to\s+(?:the\s+)?([A-Za-z][A-Za-z0-9_.-]{2,})",
+    re.IGNORECASE,
+)
+#: Tokens that are NOT delegate names (English words a delegation sentence uses).
+_NOT_A_DELEGATE = frozenset({
+    "the", "a", "an", "my", "its", "our", "your", "it", "them", "him", "her",
+    "you", "us", "me", "worker", "writable", "subagent", "sub-agent", "agent",
+    "delegate", "task", "tool", "write", "writes", "writer", "file", "path",
+    "sandbox", "one", "someone", "another",
+})
+
+
+def _named_delegate(text: str) -> Optional[str]:
+    """Return the delegate name when the summary says it delegated to one.
+
+    Conservative prose-only fallback: requires a delegation cue AND a
+    ``delegated ... to <Name>`` token that is not a common English word.  The
+    stream marker is the primary evidence; this supports a PASS only when the
+    file on disk also exists.
+    """
+    if not any(cue in text.lower() for cue in _DELEGATION_CUES):
+        return None
+    match = _DELEGATE_NAME_RE.search(text)
+    if match is None:
+        return None
+    name = match.group(1)
+    return None if name.lower() in _NOT_A_DELEGATE else name
+
+
 def _acceptance_facts(
     outcome: ProbeOutcome, write_path: str, since: float,
 ) -> list[Check]:
-    """The five T8 acceptance facts, each PASS/FAIL/UNKNOWN with evidence."""
+    """The T8 acceptance facts: the five originals plus a delegation fact 2b
+    after fact 2, each PASS/FAIL/UNKNOWN with evidence."""
     facts: list[Check] = []
 
     if outcome.received_reply:
@@ -472,6 +533,35 @@ def _acceptance_facts(
         ))
 
     ok, content = _read_write_file(write_path)
+    named_delegate = _named_delegate("".join(outcome.text))
+    stream_write = (
+        "write" in outcome.completed_tools or "write" in outcome.running_tools
+    )
+    if outcome.delegation_signals:
+        facts.append(Check(
+            "2b. delegation observed", "PASS",
+            "stream shows a subagent/delegation tool marker: "
+            + ", ".join(outcome.delegation_signals),
+        ))
+    elif named_delegate and ok:
+        facts.append(Check(
+            "2b. delegation observed", "PASS",
+            f"no stream marker; the agent's summary names the delegate "
+            f"{named_delegate!r} AND {write_path} exists (prose + on-disk sources)",
+        ))
+    elif stream_write or ok:
+        source = "a write tool marker" if stream_write else f"the on-disk file {write_path}"
+        facts.append(Check(
+            "2b. delegation observed", "FAIL",
+            f"no delegation observed, but the write outcome is present ({source}); "
+            "the read-only agent was expected to delegate the write",
+        ))
+    else:
+        facts.append(Check(
+            "2b. delegation observed", "UNKNOWN",
+            "the stream shows neither a write nor a delegation",
+        ))
+
     if ok and _WRITE_CONTENT in content:
         facts.append(Check(
             "3. work is on disk", "PASS", f"{write_path} contains {_WRITE_CONTENT!r}",

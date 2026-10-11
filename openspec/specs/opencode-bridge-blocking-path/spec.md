@@ -24,16 +24,16 @@ While the blocking message POST is in flight, `opencode_chat` SHALL poll `_detec
 - THEN the loop exits with no extra HTTP calls beyond the poll cadence
 - AND the result is the extracted assistant text
 
-### REQ-2: READ permissions are auto-allowed
+### REQ-2: READ permissions never reach the relay
 
-A permission classified "read" by the shared `_classify_permission_access` SHALL be auto-allowed (POST "always" via the shared handler) and the POST SHALL be allowed to complete normally.
+Read access (`read`, `glob`, `grep`) is pre-allowed in the serve config, so a read tool never produces a permission record — it never reaches the relay. Every permission record that does reach `_handle_permission_event` SHALL be surfaced as a question; the bridge SHALL NOT auto-allow it (there is no POST "always").
 
-#### Scenario-1: READ record appears mid-flight
+#### Scenario-1: READ tool runs mid-flight
 
-- GIVEN a pending permission record classified as read
-- WHEN the poller handles it
-- THEN the permission response "always" is posted
-- AND `opencode_chat` returns the completed message text
+- GIVEN the agent calls a read/glob/grep tool
+- WHEN the serve evaluates that tool's permission
+- THEN the serve config's pre-allow answers it, so no permission record reaches the relay
+- AND `opencode_chat` returns the completed message text with no permission POST
 
 ### REQ-3: WRITE permissions are never granted unprompted on the headless path
 

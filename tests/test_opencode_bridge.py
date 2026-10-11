@@ -68,6 +68,10 @@ class _FakeClient:
         self.raise_timeout_on = ""
         self.get_timeouts: list[Any] = []
         self.stream_lines: list[str] = []
+        # The dial URL of every client.stream(...) call — lets a test assert
+        # the /event bus targets the ACTIVE backend's base_url, never the raw
+        # bridge-owned OPENCODE_SERVE_URL constant (T8-found regression).
+        self.stream_calls: list[str] = []
         self.message_get_parts: list[dict[str, Any]] = []
         # Blocking-path scripting (opencode_chat hardening): scripted
         # GET /permission records and a message POST that hangs briefly so
@@ -158,6 +162,11 @@ class _FakeClient:
         return _FakeResp(self.message_status, {"parts": self.message_parts})
 
     def stream(self, *args: Any, **kwargs: Any) -> _FakeStream:
+        # Record the dial target (client.stream("GET", url)) so a test can
+        # assert the /event bus follows the ACTIVE transport's base_url.
+        self.stream_calls.append(
+            args[1] if len(args) > 1 else str(kwargs.get("url", "")),
+        )
         if self.raise_on_stream:
             raise httpx.ConnectError("conn refused")
         return _FakeStream(self.stream_lines)
@@ -4560,3 +4569,64 @@ class TestContextCapReset:
         assert "fresh start answer" in joined
         # The pin was dropped and a fresh session was created.
         assert any(u.endswith("/session") for u, _ in client.post_calls)
+
+
+class TestEventBusDialTargetsActiveBackend:
+    """T8-found regression: the ``/event`` bus dial must follow the ACTIVE
+    transport's ``BACKEND.base_url``, never the raw bridge-owned
+    ``OPENCODE_SERVE_URL`` constant.
+
+    The constant points at the bridge's own serve port (18900) while the
+    secure transport lives on 4096, so the pre-fix code opened the bus at
+    the wrong port (opencode_bridge.py:1100).  Because the bus is opened
+    BEFORE the prompt POST, the connect failure ended the attempt, the fresh
+    session was aborted, and ``BACKEND.send_prompt`` was never reached —
+    every bridged request failed instantly under ``OPENCODE_BACKEND=secure``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_event_bus_targets_secure_backend_base_url(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from opencode_backends import SecureBackend
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        monkeypatch.setattr(opencode_bridge, "BACKEND", SecureBackend())
+        client = _FakeClient()
+        client.stream_lines = _stream_events()
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        deltas = [d async for d in opencode_chat_stream("task", pending_permissions=PP)]
+
+        secure_base = SecureBackend.base_url  # http://127.0.0.1:4096
+        assert client.stream_calls == [f"{secure_base}/event"]
+        assert opencode_bridge.OPENCODE_SERVE_URL not in client.stream_calls[0]
+        # The prompt WAS reached (the pre-fix bug aborted BEFORE send_prompt).
+        assert any("prompt_async" in u for u, _ in client.post_calls)
+        assert "Done." in "".join(t for _, t in deltas)
+
+    @pytest.mark.asyncio
+    async def test_event_bus_targets_default_serve_base_url(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from opencode_backends import ServeBackend
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        monkeypatch.setattr(opencode_bridge, "BACKEND", ServeBackend())
+        client = _FakeClient()
+        client.stream_lines = _stream_events()
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        deltas = [d async for d in opencode_chat_stream("task", pending_permissions=PP)]
+
+        assert client.stream_calls == [f"{ServeBackend.base_url}/event"]
+        assert client.stream_calls == [f"{opencode_bridge.OPENCODE_SERVE_URL}/event"]
+        assert "Done." in "".join(t for _, t in deltas)

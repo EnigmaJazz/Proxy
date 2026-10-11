@@ -8,11 +8,14 @@ real daemon is ever started: ``ensure_openchamber_daemon`` and
 """
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
 import os
+import subprocess
+import types
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import httpx
 import pytest
@@ -578,3 +581,222 @@ async def test_send_message_transient_failure_then_daemon_death(
                 timeout=1.0,
             )
     assert poll_n[0] == 2
+
+
+# -- Secure backend (bridge v4, T4) -----------------------------------------
+
+@pytest.mark.parametrize(
+    ("env_value", "expected"),
+    [
+        (None, "ServeBackend"),
+        ("serve", "ServeBackend"),
+        ("bogus", "ServeBackend"),
+        ("openchamber", "OpenChamberBackend"),
+        ("secure", "SecureBackend"),
+    ],
+)
+def test_backend_selector_maps_each_value(
+    monkeypatch: pytest.MonkeyPatch,
+    env_value: Optional[str],
+    expected: str,
+) -> None:
+    """secure/serve/unset/unknown/openchamber each pick the right class."""
+    if env_value is None:
+        monkeypatch.delenv("OPENCODE_BACKEND", raising=False)
+    else:
+        monkeypatch.setenv("OPENCODE_BACKEND", env_value)
+    mod = importlib.reload(ob)
+    assert type(mod.BACKEND).__name__ == expected
+    # Restore the production default for the rest of the suite.
+    monkeypatch.delenv("OPENCODE_BACKEND", raising=False)
+    importlib.reload(ob)
+
+
+def test_secure_backend_owns_no_server() -> None:
+    """SecureBackend is a concrete ServeBackend pointed at 127.0.0.1:4096
+    that never owns the server lifecycle; the other two still do."""
+    assert ob.SecureBackend.__abstractmethods__ == frozenset()
+    assert issubclass(ob.SecureBackend, ob.ServeBackend)
+    assert ob.SecureBackend.base_url == "http://127.0.0.1:4096"
+    assert ob.SecureBackend.owns_server is False
+    assert ob.ServeBackend.owns_server is True
+    assert ob.OpenChamberBackend.owns_server is True
+
+
+class _RecordingResp:
+    def __init__(self, status_code: int = 200) -> None:
+        self.status_code = status_code
+
+
+class _RecordingClient:
+    """httpx.AsyncClient stand-in that records every URL it is asked to hit."""
+
+    def __init__(self) -> None:
+        self.urls: list[str] = []
+
+    async def get(self, url: str, **kwargs: Any) -> _RecordingResp:
+        self.urls.append(url)
+        return _RecordingResp()
+
+    async def post(self, url: str, **kwargs: Any) -> _RecordingResp:
+        self.urls.append(url)
+        return _RecordingResp()
+
+
+@pytest.mark.asyncio
+async def test_secure_backend_urls_target_port_4096() -> None:
+    """Every one of the 13 ABC primitives builds a URL at 127.0.0.1:4096."""
+    backend = ob.SecureBackend()
+    client = _RecordingClient()
+    await backend.create_session(client, directory="/tmp/work")
+    await backend.send_prompt(
+        client, "ses1", agent="a", system_prompt="s", user_text="u",
+        model_id=None, provider_id="kinver",
+    )
+    await backend.fetch_messages(client, "ses1")
+    await backend.session_exists(client, "ses1")
+    await backend.abort_session(client, "ses1")
+    await backend.send_message(
+        client, "ses1", agent="a", system_prompt="s", user_text="u",
+        model_id=None, provider_id="kinver", timeout=1.0,
+    )
+    await backend.fetch_message(client, "ses1", "mid1")
+    await backend.fetch_session_status(client)
+    await backend.list_sessions(client)
+    await backend.fetch_permissions(client)
+    assert await backend.reply_permission(client, "ses1", "pid1", "always")
+    await backend.fetch_questions(client)
+    assert await backend.reply_question(client, "ses1", "qid1", "yes", 1)
+    assert client.urls, "recorder saw no calls"
+    assert all(
+        u.startswith("http://127.0.0.1:4096/") for u in client.urls
+    ), client.urls
+
+
+class _DownAsyncClient:
+    """httpx.AsyncClient stand-in whose GET raises (server down)."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    async def __aenter__(self) -> "_DownAsyncClient":
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        return None
+
+    async def get(self, url: str, **kwargs: Any) -> _RecordingResp:
+        raise httpx.ConnectError("connection refused")
+
+
+class _UpAsyncClient:
+    """httpx.AsyncClient stand-in whose GET answers (server up)."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    async def __aenter__(self) -> "_UpAsyncClient":
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        return None
+
+    async def get(self, url: str, **kwargs: Any) -> _RecordingResp:
+        return _RecordingResp(200)
+
+
+@pytest.fixture
+def _lifecycle_recorders(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[str], list[tuple[int, int]]]:
+    """Record every subprocess creation and every signal sent."""
+    created: list[str] = []
+    signals: list[tuple[int, int]] = []
+
+    def _rec_popen(*args: Any, **kwargs: Any) -> Any:
+        created.append("subprocess.Popen")
+        return types.SimpleNamespace(pid=424242)
+
+    def _rec_run(*args: Any, **kwargs: Any) -> Any:
+        created.append("subprocess.run")
+        return types.SimpleNamespace(returncode=0)
+
+    async def _rec_exec(*args: Any, **kwargs: Any) -> Any:
+        created.append("asyncio.create_subprocess_exec")
+        return types.SimpleNamespace(pid=424242)
+
+    monkeypatch.setattr(subprocess, "Popen", _rec_popen)
+    monkeypatch.setattr(subprocess, "run", _rec_run)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _rec_exec)
+    monkeypatch.setattr(os, "kill", lambda pid, sig: signals.append((pid, sig)))
+    monkeypatch.setattr(
+        os, "killpg", lambda pid, sig: signals.append((pid, sig)),
+    )
+    return created, signals
+
+
+@pytest.mark.asyncio
+async def test_secure_ensure_probe_only_when_down(
+    monkeypatch: pytest.MonkeyPatch,
+    _lifecycle_recorders: tuple[list[str], list[tuple[int, int]]],
+) -> None:
+    """Server DOWN under the secure backend: ensure is a pure probe — it
+    returns False, the failure text names the secure server, and no
+    subprocess is created and no signal is sent."""
+    import opencode_bridge as obr
+
+    created, signals = _lifecycle_recorders
+    monkeypatch.setattr(obr, "BACKEND", ob.SecureBackend())
+    monkeypatch.setattr(obr.httpx, "AsyncClient", _DownAsyncClient)
+
+    assert await obr.ensure_opencode_serve() is False
+    assert created == []
+    assert signals == []
+    msg = obr._serve_unreachable_message()
+    assert "secure" in msg and "4096" in msg, msg
+    # The blocking caller surfaces that same clear error and still spawns
+    # nothing (ensure returns False before any httpx client is built).
+    err = await obr.opencode_chat("hello", timeout=1.0)
+    assert "secure" in err and "4096" in err, err
+    assert created == []
+    assert signals == []
+
+
+@pytest.mark.asyncio
+async def test_secure_ensure_probe_only_when_up(
+    monkeypatch: pytest.MonkeyPatch,
+    _lifecycle_recorders: tuple[list[str], list[tuple[int, int]]],
+) -> None:
+    """Server UP under the secure backend: ensure returns True and still
+    never spawns or signals (this is the proxy.py startup call path)."""
+    import opencode_bridge as obr
+
+    created, signals = _lifecycle_recorders
+    monkeypatch.setattr(obr, "BACKEND", ob.SecureBackend())
+    monkeypatch.setattr(obr.httpx, "AsyncClient", _UpAsyncClient)
+
+    assert await obr.ensure_opencode_serve() is True
+    assert created == []
+    assert signals == []
+
+
+@pytest.mark.asyncio
+async def test_secure_lifecycle_functions_are_noops(
+    monkeypatch: pytest.MonkeyPatch,
+    _lifecycle_recorders: tuple[list[str], list[tuple[int, int]]],
+) -> None:
+    """The guard sites themselves: recycle / force-recycle / spawn /
+    config-sync all return immediately under a non-owning backend — no
+    subprocess and no SIGTERM, even when called directly."""
+    import opencode_bridge as obr
+
+    created, signals = _lifecycle_recorders
+    monkeypatch.setattr(obr, "BACKEND", ob.SecureBackend())
+
+    await obr._recycle_serve_if_low_memory()
+    await obr._force_recycle_serve("test")
+    assert await obr._spawn_serve(None) is False
+    obr._sync_serve_config()
+
+    assert created == []
+    assert signals == []

@@ -185,6 +185,13 @@ ALL_MODEL_KEYS: tuple[str, ...] = tuple(
 # opencode agent instead of a local llama model.
 OPENCODE_SERVE_URL: str = "http://127.0.0.1:18900"
 
+# The systemd-owned secure-opencode server (bridge v4, T4).  Unlike
+# OPENCODE_SERVE_URL, the proxy NEVER owns this server's lifecycle: the
+# secure backend performs a health probe only — no spawn, no recycle, no
+# config sync, no auth copy and no SIGTERM.  Selected by
+# OPENCODE_BACKEND=secure; a down server is the user's to start.
+OPENCODE_SECURE_SERVE_URL: str = "http://127.0.0.1:4096"
+
 # OpenChamber daemon for the bridge's second transport (openchamber-bridge
 # backend, step 2+).  The bridge owns its lifecycle like the serve: the
 # daemon spawns on a fixed loopback port with ISOLATED XDG homes under

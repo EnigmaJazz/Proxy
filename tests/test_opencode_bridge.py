@@ -1078,7 +1078,6 @@ class TestRoutesOpenCode:
             session_map: Optional[dict[str, str]] = None,
             session_key: Optional[str] = None,
             pending_permissions: Optional[dict[str, tuple[str, bool]]] = None,
-            just_approved_permission: bool = False,
             system_prompt: str = "",
             timeout: float = 600.0,
             directory: Optional[str] = None,
@@ -1109,7 +1108,6 @@ class TestRoutesOpenCode:
             session_map: Optional[dict[str, str]] = None,
             session_key: Optional[str] = None,
             pending_permissions: Optional[dict[str, tuple[str, bool]]] = None,
-            just_approved_permission: bool = False,
             system_prompt: str = "",
             timeout: float = 600.0,
             directory: Optional[str] = None,
@@ -1149,7 +1147,6 @@ class TestRoutesOpenCode:
             session_map: Optional[dict[str, str]] = None,
             session_key: Optional[str] = None,
             pending_permissions: Optional[dict[str, tuple[str, bool]]] = None,
-            just_approved_permission: bool = False,
             system_prompt: str = "",
             timeout: float = 600.0,
             directory: Optional[str] = None,
@@ -1971,6 +1968,337 @@ class TestPermissionRelayPolicy:
         # and NO bare blocking /message POST (the old opencode_chat drop path).
         assert any("prompt_async" in u for u, _ in client.post_calls)
         assert not any("/message" in u for u, _ in client.post_calls)
+
+
+# ---------------------------------------------------------------------------
+# Secure-backend permission gate (T5, ct-58464)
+# ---------------------------------------------------------------------------
+
+async def _ensure_true(*args: Any, **kwargs: Any) -> bool:
+    """Async True stub for ``ensure_opencode_serve``."""
+    return True
+
+
+async def _drain_bounded(
+    stream: AsyncIterator[tuple[str, str]], *, timeout: float = 2.5,
+    stop_on: Any = None,
+) -> list[tuple[str, str]]:
+    """Collect a bridge stream for at most ``timeout`` seconds.
+
+    The secure-backend stream stays alive while a permission is pending
+    (prompts resolve out-of-band), so a test cannot await full completion;
+    it bounds the collection and then cancels the generator.  ``stop_on``
+    ends the collection early once the collected deltas satisfy it."""
+    out: list[tuple[str, str]] = []
+
+    async def _collect() -> None:
+        async for item in stream:
+            out.append(item)
+            if stop_on is not None and stop_on(out):
+                return
+
+    task = asyncio.create_task(_collect())
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+    except asyncio.TimeoutError:
+        pass
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    return out
+
+
+def _saw_waiting_status(deltas: list[tuple[str, str]]) -> bool:
+    """``stop_on`` predicate for ``_drain_bounded``: True once the drained
+    deltas contain the secure-backend waiting-permission status.
+
+    Matches the production ``_WAITING_PERMISSION_STATUS`` text instead of a
+    hardcoded guess so the stop predicate cannot drift from what the bridge
+    actually emits (the secure stream stays open while a permission is
+    pending, so the drain must end on that status)."""
+    return any(
+        kind == "status"
+        and opencode_bridge._WAITING_PERMISSION_STATUS in text
+        for kind, text in deltas
+    )
+
+
+def _pending_write_perm() -> dict[str, Any]:
+    return {
+        "id": "perm_w", "sessionID": "ses_0001",
+        "permission": "write",
+        "patterns": ["/home/user/out.txt"],
+        "tool": {"messageID": "msg_a", "callID": "call_w"},
+    }
+
+
+class _SecurePermissionClient(_FakeClient):
+    """_FakeClient scripting for the secure-backend permission tests: a
+    finite or blocking /event bus plus scripted message-list / session-status
+    / permission reads for the polling paths."""
+
+    def __init__(self, *, blocking: bool = False) -> None:
+        super().__init__()
+        self.blocking = blocking
+        self.lines: list[str] = []
+        self.poll_messages: list[dict[str, Any]] = []
+        self.status_type = "idle"
+        self.permission_records: list[dict[str, Any]] = []
+
+    def stream(self, *args: Any, **kwargs: Any) -> _FakeStream:
+        if self.blocking:
+            return _BlockingStream(self.lines)
+        return _FakeStream(self.lines)
+
+    async def get(self, url: str, **kwargs: Any) -> _FakeResp:
+        if url.endswith(f"/session/{self.session_id}/message"):
+            return _FakeResp(200, self.poll_messages)
+        if url.endswith("/permission"):
+            return _FakeResp(200, self.permission_records)
+        if "/session/status" in url:
+            return _FakeResp(200, {self.session_id: {"type": self.status_type}})
+        return await super().get(url, **kwargs)
+
+
+class TestSecurePermissionGate:
+    """T5 (ct-58464): the secure backend answers NO permission — no relay,
+    no pending entry, no POST — and reports the wait on the stream.  The
+    relay stays byte-identical on the answering backends."""
+
+    @pytest.mark.asyncio
+    async def test_secure_sse_event_reports_wait_no_relay_no_post(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """SSE path (permission.updated): the secure backend emits the
+        waiting status instead of a question and POSTs nothing."""
+        from opencode_bridge import opencode_chat_stream
+        from opencode_backends import SecureBackend
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _ensure_true)
+        monkeypatch.setattr(opencode_bridge, "BACKEND", SecureBackend())
+        client = _SecurePermissionClient()
+        client.lines = [
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_user", "role": "user"}),
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_a", "role": "assistant"}),
+            _evt("permission.updated", sessionID="ses_0001",
+                 id="perm_w", type="write",
+                 title="Allow writing to /home/user/out.txt",
+                 metadata={"filepath": "/home/user/out.txt"}),
+        ]
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        deltas = await _drain_bounded(
+            opencode_chat_stream("task", pending_permissions=PP),
+            stop_on=_saw_waiting_status,
+        )
+
+        assert any(
+            k == "status" and "waiting on a permission" in t for k, t in deltas
+        ), deltas
+        assert [k for k, _ in deltas if k == "question"] == []
+        assert [u for u, _ in client.post_calls if "/permissions/" in u] == []
+        assert PP.get("ses_0001") is None
+
+    @pytest.mark.asyncio
+    async def test_secure_polling_path_reports_wait_once_no_post(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Polling wedge path (GET /permission): the waiting status is
+        emitted ONCE (deduped) and no question/POST fires."""
+        from opencode_bridge import opencode_chat_stream
+        from opencode_backends import SecureBackend
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _ensure_true)
+        monkeypatch.setattr(opencode_bridge, "BACKEND", SecureBackend())
+        monkeypatch.setattr(opencode_bridge, "_WEDGE_CHECK_INTERVAL_S", 0.01)
+        monkeypatch.setattr(opencode_bridge, "_TOOL_WEDGE_AFTER_S", 60.0)
+        client = _SecurePermissionClient()
+        client.lines = []  # bus closes → polling fallback
+        client.status_type = "busy"
+        client.permission_records = [_pending_write_perm()]
+        client.poll_messages = [_assistant_msg([
+            {"id": "prt_w", "type": "tool", "tool": "write",
+             "state": {"status": "running",
+                       "input": {"filePath": "/home/user/out.txt"},
+                       "time": {"start": 1786124255392}}},
+        ])]
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        deltas = await _drain_bounded(
+            opencode_chat_stream("task", pending_permissions=PP),
+            stop_on=_saw_waiting_status,
+        )
+
+        waiting = [
+            t for k, t in deltas
+            if k == "status" and "waiting on a permission" in t
+        ]
+        assert len(waiting) == 1, deltas  # emitted ONCE per pending permission
+        assert [k for k, _ in deltas if k == "question"] == []
+        assert [u for u, _ in client.post_calls if "/permissions/" in u] == []
+        assert PP.get("ses_0001") is None
+
+    @pytest.mark.asyncio
+    async def test_secure_idle_completion_resolver_reports_wait(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Idle-completion resolver: a parked session (idle, no running
+        tool) is NOT declared done under a non-answering backend; it reports
+        the wait and keeps polling."""
+        from opencode_bridge import opencode_chat_stream
+        from opencode_backends import SecureBackend
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _ensure_true)
+        monkeypatch.setattr(opencode_bridge, "BACKEND", SecureBackend())
+        monkeypatch.setattr(opencode_bridge, "_WEDGE_CHECK_INTERVAL_S", 60.0)
+        monkeypatch.setattr(opencode_bridge, "_EVENT_QUIET_TIMEOUT", 0.02)
+        client = _SecurePermissionClient()
+        client.lines = []
+        client.status_type = "idle"
+        client.poll_messages = []  # no running tool → idle resolver owns it
+        client.permission_records = [_pending_write_perm()]
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        deltas = await _drain_bounded(
+            opencode_chat_stream("task", pending_permissions=PP),
+            stop_on=_saw_waiting_status,
+        )
+
+        assert any(
+            k == "status" and "waiting on a permission" in t for k, t in deltas
+        ), deltas
+        assert [k for k, _ in deltas if k == "question"] == []
+        assert [u for u, _ in client.post_calls if "/permissions/" in u] == []
+        assert PP.get("ses_0001") is None
+
+    @pytest.mark.asyncio
+    async def test_secure_bus_timeout_wedge_check_reports_wait(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Event-bus-timeout wedge check: an open bus with a pending
+        permission reports the wait instead of relaying or killing."""
+        from opencode_bridge import opencode_chat_stream
+        from opencode_backends import SecureBackend
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _ensure_true)
+        monkeypatch.setattr(opencode_bridge, "BACKEND", SecureBackend())
+        monkeypatch.setattr(opencode_bridge, "_EVENT_QUIET_TIMEOUT", 0.02)
+        monkeypatch.setattr(opencode_bridge, "_WEDGE_CHECK_INTERVAL_S", 0.01)
+        monkeypatch.setattr(opencode_bridge, "_TOOL_WEDGE_AFTER_S", 60.0)
+        client = _SecurePermissionClient(blocking=True)
+        client.lines = []
+        client.status_type = "busy"
+        client.permission_records = [_pending_write_perm()]
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        deltas = await _drain_bounded(
+            opencode_chat_stream("task", pending_permissions=PP),
+            stop_on=_saw_waiting_status,
+        )
+
+        assert any(
+            k == "status" and "waiting on a permission" in t for k, t in deltas
+        ), deltas
+        assert [k for k, _ in deltas if k == "question"] == []
+        assert [u for u, _ in client.post_calls if "/permissions/" in u] == []
+        assert PP.get("ses_0001") is None
+
+    @pytest.mark.asyncio
+    async def test_secure_blocking_path_does_not_abort(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Blocking path (opencode_chat): a pending permission does not
+        abort the session nor fail the request — the prompt resolves
+        out-of-band and the request keeps waiting."""
+        from opencode_bridge import opencode_chat
+        from opencode_backends import SecureBackend
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _ensure_true)
+        monkeypatch.setattr(opencode_bridge, "BACKEND", SecureBackend())
+        monkeypatch.setattr(opencode_bridge, "_BLOCKING_PERMISSION_POLL_S", 0.01)
+        client = _SecurePermissionClient()
+        client.message_hang_s = 0.2
+        client.message_parts = [{"type": "text", "text": "done"}]
+        client.permission_records = [_pending_write_perm()]
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        result = await opencode_chat("task")
+
+        assert result == "done"
+        assert not any(u.endswith("/abort") for u, _ in client.post_calls)
+        assert [u for u, _ in client.post_calls if "/permissions/" in u] == []
+
+    @pytest.mark.parametrize("backend_name", ["serve", "openchamber"])
+    @pytest.mark.asyncio
+    async def test_answering_backends_still_relay_question(
+        self, monkeypatch: pytest.MonkeyPatch, backend_name: str,
+    ) -> None:
+        """The gate is scoped: the serve and openchamber transports still
+        relay the permission as a question and store the pending entry, so
+        the pinned-continuation resume has something to POST.
+
+        Real openchamber behaviour (source-observed): the SSE
+        ``permission.updated`` event relays because ``answers_permissions``
+        stays True, but openchamber has NO polling permission surface —
+        ``OpenChamberBackend.fetch_permissions`` always returns ``[]`` — so
+        only an SSE-delivered permission is relayed.  This test drives the
+        SSE path."""
+        from opencode_bridge import opencode_chat_stream
+        import opencode_backends as _ob
+
+        backend = (
+            _ob.ServeBackend() if backend_name == "serve"
+            else _ob.OpenChamberBackend()
+        )
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _ensure_true)
+        monkeypatch.setattr(opencode_bridge, "BACKEND", backend)
+        if backend_name == "openchamber":
+            # Hermetic openchamber: the CLI transport spawns a REAL daemon on
+            # first use (``ensure_openchamber_daemon``) and runs the
+            # openchamber binary per call (``chamber._run_cli``).  A test must
+            # never create a process, so stub both — the daemon reports up and
+            # the CLI answers create/send from a canned payload.  Mirrors the
+            # autouse fixture in tests/test_opencode_backends.py.
+            async def _fake_ensure() -> tuple[bool, str]:
+                return True, "ok"
+
+            async def _fake_run_cli(
+                args: list[str], timeout: float,
+            ) -> tuple[int, str]:
+                if args[:2] == ["session", "create"]:
+                    return 0, json.dumps({"sessionId": "ses_0001"})
+                return 0, json.dumps({})
+
+            monkeypatch.setattr(
+                _ob.chamber, "ensure_openchamber_daemon", _fake_ensure,
+            )
+            monkeypatch.setattr(_ob.chamber, "_run_cli", _fake_run_cli)
+        client = _SecurePermissionClient()
+        client.lines = [
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_user", "role": "user"}),
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_a", "role": "assistant"}),
+            _evt("permission.updated", sessionID="ses_0001",
+                 id="perm_w", type="write",
+                 title="Allow writing to /home/user/out.txt",
+                 metadata={"filepath": "/home/user/out.txt"}),
+        ]
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        deltas = [d async for d in opencode_chat_stream("task", pending_permissions=PP)]
+
+        assert len(deltas) == 1, deltas
+        kind, text = deltas[0]
+        assert kind == "question"
+        assert "Target: /home/user/out.txt" in text
+        assert [u for u, _ in client.post_calls if "/permissions/" in u] == []
+        assert PP.get("ses_0001") == ("perm_w", True)
 
 
 # ---------------------------------------------------------------------------

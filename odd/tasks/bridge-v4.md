@@ -128,7 +128,7 @@ only after its checks were observed.
 
 - [x] **T0 (ct-58460)** Map the secure server, `opencode-perm` and the bridge. Done; the
   findings are above.
-- [ ] **T1 (ct-58668)** Remove SDD from `routes.py`.
+- [x] **T1 (ct-58668)** Remove SDD from `routes.py`.
   - Drop the `opencode-sdd` model alias, the `sdd` decision and reply in the coding gate
     (the prompt offers `opencode` or `local`), the apply-executor carve-out,
     `_copy_sdd_output_to_workspace` and its call.
@@ -211,3 +211,4 @@ non-trivial files). T7 and the T8 probe need the user.
 
 - 2026-10-09: mapping done (T0); plan and this document written. No code changed.
 - T1 route evidence — route: delegated; specialist: odd-apply; trigger: secure policy (all mutations delegated) + two-or-more-file writer (routes.py, constants.py, tests).
+- 2026-10-11: T1 DONE. Removed the SDD surface from the proxy request path: the "opencode-sdd" model alias, the sdd decision/reply in the coding gate (prompt now offers opencode or local), the LOCAL-APPLY bypass, and _copy_sdd_output_to_workspace with its call; also constrained the llm.py difficulty-assessment recommendation to enum [opencode, local] and dropped the obsolete SDD tests. Commit 086685e. Checks observed: host suite 635 passed, 0 failed (.venv/bin/python -m pytest tests/ -q). RDD review-193c4ffd784643c4 (high tier, 4/4 lenses) approved and acknowledged 2026-10-11; review authority burned. Advisory, non-blocking only: R4-001 the plain bridge path now relies on transport defaults for system_prompt/timeout (revisit in T2/T6); R4-002 no explicit rejection/log for the retired alias; R4-003 re-tracks the known proxy.py:264 unawaited _opencode_session_state call.

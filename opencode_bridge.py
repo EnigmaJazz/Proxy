@@ -59,7 +59,11 @@ from opencode_backends import BACKEND
 
 logger = get_logger("kinver.opencode_bridge")
 
-# System prompt sent to every bridge session.  The gentle-orchestrator's
+# System prompt sent to every bridge session.  It carries ONLY the channel
+# contract: the API-facing identity/language policy, the single-stream reply
+# plus turn-end/question contract, and the narration requirement.  The model's
+# own agent config (the agent the server selects) owns orchestration and tool
+# policy, so the bridge does not restate them.  The gentle-orchestrator's
 # persona (AGENTS.md) defaults direct replies to Rioplatense Spanish, which
 # is wrong for an API-facing bridge consumed by OpenWebUI/nanobot — pin
 # English unless the user's own message is in another language.
@@ -67,27 +71,15 @@ _BRIDGE_SYSTEM_PROMPT = (
     "You are an API-backed coding assistant reached through a proxy bridge. "
     "Respond in English unless the user's message is written in another "
     "language. Keep the final answer concise and in English.\n\n"
-    "WORK CONTINUITY (MANDATORY): work through MULTIPLE steps in one turn — "
-    "after each step (tool call, file read, edit), continue with the next "
-    "step immediately.  Never end your turn after a step, never stop to "
-    "report progress, and never wait for the user to say \"continue\" — "
-    "the user expects the finished result in one stream, not a series of "
-    "continue-pings.  Keep working until the task is complete.  End your "
-    "turn only when the task is done, or when you must ask the user a "
-    "clarifying question (the user CAN answer in their next message and "
-    "the same session resumes).  When the task is ambiguous, make "
-    "reasonable assumptions, state them briefly, and continue.\n\n"
+    "Deliver each request as one stream: the user expects the finished "
+    "result in one stream, not a series of continue-pings.  End your turn "
+    "only when the task is done, or when you must ask the user a clarifying "
+    "question (the user CAN answer in their next message and the same "
+    "session resumes).\n\n"
     "NARRATE (MANDATORY): before each step, tell the user in one short "
     "sentence what you are doing and why; after each step, tell them what "
     "happened in one short sentence.  Never run a tool in silence — a "
-    "silent tool run looks like a dead stream to the user.\n\n"
-    "TOOL RULES (MANDATORY): the headless tool runner can wedge indefinitely "
-    "on glob/grep/read calls (their completion never arrives, stranding the "
-    "task).  Prefer `bash` for discovery and reading — `ls`, `find`, `sed`, "
-    "`head`, `tail`, `cat` with explicit paths — and avoid glob/grep/read "
-    "where possible.  When a tool call fails with a transient error (e.g. "
-    "\"Tool execution aborted\", connection resets), retry it ONCE "
-    "immediately before giving up.\n"
+    "silent tool run looks like a dead stream to the user.\n"
 )
 
 #: The exact marker the orchestrator ends its final message with when an
@@ -762,8 +754,6 @@ async def opencode_chat(
     user_text: str,
     *,
     agent: str = OPENCODE_AGENT,
-    model_id: Optional[str] = None,
-    provider_id: str = "kinver",
     timeout: float = OPENCODE_SERVE_TIMEOUT,
     system_prompt: str = _BRIDGE_SYSTEM_PROMPT,
     directory: Optional[str] = None,
@@ -792,8 +782,7 @@ async def opencode_chat(
         return _serve_unreachable_message()
     async with httpx.AsyncClient() as client:
         text, network_failed = await _opencode_chat_attempt(
-            client, user_text, agent=agent, model_id=model_id,
-            provider_id=provider_id, timeout=timeout,
+            client, user_text, agent=agent, timeout=timeout,
             system_prompt=system_prompt,
             directory=directory,
         )
@@ -806,8 +795,7 @@ async def opencode_chat(
         if not await ensure_opencode_serve():
             return _serve_unreachable_message()
         text, _ = await _opencode_chat_attempt(
-            client, user_text, agent=agent, model_id=model_id,
-            provider_id=provider_id, timeout=timeout,
+            client, user_text, agent=agent, timeout=timeout,
             system_prompt=system_prompt,
             directory=directory,
         )
@@ -819,8 +807,6 @@ async def _opencode_chat_attempt(
     user_text: str,
     *,
     agent: str,
-    model_id: Optional[str],
-    provider_id: str,
     timeout: float,
     system_prompt: str,
     directory: Optional[str] = None,
@@ -851,7 +837,7 @@ async def _opencode_chat_attempt(
             BACKEND.send_message(
                 client, session_id,
                 agent=agent, system_prompt=system_prompt, user_text=user_text,
-                model_id=model_id, provider_id=provider_id, timeout=timeout,
+                timeout=timeout,
             )
         )
         try:
@@ -920,8 +906,6 @@ async def opencode_chat_stream(
     user_text: str,
     *,
     agent: str = OPENCODE_AGENT,
-    model_id: Optional[str] = None,
-    provider_id: str = "kinver",
     session_map: Optional[dict[str, str]] = None,
     session_key: Optional[str] = None,
     pending_permissions: Optional[dict[str, tuple[str, bool]]] = None,
@@ -1119,8 +1103,7 @@ async def opencode_chat_stream(
                     async_resp = await BACKEND.send_prompt(
                         client, session_id,
                         agent=agent, system_prompt=system_prompt,
-                        user_text=user_text, model_id=model_id,
-                        provider_id=provider_id,
+                        user_text=user_text,
                     )
                 if async_resp is not None and async_resp.status_code != 204:
                     # Session was created and pinned before this POST — do

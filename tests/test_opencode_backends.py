@@ -242,7 +242,6 @@ async def test_send_prompt_dispatches_via_cli(
         resp = await backend.send_prompt(
             client, FAKE_SESSION_ID,
             agent="gentle-orchestrator", system_prompt="sys", user_text="hello",
-            model_id=None, provider_id="kinver",
         )
     assert resp.status_code == 204
     send_call = _cli_calls(tmp_path)[-1]
@@ -292,7 +291,7 @@ async def test_send_message_returns_assistant_text_parts(
         resp = await backend.send_message(
             client, FAKE_SESSION_ID,
             agent="gentle-orchestrator", system_prompt="sys", user_text="hello",
-            model_id=None, provider_id="kinver", timeout=10.0,
+            timeout=10.0,
         )
     assert resp.status_code == 200
     assert resp.json()["parts"] == [{"type": "text", "text": "PONG"}]
@@ -313,7 +312,7 @@ async def test_send_message_wedge_timeout_returns_empty_parts(
         resp = await backend.send_message(
             client, FAKE_SESSION_ID,
             agent="gentle-orchestrator", system_prompt="sys", user_text="hello",
-            model_id=None, provider_id="kinver", timeout=0.25,
+            timeout=0.25,
         )
     assert resp.status_code == 200
     assert resp.json()["parts"] == []
@@ -476,8 +475,6 @@ async def test_send_message_transient_cli_failure_retries_while_daemon_alive(
             agent="gentle-orchestrator",
             system_prompt="sys",
             user_text="hello",
-            model_id=None,
-            provider_id="kinver",
             timeout=1.0,
         )
     assert resp.status_code == 200
@@ -523,8 +520,6 @@ async def test_send_message_raises_when_daemon_dies_mid_poll(
                 agent="gentle-orchestrator",
                 system_prompt="sys",
                 user_text="hello",
-                model_id=None,
-                provider_id="kinver",
                 timeout=1.0,
             )
 
@@ -576,8 +571,6 @@ async def test_send_message_transient_failure_then_daemon_death(
                 agent="gentle-orchestrator",
                 system_prompt="sys",
                 user_text="hello",
-                model_id=None,
-                provider_id="kinver",
                 timeout=1.0,
             )
     assert poll_n[0] == 2
@@ -652,6 +645,65 @@ class _RecordingClient:
         return _RecordingResp()
 
 
+def _send_signatures() -> list[Any]:
+    """Every send primitive that could carry a model override: the ABC
+    contract plus both concrete transports (T6, ct-58463)."""
+    return [
+        ob.OpenCodeBackend.send_prompt,
+        ob.OpenCodeBackend.send_message,
+        ob.ServeBackend.send_prompt,
+        ob.ServeBackend.send_message,
+        ob.OpenChamberBackend.send_prompt,
+        ob.OpenChamberBackend.send_message,
+    ]
+
+
+def test_send_signatures_carry_no_model_override_params() -> None:
+    """T6 (ct-58463): no send primitive accepts model_id/provider_id, so a
+    caller CANNOT hand the transport a model override — model selection
+    belongs to the server's own agent config."""
+    import inspect
+
+    for fn in _send_signatures():
+        params = inspect.signature(fn).parameters
+        assert "model_id" not in params, (fn, sorted(params))
+        assert "provider_id" not in params, (fn, sorted(params))
+
+
+class _PayloadClient:
+    """httpx.AsyncClient stand-in that records each POST's JSON body."""
+
+    def __init__(self) -> None:
+        self.payloads: list[Any] = []
+
+    async def post(self, url: str, **kwargs: Any) -> _RecordingResp:
+        self.payloads.append(kwargs.get("json"))
+        return _RecordingResp(200)
+
+
+@pytest.mark.asyncio
+async def test_send_payload_never_carries_model_override() -> None:
+    """T6 (ct-58463) rule 7: the outbound payload has NO ``model`` key on
+    either send primitive — the streaming prompt_async (``send_prompt``)
+    and the blocking message POST (``send_message``)."""
+    backend = ob.ServeBackend()
+    client = _PayloadClient()
+    await backend.send_prompt(
+        client, "ses1", agent="gentle-orchestrator", system_prompt="s",
+        user_text="u",
+    )
+    await backend.send_message(
+        client, "ses1", agent="gentle-orchestrator", system_prompt="s",
+        user_text="u", timeout=1.0,
+    )
+    assert len(client.payloads) == 2, client.payloads
+    for payload in client.payloads:
+        assert "model" not in payload, payload
+        assert payload["agent"] == "gentle-orchestrator", payload
+        assert payload["system"] == "s", payload
+        assert payload["parts"] == [{"type": "text", "text": "u"}], payload
+
+
 @pytest.mark.asyncio
 async def test_secure_backend_urls_target_port_4096() -> None:
     """Every one of the 13 ABC primitives builds a URL at 127.0.0.1:4096."""
@@ -660,14 +712,13 @@ async def test_secure_backend_urls_target_port_4096() -> None:
     await backend.create_session(client, directory="/tmp/work")
     await backend.send_prompt(
         client, "ses1", agent="a", system_prompt="s", user_text="u",
-        model_id=None, provider_id="kinver",
     )
     await backend.fetch_messages(client, "ses1")
     await backend.session_exists(client, "ses1")
     await backend.abort_session(client, "ses1")
     await backend.send_message(
         client, "ses1", agent="a", system_prompt="s", user_text="u",
-        model_id=None, provider_id="kinver", timeout=1.0,
+        timeout=1.0,
     )
     await backend.fetch_message(client, "ses1", "mid1")
     await backend.fetch_session_status(client)

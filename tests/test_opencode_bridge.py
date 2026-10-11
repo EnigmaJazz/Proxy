@@ -535,30 +535,6 @@ class TestOpenCodeChatHardening:
         )
 
     @pytest.mark.asyncio
-    async def test_autonomous_write_auto_allowed(
-        self, fake_client: _FakeClient, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        monkeypatch.setattr(opencode_bridge, "_BLOCKING_PERMISSION_POLL_S", 0.01)
-        fake_client.message_hang_s = 0.2
-        fake_client.message_parts = [{"type": "text", "text": "ok"}]
-        fake_client.permission_records = [{
-            "id": "perm_3",
-            "sessionID": "ses_0001",
-            "permission": "write",
-            "patterns": ["rm -rf /x"],
-            "tool": {"messageID": "m1", "callID": "c1"},
-        }]
-        result = await opencode_chat("task", autonomous=True)
-        assert result == "ok"
-        assert any(
-            url.endswith("/permissions/perm_3") and body == {"response": "always"}
-            for url, body in fake_client.post_calls
-        )
-        assert not any(
-            url.endswith("/abort") for url, _ in fake_client.post_calls
-        )
-
-    @pytest.mark.asyncio
     async def test_success_no_permissions_unchanged(
         self, fake_client: _FakeClient, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -1129,7 +1105,6 @@ class TestRoutesOpenCode:
             just_approved_permission: bool = False,
             system_prompt: str = "",
             timeout: float = 600.0,
-            autonomous: bool = False,
             directory: Optional[str] = None,
         ) -> AsyncIterator[tuple[str, str]]:
             captured.append(text)
@@ -1161,7 +1136,6 @@ class TestRoutesOpenCode:
             just_approved_permission: bool = False,
             system_prompt: str = "",
             timeout: float = 600.0,
-            autonomous: bool = False,
             directory: Optional[str] = None,
         ) -> AsyncIterator[tuple[str, str]]:
             yield ("text", "STREAMED_")
@@ -1202,7 +1176,6 @@ class TestRoutesOpenCode:
             just_approved_permission: bool = False,
             system_prompt: str = "",
             timeout: float = 600.0,
-            autonomous: bool = False,
             directory: Optional[str] = None,
         ) -> AsyncIterator[tuple[str, str]]:
             captured.append(text)
@@ -1985,11 +1958,9 @@ class TestPermissionRelay:
 
 
 class TestPermissionRelayPolicy:
-    """REQ-1/REQ-2: write/edit gates (opencode 1.18.15 write/edit tools may
-    OMIT the permission.updated SSE event — the relay flows through the
-    polling GET /permission paths too) must be RELAYED in interactive mode
-    and AUTO-ALLOWED (POST "always", no client surface, no pending state)
-    in SDD-autonomous mode."""
+    """REQ-1: write/edit gates (opencode 1.18.15 write/edit tools may OMIT
+    the permission.updated SSE event — the relay flows through the polling
+    GET /permission paths too) must be RELAYED in interactive mode."""
 
     @pytest.mark.asyncio
     async def test_permission_write_relayed_interactive(
@@ -2027,88 +1998,6 @@ class TestPermissionRelayPolicy:
         # No auto-allow POST fired; the write awaits the user's answer.
         assert [u for u, _ in client.post_calls if "/permissions/" in u] == []
         assert PP.get("ses_0001") == ("perm_w", True)
-
-    @pytest.mark.asyncio
-    async def test_autonomous_auto_allows_write(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """REQ-2 Scenario-1: autonomous mode POSTs "always" for a write
-        permission — no question surfaced, no pending state stored."""
-        from opencode_bridge import opencode_chat_stream
-
-        async def _running(*args: Any, **kwargs: Any) -> bool:
-            return True
-
-        async def _noop(*args: Any, **kwargs: Any) -> None:
-            return None
-
-        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
-        monkeypatch.setattr(opencode_bridge, "_force_recycle_serve", _noop)
-        client = _FakeClient()
-        client.stream_lines = [
-            _evt("message.updated", sessionID="ses_0001",
-                 info={"id": "msg_user", "role": "user"}),
-            _evt("message.updated", sessionID="ses_0001",
-                 info={"id": "msg_a", "role": "assistant"}),
-            _evt("permission.updated", sessionID="ses_0001",
-                 id="perm_w", type="write",
-                 title="Allow writing to /home/user/out.txt",
-                 metadata={"filepath": "/home/user/out.txt"}),
-        ]
-        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
-
-        deltas = [d async for d in opencode_chat_stream(
-            "task", pending_permissions=PP, autonomous=True,
-        )]
-
-        assert [k for k, _ in deltas if k == "question"] == []
-        perm_posts = [(u, b) for u, b in client.post_calls if "/permissions/" in u]
-        assert any(
-            u.endswith("/permissions/perm_w") and b == {"response": "always"}
-            for u, b in perm_posts
-        )
-        assert PP.get("ses_0001") is None
-
-    @pytest.mark.asyncio
-    async def test_autonomous_auto_allows_git_commit(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """REQ-2 Scenario-2: autonomous mode auto-allows a git commit ask
-        (bash permission type) — the cycle must not stall on the git ask."""
-        from opencode_bridge import opencode_chat_stream
-
-        async def _running(*args: Any, **kwargs: Any) -> bool:
-            return True
-
-        async def _noop(*args: Any, **kwargs: Any) -> None:
-            return None
-
-        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
-        monkeypatch.setattr(opencode_bridge, "_force_recycle_serve", _noop)
-        client = _FakeClient()
-        client.stream_lines = [
-            _evt("message.updated", sessionID="ses_0001",
-                 info={"id": "msg_user", "role": "user"}),
-            _evt("message.updated", sessionID="ses_0001",
-                 info={"id": "msg_a", "role": "assistant"}),
-            _evt("permission.updated", sessionID="ses_0001",
-                 id="perm_g", type="bash",
-                 title="Allow git commit",
-                 metadata={"command": "git commit -m bump"}),
-        ]
-        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
-
-        deltas = [d async for d in opencode_chat_stream(
-            "task", pending_permissions=PP, autonomous=True,
-        )]
-
-        assert [k for k, _ in deltas if k == "question"] == []
-        perm_posts = [(u, b) for u, b in client.post_calls if "/permissions/" in u]
-        assert any(
-            u.endswith("/permissions/perm_g") and b == {"response": "always"}
-            for u, b in perm_posts
-        )
-        assert PP.get("ses_0001") is None
 
     @pytest.mark.asyncio
     async def test_interactive_does_not_auto_allow_write(
@@ -2157,10 +2046,8 @@ class TestPermissionRelayPolicy:
         command must flow through ``opencode_chat_stream`` (the relay path),
         NOT the bare blocking ``opencode_chat`` (the old silent write/edit
         drop).  A write gate inside a /opencode task surfaces as an SSE
-        content question in interactive mode (no auto-allow), and the SAME
-        stream path auto-allows it in autonomous mode."""
+        content question (no auto-allow)."""
         from routes import _handle_opencode_command
-        from opencode_bridge import opencode_chat_stream
 
         async def _running(*args: Any, **kwargs: Any) -> bool:
             return True
@@ -2194,23 +2081,6 @@ class TestPermissionRelayPolicy:
         # and NO bare blocking /message POST (the old opencode_chat drop path).
         assert any("prompt_async" in u for u, _ in client.post_calls)
         assert not any("/message" in u for u, _ in client.post_calls)
-
-        # ---- Autonomous leg: the same stream path auto-allows -----------
-        PP.clear()
-        client2 = _FakeClient()
-        client2.stream_lines = list(client.stream_lines)
-        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client2)
-        deltas = [d async for d in opencode_chat_stream(
-            "write config", pending_permissions=PP, autonomous=True,
-        )]
-        assert [k for k, _ in deltas if k == "question"] == []
-        perm_posts = [(u, b) for u, b in client2.post_calls if "/permissions/" in u]
-        assert any(
-            u.endswith("/permissions/perm_w") and b == {"response": "always"}
-            for u, b in perm_posts
-        )
-        assert PP.get("ses_0001") is None
-        PP.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -3813,7 +3683,7 @@ class TestResilientStream:
     """``opencode_chat_stream_resilient``: one auto-retry on a fresh serve
     when the first attempt dies silently (the serve's tool runner fails at
     a high rate — upstream defect family #35066); never retries after text
-    or a question, and never retries autonomous (SDD) mode.
+    or a question.
     """
 
     @pytest.mark.asyncio
@@ -3978,34 +3848,6 @@ class TestResilientStream:
         assert calls == 1
         assert recycles == []
 
-    @pytest.mark.asyncio
-    async def test_autonomous_mode_never_retried(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """SDD-autonomous mode is never auto-retried: the cycle driver owns
-        its recovery (a whole-cycle retry could burn hours)."""
-        from opencode_bridge import opencode_chat_stream_resilient
-
-        calls = 0
-
-        async def _fail(*args: Any, **kwargs: Any):
-            nonlocal calls
-            calls += 1
-            yield "status", "[OpenCode Bridge Error: x]"
-
-        recycles: list[str] = []
-
-        async def _recycle(reason: str) -> None:
-            recycles.append(reason)
-
-        monkeypatch.setattr(opencode_bridge, "opencode_chat_stream", _fail)
-        monkeypatch.setattr(opencode_bridge, "_force_recycle_serve", _recycle)
-
-        deltas = [d async for d in opencode_chat_stream_resilient("task", autonomous=True)]
-        assert any("OpenCode Bridge Error" in t for k, t in deltas)
-        assert calls == 1
-        assert recycles == []
-
 
 class TestCompletionResolvesPermissions:
     """Root-cause regression (2026-08-07): the bridge used to pop pending
@@ -4144,10 +3986,6 @@ class TestSddSubagentContract:
         assert "never start a retry while the original sub-agent session" in c
         # The old unbounded rule is gone from the canonical text.
         assert "DO NOT retry the sub-agent" not in c
-
-    def test_bridge_prompt_embeds_contract(self) -> None:
-        assert opencode_bridge._SDD_SUBAGENT_CONTRACT in \
-            opencode_bridge._SDD_AUTONOMOUS_SYSTEM_PROMPT
 
     def test_serve_config_prompt_embeds_contract(self) -> None:
         import json as _json

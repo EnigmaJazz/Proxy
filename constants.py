@@ -221,12 +221,6 @@ OPENCHAMBER_CONFIG_DIR: str = _machine(
     os.path.join(OPENCODE_WORKSPACE_DIR, "openchamber-config"),
 )
 
-# Directory the SDD-AUTONOMOUS sessions run in.  The full-SDD-cycle path
-# operates on the OpenSpec store + repo, which lives in the proxy repo
-# (NOT the nanobot workspace the plain bridge sessions use).  Machine
-# override via local_config.OPENCODE_SDD_DIRECTORY.
-OPENCODE_SDD_DIRECTORY: str = _machine("OPENCODE_SDD_DIRECTORY", _REPO_ROOT)
-
 # Absolute path to the opencode binary.  systemd services run with a
 # minimal PATH that does not include ~/.opencode/bin, so the bridge spawn
 # must not rely on PATH resolution.
@@ -272,12 +266,6 @@ OPCODE_CONFIG_PATH: str = _machine(
 # Bridge model keys exposed to clients, validated alongside ALL_MODEL_KEYS.
 # "opencode" routes to the opencode serve bridge instead of llama.cpp.
 BRIDGE_MODEL_KEYS: frozenset[str] = frozenset({"opencode"})
-
-# Time budget for a single bridge turn.  The regular bridge streams one
-# agentic task; the SDD-autonomous mode runs the FULL cycle (proposal →
-# spec → design → tasks → apply → verify → archive) in one long-lived
-# turn, so it gets a much larger budget.
-OPENCODE_SDD_TIMEOUT: float = 7200.0
 
 # Queue-worker escalation backend after local tiers are exhausted:
 # "opencode" → headless opencode serve (build agent);

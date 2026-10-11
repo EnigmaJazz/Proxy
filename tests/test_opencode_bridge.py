@@ -1074,7 +1074,6 @@ class TestRoutesOpenCode:
 
         async def _fake_stream(
             text: str, *, agent: str = "gentle-orchestrator",
-            model_id: Optional[str] = None, provider_id: str = "kinver",
             session_map: Optional[dict[str, str]] = None,
             session_key: Optional[str] = None,
             pending_permissions: Optional[dict[str, tuple[str, bool]]] = None,
@@ -1104,7 +1103,6 @@ class TestRoutesOpenCode:
 
         async def _fake_stream(
             text: str, *, agent: str = "gentle-orchestrator",
-            model_id: Optional[str] = None, provider_id: str = "kinver",
             session_map: Optional[dict[str, str]] = None,
             session_key: Optional[str] = None,
             pending_permissions: Optional[dict[str, tuple[str, bool]]] = None,
@@ -1143,7 +1141,6 @@ class TestRoutesOpenCode:
 
         async def _fake_stream(
             text: str, *, agent: str = "gentle-orchestrator",
-            model_id: Optional[str] = None, provider_id: str = "kinver",
             session_map: Optional[dict[str, str]] = None,
             session_key: Optional[str] = None,
             pending_permissions: Optional[dict[str, tuple[str, bool]]] = None,
@@ -2301,6 +2298,100 @@ class TestSecurePermissionGate:
         assert PP.get("ses_0001") == ("perm_w", True)
 
 
+class TestRelayEveryPermission:
+    """R3 (T6, ct-58463): the removed READ auto-allow means every permission
+    that reaches the handler is relayed now — including ``external_directory``,
+    the formerly-auto-allowed read class.  The three relay paths (headless
+    blocking chat, stream event-bus, idle-completion resolver) each assert the
+    serve still relays it as a question with a stored pending entry."""
+
+    @pytest.mark.asyncio
+    async def test_blocking_path_relays_formerly_auto_allowed_read(
+        self, fake_client: _FakeClient, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Headless/blocking chat path: an ``external_directory`` permission
+        (formerly auto-allowed) is relayed — the handler builds a question,
+        so the headless caller aborts instead of silently allowing it."""
+        from opencode_bridge import opencode_chat
+
+        monkeypatch.setattr(opencode_bridge, "_BLOCKING_PERMISSION_POLL_S", 0.01)
+        fake_client.message_hang_s = 0.2
+        fake_client.message_parts = [{"type": "text", "text": "ok"}]
+        fake_client.permission_records = [{
+            "id": "perm_read",
+            "sessionID": "ses_0001",
+            "permission": "external_directory",
+            "patterns": ["cat /etc/os-release"],
+            "tool": {"messageID": "m1", "callID": "c1"},
+        }]
+        result = await opencode_chat("task")
+        assert "[OpenCode Bridge Error:" in result
+        assert "headless escalation cannot relay" in result
+        assert any(
+            url.endswith("/abort") for url, _ in fake_client.post_calls
+        )
+
+    @pytest.mark.asyncio
+    async def test_event_bus_relays_formerly_auto_allowed_read(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Stream event-bus path: an ``external_directory`` SSE permission
+        (``permission.updated``) is relayed as a question, once, with a
+        stored pending entry and no permission POST."""
+        from opencode_bridge import opencode_chat_stream
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _ensure_true)
+        client = _FakeClient()
+        client.stream_lines = [
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_user", "role": "user"}),
+            _evt("message.updated", sessionID="ses_0001",
+                 info={"id": "msg_a", "role": "assistant"}),
+            _evt("permission.updated", sessionID="ses_0001",
+                 id="perm_read", type="external_directory",
+                 title="Allow reading /etc/os-release",
+                 metadata={"filepath": "/etc/os-release"}),
+        ]
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        deltas = [d async for d in opencode_chat_stream("task", pending_permissions=PP)]
+
+        questions = [(k, t) for k, t in deltas if k == "question"]
+        assert len(questions) == 1, deltas
+        assert [u for u, _ in client.post_calls if "/permissions/" in u] == []
+        assert PP.get("ses_0001") == ("perm_read", True)
+
+    @pytest.mark.asyncio
+    async def test_idle_completion_resolver_relays_formerly_auto_allowed_read(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Idle-completion resolver: an ``external_directory`` permission
+        (formerly auto-allowed) is relayed as a question instead of the
+        parked session being declared done, with a stored pending entry."""
+        from opencode_bridge import opencode_chat_stream
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _ensure_true)
+        monkeypatch.setattr(opencode_bridge, "_EVENT_QUIET_TIMEOUT", 0.02)
+        monkeypatch.setattr(opencode_bridge, "_TOOL_WEDGE_AFTER_S", 60.0)
+        client = _RunningToolPermissionClient()
+        client.status_type = "idle"  # completion path
+        client.permission_records = [{
+            "id": "perm_read", "sessionID": "ses_0001",
+            "permission": "external_directory",
+            "patterns": ["/etc/os-release"],
+            "tool": {"messageID": "msg_a", "callID": "call_read"},
+        }]
+        client.stream_lines = []  # empty event bus → polling fallback
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        deltas = [d async for d in opencode_chat_stream("task", pending_permissions=PP)]
+
+        questions = [(k, t) for k, t in deltas if k == "question"]
+        assert len(questions) == 1, deltas
+        assert all("perm_read" not in u for u, _ in client.post_calls if "/permissions/" in u)
+        assert PP.get("ses_0001") == ("perm_read", True)
+
+
 # ---------------------------------------------------------------------------
 # Pinned sessions + clarifying questions (a701e8d)
 # ---------------------------------------------------------------------------
@@ -3369,20 +3460,32 @@ class TestRunningToolAnnounce:
     """
 
     @pytest.mark.asyncio
-    async def test_bridge_prompt_carries_tool_rules(self) -> None:
-        """The bridge prompt forbids relying on glob/grep/read (the serve's
-        tool runner wedges on them), mandates the bash-first + retry-once
-        rules, and requires work CONTINUITY (the model otherwise ends its
-        turn after every step and the user must ping \"continue\" ~65 times
-        per task — observed live 2026-08-14)."""
+    async def test_bridge_prompt_carries_only_channel_contract(self) -> None:
+        """T6 (ct-58463): the bridge prompt carries ONLY the channel
+        contract — the identity/language policy, the single-stream reply
+        plus turn-end/question contract, and the narration requirement.
+        The WORK CONTINUITY orchestration, the serve-specific tool policy
+        (glob/grep/bash wedge rules), and the reasonable-assumptions
+        guidance are dropped: the server's own agent config owns
+        orchestration and tool policy."""
         prompt = opencode_bridge._BRIDGE_SYSTEM_PROMPT
-        assert "glob" in prompt and "grep" in prompt
-        assert "`bash`" in prompt and "retry it ONCE" in prompt
-        assert "WORK CONTINUITY" in prompt
-        assert "Never end your turn after a step" in prompt
-        assert "continue-pings" in prompt
-        assert "NARRATE" in prompt
+        # Kept channel-contract lines.
+        assert "API-backed coding assistant" in prompt
+        assert "Respond in English unless" in prompt
+        assert "one stream, not a series of continue-pings" in prompt
+        assert "End your turn only when the task is done" in prompt
+        assert "clarifying question" in prompt
+        assert "NARRATE (MANDATORY)" in prompt
         assert "Never run a tool in silence" in prompt
+        # Dropped directives: orchestration, tool policy, assumptions.
+        assert "WORK CONTINUITY" not in prompt
+        assert "Never end your turn after a step" not in prompt
+        assert "reasonable assumptions" not in prompt
+        assert "TOOL RULES" not in prompt
+        assert "glob" not in prompt
+        assert "grep" not in prompt
+        assert "`bash`" not in prompt
+        assert "retry it ONCE" not in prompt
 
     @pytest.mark.asyncio
     async def test_keepalive_announces_running_tool_from_message_list(

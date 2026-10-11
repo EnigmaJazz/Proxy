@@ -70,8 +70,8 @@ class OpenCodeBackend(ABC):
     primitive to a backend so a second transport (the openchamber CLI,
     later steps) can implement the same contract.  Session-oriented
     signatures follow the design doc's shape — ``create_session(directory)``,
-    ``send_prompt(session_id, agent, system_prompt, user_text, model_id,
-    provider_id)``, ``fetch_messages(session_id)``,
+    ``send_prompt(session_id, agent, system_prompt, user_text)``,
+    ``fetch_messages(session_id)``,
     ``session_exists(session_id)``, ``abort_session(session_id)`` —
     adjusted only as needed to cover the serve primitives 1:1 (the caller's
     client parameter, and the serve-specific permission/question/status/
@@ -114,8 +114,6 @@ class OpenCodeBackend(ABC):
         agent: str,
         system_prompt: str,
         user_text: str,
-        model_id: Optional[str],
-        provider_id: str,
     ) -> httpx.Response:
         """Fire-and-forget prompt send (the streaming path's no-wait POST)."""
 
@@ -154,8 +152,6 @@ class OpenCodeBackend(ABC):
         agent: str,
         system_prompt: str,
         user_text: str,
-        model_id: Optional[str],
-        provider_id: str,
         timeout: float,
     ) -> httpx.Response:
         """Blocking message send (the blocking path's POST, runs to completion)."""
@@ -231,28 +227,20 @@ def _build_send_payload(
     agent: str,
     system_prompt: str,
     user_text: str,
-    model_id: Optional[str],
-    provider_id: str,
 ) -> dict[str, Any]:
     """Build the serve message/prompt payload.
 
-    The agent/system/parts shape the serve expects, with the optional
-    model block (modelID/providerID/variant) when the client named a model.
-    Relocated verbatim from the bridge's two inline construction sites so
-    both send primitives share one copy.
+    The agent/system/parts shape the serve expects.  The payload carries NO
+    model override: model selection belongs to the server's own agent config
+    (bridge v4, T6), so no caller can dictate a model.  Relocated verbatim
+    from the bridge's two inline construction sites so both send primitives
+    share one copy.
     """
-    payload: dict[str, Any] = {
+    return {
         "agent": agent,
         "system": system_prompt,
         "parts": [{"type": "text", "text": user_text}],
     }
-    if model_id:
-        payload["model"] = {
-            "modelID": model_id,
-            "providerID": provider_id,
-            "variant": "default",
-        }
-    return payload
 
 
 class ServeBackend(OpenCodeBackend):
@@ -297,8 +285,6 @@ class ServeBackend(OpenCodeBackend):
         agent: str,
         system_prompt: str,
         user_text: str,
-        model_id: Optional[str],
-        provider_id: str,
     ) -> httpx.Response:
         """POST /session/<id>/prompt_async — the streaming path's send.
 
@@ -312,7 +298,6 @@ class ServeBackend(OpenCodeBackend):
             f"{self.base_url}/session/{session_id}/prompt_async",
             json=_build_send_payload(
                 agent=agent, system_prompt=system_prompt, user_text=user_text,
-                model_id=model_id, provider_id=provider_id,
             ),
             timeout=30.0,
         )
@@ -383,8 +368,6 @@ class ServeBackend(OpenCodeBackend):
         agent: str,
         system_prompt: str,
         user_text: str,
-        model_id: Optional[str],
-        provider_id: str,
         timeout: float,
     ) -> httpx.Response:
         """POST /session/<id>/message — the BLOCKING message send.
@@ -400,7 +383,6 @@ class ServeBackend(OpenCodeBackend):
             f"{self.base_url}/session/{session_id}/message",
             json=_build_send_payload(
                 agent=agent, system_prompt=system_prompt, user_text=user_text,
-                model_id=model_id, provider_id=provider_id,
             ),
             timeout=timeout,
         )
@@ -716,11 +698,11 @@ class OpenChamberBackend(OpenCodeBackend):
                 --limit 5``
       list      ``session list --json``
 
-    The ``agent``/``system_prompt``/``model_id``/``provider_id``
-    parameters are the serve payload's; the CLI's agent + model come
-    from the daemon config (patched at spawn to pin gentle-orchestrator
-    to kinver/professional) and the agent's own system prompt, so they
-    are intentionally NOT forwarded.
+    The ``agent``/``system_prompt``/``user_text`` parameters are the
+    serve payload's; the CLI's agent + model come from the daemon config
+    (patched at spawn to pin gentle-orchestrator to kinver/professional)
+    and the agent's own system prompt, so they are intentionally NOT
+    forwarded.
 
     Serve-specific primitives with no openchamber analogue (design
     §3.4/§3.5) map to best-effort defaults with logging:
@@ -803,8 +785,6 @@ class OpenChamberBackend(OpenCodeBackend):
         agent: str,
         system_prompt: str,
         user_text: str,
-        model_id: Optional[str],
-        provider_id: str,
     ) -> httpx.Response:
         """The streaming path's no-wait dispatch: ``session send --wait``
         returns BEFORE the turn completes (dispatch semantics —
@@ -933,8 +913,6 @@ class OpenChamberBackend(OpenCodeBackend):
         agent: str,
         system_prompt: str,
         user_text: str,
-        model_id: Optional[str],
-        provider_id: str,
         timeout: float,
     ) -> httpx.Response:
         """The blocking path's send: dispatch ``session send --wait`` then

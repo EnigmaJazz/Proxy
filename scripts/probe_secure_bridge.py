@@ -3,9 +3,21 @@
 
 Checks the secure-bridge preconditions, then sends exactly ONE bridged request
 through the proxy's PUBLIC API (``POST /v1/chat/completions`` with
-``model: "opencode"``, streamed).  The prompt forces the agent to exercise tools
-in sequence: a glob, a grep, a read of a known file, and a WRITE of a new file
-OUTSIDE the workspace (the write is the likely permission trigger).
+``model: "opencode"``, streamed).  The prompt asks the agent to exercise tools
+in sequence: a glob, a grep, a read of a known file, and the OUTCOME of a new
+file.  Every fixture lives in the workspace-RELATIVE subdirectory
+``.opencode_bridge_probe``: the glob/grep steps scope to that relative
+subdirectory (the tools cannot resolve the workspace root), and the write
+target ``.opencode_bridge_probe/out.txt`` is INSIDE the workspace, so it
+crosses no workspace/protected-path boundary.  A read-only agent MUST delegate
+the write to a writable worker through its subagent/task tool.
+
+NOTE (glob/grep scoping): the glob and grep tools resolve an existing RELATIVE
+subdirectory but NOT the workspace root — a root, ``.`` or an absolute search
+path returns ``search path does not exist`` even while ``read`` succeeds there.
+This is the ENVIRONMENT's normal tool scoping, not a bridge result and not a
+bridge failure; the probe scopes its steps to the relative subdirectory instead
+of trying to fix it.
 
 This is a CLI: stdout IS the deliverable (the streamed reply plus the
 PASS/FAIL/UNKNOWN report), so the ``print()`` calls below are the AGENTS.md
@@ -38,9 +50,10 @@ import asyncio
 import json
 import logging
 import os
+import re
+import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -69,10 +82,23 @@ EXIT_UNKNOWN = 4
 #: ``🔧 <name>`` (opencode_bridge._yield_part_deltas).  Duplicated so the probe
 #: stays import-light and runs even if the bridge module cannot import.
 _TOOLS = ("glob", "grep", "read", "write")
-#: Exact content the agent must write to the outside-workspace file.
+#: Tool names for a subagent/delegation invocation.  The opencode delegation
+#: tool is ``task`` (``subagent`` covers an alias); the bridge renders any tool
+#: as ``✅ <name> done`` / ``🔧 <name>`` / ``⚠️ <name> failed``.
+_DELEGATION_TOOLS = ("task", "subagent")
+#: Exact content the agent must write to the in-workspace outcome file.
 _WRITE_CONTENT = "secure-bridge-probe-ok"
 #: Prefix of the token in the known read file.
 _READ_SENTINEL = "PROBE-TOKEN-"
+#: Probe fixture directory, RELATIVE to the bridge workspace.  The glob/grep
+#: tools resolve an existing relative subdirectory but NOT the workspace root
+#: (see the module NOTE), and a relative in-workspace write crosses no
+#: workspace/protected-path boundary.
+_PROBE_DIRNAME = ".opencode_bridge_probe"
+#: Token file the glob/grep/read steps target, relative to the workspace.
+_PROBE_TARGET_REL = f"{_PROBE_DIRNAME}/target.txt"
+#: Write-outcome file, relative to the workspace (INSIDE it).
+_PROBE_OUT_REL = f"{_PROBE_DIRNAME}/out.txt"
 #: Data dir the opencode session store + log live under.
 _OPENCODE_DATA_DIR = os.path.expanduser("~/.local/share/opencode")
 
@@ -98,6 +124,7 @@ class ProbeOutcome:
     completed_tools: list[str] = field(default_factory=list)
     running_tools: list[str] = field(default_factory=list)
     failed_tools: list[str] = field(default_factory=list)
+    delegation_signals: list[str] = field(default_factory=list)
     text: list[str] = field(default_factory=list)
     stream_error: str = ""
 
@@ -245,36 +272,48 @@ def _check_registration(workspace: str) -> Check:
 
 
 def _build_prompt(
-    known_name: Optional[str], write_path: str, token: str,
+    known_rel: Optional[str], write_rel: str, token: str,
 ) -> str:
-    """The explicit tool-sequence prompt for the one bridged request."""
+    """The explicit tool-sequence prompt for the one bridged request.
+
+    Every path is RELATIVE to the bridge workspace and scoped to the
+    ``.opencode_bridge_probe`` subdirectory: the glob/grep tools resolve an
+    existing relative subdirectory but NOT the workspace root, and a relative
+    in-workspace write crosses no workspace/protected-path boundary.
+    """
     lines = [
         "This is an automated probe of the secure opencode bridge. Execute ALL of the",
         "following steps IN ORDER using your tools. Do not skip any step. Narrate each",
         "step in one short sentence.",
         "",
-        '1. GLOB: use the glob tool with the pattern "**/*" (or "*") in the current',
-        "   working directory and report one path you found.",
+        '1. GLOB: use the glob tool with the pattern "**/*" (or "*") in the RELATIVE',
+        f"   directory {_PROBE_DIRNAME} (inside the current workspace) and report one",
+        "   path you found.",
         "2. GREP: use the grep tool to search for the exact string "
-        f'"{token}" in the current working directory and report the match.',
+        f'"{token}" in the RELATIVE directory {_PROBE_DIRNAME} and report the match.',
     ]
-    if known_name:
+    if known_rel:
         lines += [
-            f"3. READ: use the read tool to read the file ./{known_name} and report the",
+            f"3. READ: use the read tool to read the file {known_rel} and report the",
             f'   token it contains (it contains "{token}").',
         ]
     else:
         lines += [
             "3. READ: use the read tool to read any small text file you found in step 1",
-            "   and report its first line.",
+            "   under the relative directory and report its first line.",
         ]
     lines += [
-        f"4. WRITE: use the write tool to create a NEW file at the absolute path "
-        f"{write_path}",
-        f"   (OUTSIDE the current workspace) with exactly this content: {_WRITE_CONTENT}",
+        f"4. WRITE OUTCOME: the file at the workspace-RELATIVE path {write_rel} must",
+        f"   exist with exactly this content: {_WRITE_CONTENT}",
+        "   The target is INSIDE the current workspace and is RELATIVE (not an absolute",
+        "   or out-of-workspace path), so there is no boundary to cross.",
+        "   You may be a read-only agent: if you have no write/edit/apply_patch tool of",
+        "   your own, you MUST delegate this write to a writable worker using your",
+        "   subagent / delegation (task) tool, and make sure the delegated write lands.",
         "",
         "Finally reply with a short numbered summary: for each step, name the tool you",
-        "used and whether it completed.",
+        "used and whether it completed. For step 4 say whether you wrote directly or",
+        "delegated, and if you delegated, name the delegate.",
     ]
     return "\n".join(lines)
 
@@ -305,6 +344,15 @@ def _apply_chunk(chunk: dict[str, Any], outcome: ProbeOutcome, marker: str) -> N
             outcome.running_tools.append(tool)
         if f"⚠️ {tool} failed" in text and tool not in outcome.failed_tools:
             outcome.failed_tools.append(tool)
+    for tool in _DELEGATION_TOOLS:
+        if tool in outcome.delegation_signals:
+            continue
+        if (
+            f"✅ {tool} done" in text
+            or f"🔧 {tool}" in text
+            or f"⚠️ {tool} failed" in text
+        ):
+            outcome.delegation_signals.append(tool)
 
 
 async def _pump_lines(resp: httpx.Response, queue: "asyncio.Queue[Optional[str]]") -> None:
@@ -433,10 +481,46 @@ def _scan_sessions(data_dir: Path, since: float, *, cap: int = 20000) -> Optiona
     return newest[1] if newest else None
 
 
+#: Delegation verbs/phrases the agent's own summary may use.
+_DELEGATION_CUES = ("delegat", "subagent", "sub-agent", "handed off", "handed over")
+#: A delegation statement that NAMES the delegate (``... to <Name>``).  Used
+#: only as a prose fallback: never a PASS basis without the file on disk.
+_DELEGATE_NAME_RE = re.compile(
+    r"(?:delegat\w*|handed (?:off|over))\s+"
+    r"(?:the\s+\S+\s+)?to\s+(?:the\s+)?([A-Za-z][A-Za-z0-9_.-]{2,})",
+    re.IGNORECASE,
+)
+#: Tokens that are NOT delegate names (English words a delegation sentence uses).
+_NOT_A_DELEGATE = frozenset({
+    "the", "a", "an", "my", "its", "our", "your", "it", "them", "him", "her",
+    "you", "us", "me", "worker", "writable", "subagent", "sub-agent", "agent",
+    "delegate", "task", "tool", "write", "writes", "writer", "file", "path",
+    "sandbox", "one", "someone", "another",
+})
+
+
+def _named_delegate(text: str) -> Optional[str]:
+    """Return the delegate name when the summary says it delegated to one.
+
+    Conservative prose-only fallback: requires a delegation cue AND a
+    ``delegated ... to <Name>`` token that is not a common English word.  The
+    stream marker is the primary evidence; this supports a PASS only when the
+    file on disk also exists.
+    """
+    if not any(cue in text.lower() for cue in _DELEGATION_CUES):
+        return None
+    match = _DELEGATE_NAME_RE.search(text)
+    if match is None:
+        return None
+    name = match.group(1)
+    return None if name.lower() in _NOT_A_DELEGATE else name
+
+
 def _acceptance_facts(
     outcome: ProbeOutcome, write_path: str, since: float,
 ) -> list[Check]:
-    """The five T8 acceptance facts, each PASS/FAIL/UNKNOWN with evidence."""
+    """The T8 acceptance facts: the five originals plus a delegation fact 2b
+    after fact 2, each PASS/FAIL/UNKNOWN with evidence."""
     facts: list[Check] = []
 
     if outcome.received_reply:
@@ -472,6 +556,35 @@ def _acceptance_facts(
         ))
 
     ok, content = _read_write_file(write_path)
+    named_delegate = _named_delegate("".join(outcome.text))
+    stream_write = (
+        "write" in outcome.completed_tools or "write" in outcome.running_tools
+    )
+    if outcome.delegation_signals:
+        facts.append(Check(
+            "2b. delegation observed", "PASS",
+            "stream shows a subagent/delegation tool marker: "
+            + ", ".join(outcome.delegation_signals),
+        ))
+    elif named_delegate and ok:
+        facts.append(Check(
+            "2b. delegation observed", "PASS",
+            f"no stream marker; the agent's summary names the delegate "
+            f"{named_delegate!r} AND {write_path} exists (prose + on-disk sources)",
+        ))
+    elif stream_write or ok:
+        source = "a write tool marker" if stream_write else f"the on-disk file {write_path}"
+        facts.append(Check(
+            "2b. delegation observed", "FAIL",
+            f"no delegation observed, but the write outcome is present ({source}); "
+            "the read-only agent was expected to delegate the write",
+        ))
+    else:
+        facts.append(Check(
+            "2b. delegation observed", "UNKNOWN",
+            "the stream shows neither a write nor a delegation",
+        ))
+
     if ok and _WRITE_CONTENT in content:
         facts.append(Check(
             "3. work is on disk", "PASS", f"{write_path} contains {_WRITE_CONTENT!r}",
@@ -531,6 +644,19 @@ def _print_manual_instruction(marker: str) -> None:
 # -- Entry -------------------------------------------------------------------
 
 
+def _cleanup_probe_dir(probe_dir: Path) -> None:
+    """Best-effort removal of the probe fixture subdirectory; never raises.
+
+    Runs from the entry point's ``finally`` so a failed or partial run still
+    cleans up.  Removal failure is logged and swallowed: the probe's result is
+    already decided, and a leftover fixture directory must not fail a run.
+    """
+    try:
+        shutil.rmtree(probe_dir)
+    except OSError as exc:
+        log.warning("probe cleanup could not remove %s: %s", probe_dir, exc)
+
+
 async def _amain(args: argparse.Namespace) -> int:
     print("=== secure-bridge probe (bridge v4 / T8) ===")
     print(f"proxy URL : {args.proxy_url}")
@@ -579,23 +705,27 @@ async def _amain(args: argparse.Namespace) -> int:
 
     ws = Path(OPENCODE_BRIDGE_DIRECTORY)
     token = f"{_READ_SENTINEL}{os.getpid():x}{int(time.time()):x}"
-    known_name: Optional[str] = ".opencode_bridge_probe_target.txt"
-    known_path = ws / known_name
-    known_created = False
+    probe_dir = ws / _PROBE_DIRNAME
+    known_rel: Optional[str] = _PROBE_TARGET_REL
+    known_path = probe_dir / "target.txt"
     try:
+        probe_dir.mkdir(parents=True, exist_ok=True)
         known_path.write_text(f"{token}\n", encoding="utf-8")
-        known_created = True
     except OSError as exc:
         log.warning("could not create the read-target file %s: %s", known_path, exc)
-        known_name = None
+        known_rel = None
 
-    write_path = args.write_path or os.path.join(
-        tempfile.gettempdir(), f"opencode_bridge_probe_{os.getpid()}.txt",
-    )
-    if Path(write_path).resolve().is_relative_to(ws.resolve()):
-        log.warning("write path %s is INSIDE the workspace — no external write gate", write_path)
+    write_rel = args.write_path or _PROBE_OUT_REL
+    write_path = Path(write_rel)
+    if not write_path.is_absolute():
+        write_path = ws / write_path
+    else:
+        log.warning(
+            "write path %s is ABSOLUTE — the probe expects an inside-workspace "
+            "RELATIVE target", write_rel,
+        )
 
-    prompt = _build_prompt(known_name, write_path, token)
+    prompt = _build_prompt(known_rel, write_rel, token)
     log.info("probe prompt:\n%s", prompt)
     print("-- bridged request (model=opencode, streamed) --")
     print(prompt)
@@ -605,36 +735,34 @@ async def _amain(args: argparse.Namespace) -> int:
     marker = _waiting_permission_marker()
     try:
         outcome = await _stream_request(args, prompt, marker)
-    finally:
-        if known_created:
-            try:
-                known_path.unlink()
-            except OSError:
-                pass
 
-    print()
-    if outcome.stream_error:
-        log.warning("stream error: %s", outcome.stream_error)
+        print()
+        if outcome.stream_error:
+            log.warning("stream error: %s", outcome.stream_error)
 
-    if outcome.waiting_permission and (outcome.parked_and_timed_out or not outcome.completed_tools):
-        _print_manual_instruction(marker)
-        if outcome.parked_and_timed_out:
-            return EXIT_PERMISSION_PENDING
+        if outcome.waiting_permission and (
+            outcome.parked_and_timed_out or not outcome.completed_tools
+        ):
+            _print_manual_instruction(marker)
+            if outcome.parked_and_timed_out:
+                return EXIT_PERMISSION_PENDING
 
-    print("-- T8 acceptance facts --")
-    facts = _acceptance_facts(outcome, write_path, since)
-    exit_code = EXIT_OK
-    for fact in facts:
-        _print_check(fact)
-        if fact.status == "FAIL":
+        print("-- T8 acceptance facts --")
+        facts = _acceptance_facts(outcome, str(write_path), since)
+        exit_code = EXIT_OK
+        for fact in facts:
+            _print_check(fact)
+            if fact.status == "FAIL":
+                exit_code = EXIT_ACCEPTANCE_FAILED
+            elif fact.status == "UNKNOWN" and exit_code == EXIT_OK:
+                exit_code = EXIT_UNKNOWN
+        if registration.status != "PASS" and exit_code == EXIT_OK:
             exit_code = EXIT_ACCEPTANCE_FAILED
-        elif fact.status == "UNKNOWN" and exit_code == EXIT_OK:
-            exit_code = EXIT_UNKNOWN
-    if registration.status != "PASS" and exit_code == EXIT_OK:
-        exit_code = EXIT_ACCEPTANCE_FAILED
-    print()
-    print(f"RESULT: exit {exit_code}")
-    return exit_code
+        print()
+        print(f"RESULT: exit {exit_code}")
+        return exit_code
+    finally:
+        _cleanup_probe_dir(probe_dir)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -651,7 +779,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--write-path", default=None,
-        help="OUTSIDE-workspace file the agent must write (default: a temp file)",
+        help="workspace-RELATIVE file the agent must write "
+             f"(default: {_PROBE_OUT_REL})",
     )
     parser.add_argument(
         "--prompt-wait", type=float, default=600.0,

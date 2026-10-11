@@ -322,6 +322,16 @@ _RELAYED_PERMISSION_TYPES: tuple[str, ...] = (
     "external_directory", "bash", "write", "edit",
 )
 
+#: Status emitted while a permission prompt is pending under a backend that
+#: does NOT answer permissions (the secure server, whose own
+#: ``opencode-perm`` resolves prompts out-of-band).  The bridge relays no
+#: question and POSTs no answer — it only tells the client the session is
+#: parked, once per permission id.
+_WAITING_PERMISSION_STATUS = (
+    "🔐 waiting on a permission prompt "
+    "(the session is paused; resolve it with opencode-perm)"
+)
+
 
 def _parse_permission_answer(answer: str, *, write: bool = False) -> str:
     """Map the user's reply to a permission response: "once"|"always"|"reject".
@@ -425,6 +435,13 @@ async def _handle_permission_event(
     malformed; otherwise returns a question string for the USER to decide
     (write/git ask).  Never raises.
     """
+    if not BACKEND.answers_permissions:
+        # A non-answering backend (the secure server) never relays a
+        # permission: its own ``opencode-perm`` process resolves prompts
+        # out-of-band, so there is no question to build and no pending entry
+        # to answer on a later request.  Callers keep the request/stream
+        # alive and report the wait instead.
+        return None
     pid = str(perm.get("id") or "")
     perm_type = str(perm.get("permission") or perm.get("type") or "")
     if not pid or not perm_type:
@@ -492,6 +509,29 @@ async def _detect_pending_permission(
     except (httpx.HTTPError, OSError, ValueError):
         pass
     return None
+
+
+def _waiting_permission_status(
+    perm: dict[str, Any], announced_ids: set[str],
+) -> Optional[str]:
+    """The once-per-permission "waiting" status for a non-answering backend.
+
+    On a backend that answers permissions (the serve/openchamber transports)
+    this returns None — the caller relays the permission as a question
+    instead, exactly as before.  On the secure backend there is no question
+    to relay and no answer to POST (``opencode-perm`` resolves the prompt
+    out-of-band), so the caller keeps the stream alive and reports the wait.
+    Deduped by permission id (the existing announce-dedupe pattern), so a
+    poll every tick never repeats the line.  Returns None when this
+    permission id was already announced or has no id.
+    """
+    if BACKEND.answers_permissions:
+        return None
+    pid = str(perm.get("id") or "")
+    if not pid or pid in announced_ids:
+        return None
+    announced_ids.add(pid)
+    return _WAITING_PERMISSION_STATUS
 
 
 def _strip_proxy_status_text(text: str) -> str:
@@ -828,6 +868,9 @@ async def _opencode_chat_attempt(
                         question = await _handle_permission_event(
                             client, session_id, perm, {},
                         )
+                        # A non-answering backend (secure) leaves ``question``
+                        # None: the prompt is resolved out-of-band, so the
+                        # loop keeps polling and never aborts the session.
                         if question:
                             # Interactive-mode WRITE/git ask on a headless
                             # blocking call: no user can answer, and the
@@ -882,7 +925,6 @@ async def opencode_chat_stream(
     session_map: Optional[dict[str, str]] = None,
     session_key: Optional[str] = None,
     pending_permissions: Optional[dict[str, tuple[str, bool]]] = None,
-    just_approved_permission: bool = False,
     system_prompt: str = _BRIDGE_SYSTEM_PROMPT,
     timeout: float = OPENCODE_SERVE_TIMEOUT,
     directory: Optional[str] = None,
@@ -989,6 +1031,10 @@ async def opencode_chat_stream(
             pending_done = False
             session_busy = True  # assume working until a status event says idle
             seen_question_pids: set[str] = set()
+            # Permission ids already reported as "waiting" under a backend
+            # that does not answer permissions (the secure server) — dedupes
+            # the status so a poll every tick never repeats the line.
+            announced_permission_ids: set[str] = set()
             running_question_times: list[float] = []
             if resumed and session_id is not None:
                 # Seed part state for the resumed conversation so the
@@ -1248,7 +1294,21 @@ async def opencode_chat_stream(
                                         if question:
                                             yield ("question", question)
                                             return
-                                    return
+                                        if BACKEND.answers_permissions:
+                                            return
+                                        # Non-answering backend: the prompt is
+                                        # resolved out-of-band, so the parked
+                                        # session must NOT look done.  Report
+                                        # the wait once and restart the idle
+                                        # grace so polling continues.
+                                        status = _waiting_permission_status(
+                                            pending_perm, announced_permission_ids,
+                                        )
+                                        if status:
+                                            yield ("status", status)
+                                        idle_since = time.monotonic()
+                                    else:
+                                        return
                             else:
                                 idle_since = None
                             # Real agent work with no new parts (long bash
@@ -1291,6 +1351,11 @@ async def opencode_chat_stream(
                                     if question:
                                         yield ("question", question)
                                         return
+                                    status = _waiting_permission_status(
+                                        pending_perm, announced_permission_ids,
+                                    )
+                                    if status:
+                                        yield ("status", status)
                                     continue
                                 if await _detect_wedged_tool(client, session_id):
                                     await _abort_stream_session_best_effort(
@@ -1343,6 +1408,11 @@ async def opencode_chat_stream(
                                 if question:
                                     yield ("question", question)
                                     return
+                                status = _waiting_permission_status(
+                                    pending_perm, announced_permission_ids,
+                                )
+                                if status:
+                                    yield ("status", status)
                                 continue
                             if await _detect_wedged_tool(client, session_id):
                                 await _abort_stream_session_best_effort(
@@ -1426,6 +1496,11 @@ async def opencode_chat_stream(
                             if question:
                                 yield ("question", question)
                                 return
+                            status = _waiting_permission_status(
+                                props, announced_permission_ids,
+                            )
+                            if status:
+                                yield ("status", status)
                             continue
                         # Other permission types: no existing branch matches,
                         # so fall through to the rest of the loop body.

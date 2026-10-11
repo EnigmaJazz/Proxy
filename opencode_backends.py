@@ -85,6 +85,15 @@ class OpenCodeBackend(ABC):
     #: auth-copy or signal it.
     owns_server: bool = True
 
+    #: Whether this transport answers/relays permission prompts to the
+    #: client.  True by default: the serve and openchamber transports relay
+    #: write/git asks to the user as questions and POST the user's answer
+    #: back so the parked tool resumes.  ``SecureBackend`` sets it False —
+    #: the secure-opencode server's own ``opencode-perm`` process resolves
+    #: prompts out-of-band, so the bridge must neither relay a question nor
+    #: POST an answer; it only reports that the session is waiting.
+    answers_permissions: bool = True
+
     # -- Session lifecycle (the design's core five) ---------------------
 
     @abstractmethod
@@ -536,10 +545,16 @@ class SecureBackend(ServeBackend):
     ``owns_server`` is False: the proxy performs a health probe only and
     never spawns, recycles, config-syncs, auth-copies or signals this
     server.  The systemd unit is the user's to manage.
+
+    ``answers_permissions`` is also False: the server's own
+    ``opencode-perm`` resolves permission prompts out-of-band, so the bridge
+    never relays a question and never POSTs an answer — while a prompt is
+    pending it only reports the wait on the stream.
     """
 
     base_url: str = OPENCODE_SECURE_SERVE_URL
     owns_server: bool = False
+    answers_permissions: bool = False
 
 
 # -- OpenChamber CLI transport (design step 3, 2026-08-22) ------------------

@@ -70,6 +70,7 @@ from opencode_bridge import (
     _post_permission_response,
     opencode_chat_stream_resilient,
 )
+from opencode_backends import BACKEND
 from routing import (
     RouteDecision,
     discriminate_caller,
@@ -1161,18 +1162,19 @@ async def chat_completions(request: Request) -> Response:
         answer = _last_user_text(processed_messages)
         # Pending external_directory WRITE permission from the previous
         # stream: the agent is paused waiting on the gate.  Parse the user's
-        # reply into a permission response, POST it so the tool resumes,
-        # then run the normal pinned continuation.
+        # reply into a permission response and POST it so the tool resumes.
+        # A non-answering backend (the secure server, whose own
+        # opencode-perm resolves prompts out-of-band) never stores a pending
+        # entry, and must never POST an answer even if one somehow lingers —
+        # the flag guard keeps that path impossible.
         pending_permission = _pending_permissions_state(request.app).get(pinned)
-        just_approved = False
-        if pending_permission:
+        if pending_permission and BACKEND.answers_permissions:
             pid, is_write = pending_permission
             permission_response = _parse_permission_answer(
                 answer or "continue", write=is_write,
             )
             await _post_permission_response(pinned, pid, permission_response)
             _pending_permissions_state(request.app).pop(pinned, None)
-            just_approved = True
             logger.info(
                 "Answered pending permission %s for session %s (%s)",
                 pid[:16], pinned[:16], permission_response,
@@ -1187,7 +1189,6 @@ async def chat_completions(request: Request) -> Response:
             session_map=await _opencode_session_state(request.app),
             session_key=session_key,
             pending_permissions=_pending_permissions_state(request.app),
-            just_approved_permission=just_approved,
         )
         await _persist_opencode_sessions(request.app)
         return resp
@@ -2588,7 +2589,6 @@ async def _opencode_task_response(
     session_map: Optional[dict[str, str]] = None,
     session_key: Optional[str] = None,
     pending_permissions: Optional[dict[str, tuple[str, bool]]] = None,
-    just_approved_permission: bool = False,
     system_prompt: str = _BRIDGE_SYSTEM_PROMPT,
     timeout: float = OPENCODE_SERVE_TIMEOUT,
     directory: Optional[str] = None,
@@ -2636,7 +2636,6 @@ async def _opencode_task_response(
             session_map=session_map,
             session_key=session_key,
             pending_permissions=pending_permissions,
-            just_approved_permission=just_approved_permission,
             system_prompt=system_prompt,
             timeout=timeout,
             directory=stream_directory,
@@ -2708,7 +2707,6 @@ async def _opencode_task_response(
         session_map=session_map,
         session_key=session_key,
         pending_permissions=pending_permissions,
-        just_approved_permission=just_approved_permission,
         system_prompt=system_prompt,
         timeout=timeout,
         directory=stream_directory,

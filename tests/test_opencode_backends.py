@@ -623,6 +623,15 @@ def test_secure_backend_owns_no_server() -> None:
     assert ob.OpenChamberBackend.owns_server is True
 
 
+def test_answers_permissions_flag_scoped_to_secure() -> None:
+    """The permission-relay capability defaults True and is switched off
+    ONLY for the secure backend (T5, ct-58464)."""
+    assert ob.OpenCodeBackend.answers_permissions is True
+    assert ob.ServeBackend.answers_permissions is True
+    assert ob.OpenChamberBackend.answers_permissions is True
+    assert ob.SecureBackend.answers_permissions is False
+
+
 class _RecordingResp:
     def __init__(self, status_code: int = 200) -> None:
         self.status_code = status_code

@@ -68,6 +68,10 @@ class _FakeClient:
         self.raise_timeout_on = ""
         self.get_timeouts: list[Any] = []
         self.stream_lines: list[str] = []
+        # The dial URL of every client.stream(...) call — lets a test assert
+        # the /event bus targets the ACTIVE backend's base_url, never the raw
+        # bridge-owned OPENCODE_SERVE_URL constant (T8-found regression).
+        self.stream_calls: list[str] = []
         self.message_get_parts: list[dict[str, Any]] = []
         # Blocking-path scripting (opencode_chat hardening): scripted
         # GET /permission records and a message POST that hangs briefly so
@@ -158,6 +162,11 @@ class _FakeClient:
         return _FakeResp(self.message_status, {"parts": self.message_parts})
 
     def stream(self, *args: Any, **kwargs: Any) -> _FakeStream:
+        # Record the dial target (client.stream("GET", url)) so a test can
+        # assert the /event bus follows the ACTIVE transport's base_url.
+        self.stream_calls.append(
+            args[1] if len(args) > 1 else str(kwargs.get("url", "")),
+        )
         if self.raise_on_stream:
             raise httpx.ConnectError("conn refused")
         return _FakeStream(self.stream_lines)
@@ -4560,3 +4569,85 @@ class TestContextCapReset:
         assert "fresh start answer" in joined
         # The pin was dropped and a fresh session was created.
         assert any(u.endswith("/session") for u, _ in client.post_calls)
+
+
+class TestEventBusDialTargetsActiveBackend:
+    """T8-found regression: the ``/event`` bus dial must follow the ACTIVE
+    transport's ``BACKEND.event_bus_url``.
+
+    An earlier fix dialed the bus via ``BACKEND.base_url`` — a serve-only
+    attribute (``ServeBackend``, inherited by ``SecureBackend``) that the
+    openchamber CLI transport does not define, so ``OPENCODE_BACKEND=openchamber``
+    raised ``AttributeError`` at the dial.  The bus URL is now its own ABC
+    attribute: serve and openchamber keep the historical ``OPENCODE_SERVE_URL``
+    (18900), the secure transport points at ``OPENCODE_SECURE_SERVE_URL``
+    (4096).  Because the bus opens BEFORE the prompt POST, a wrong-port dial
+    under ``OPENCODE_BACKEND=secure`` ended every attempt before ``send_prompt``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_event_bus_targets_secure_backend_base_url(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from constants import OPENCODE_SECURE_SERVE_URL
+        from opencode_backends import SecureBackend
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        monkeypatch.setattr(opencode_bridge, "BACKEND", SecureBackend())
+        client = _FakeClient()
+        client.stream_lines = _stream_events()
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        deltas = [d async for d in opencode_chat_stream("task", pending_permissions=PP)]
+
+        assert client.stream_calls == [f"{SecureBackend.event_bus_url}/event"]
+        assert client.stream_calls[0] == f"{OPENCODE_SECURE_SERVE_URL}/event"
+        assert opencode_bridge.OPENCODE_SERVE_URL not in client.stream_calls[0]
+        # The prompt WAS reached (the pre-fix bug aborted BEFORE send_prompt).
+        assert any("prompt_async" in u for u, _ in client.post_calls)
+        assert "Done." in "".join(t for _, t in deltas)
+
+    @pytest.mark.asyncio
+    async def test_event_bus_targets_default_serve_base_url(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from opencode_backends import ServeBackend
+        from opencode_bridge import opencode_chat_stream
+
+        async def _running(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
+        monkeypatch.setattr(opencode_bridge, "BACKEND", ServeBackend())
+        client = _FakeClient()
+        client.stream_lines = _stream_events()
+        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
+
+        deltas = [d async for d in opencode_chat_stream("task", pending_permissions=PP)]
+
+        assert client.stream_calls == [f"{ServeBackend.event_bus_url}/event"]
+        assert client.stream_calls == [f"{opencode_bridge.OPENCODE_SERVE_URL}/event"]
+        assert "Done." in "".join(t for _, t in deltas)
+
+    def test_event_bus_url_defined_on_every_transport(self) -> None:
+        """Every transport resolves ``event_bus_url`` (no ``AttributeError``).
+
+        ``OpenChamberBackend`` has no ``base_url`` — the earlier
+        ``BACKEND.base_url`` dial raised there — so the bus URL must live on
+        the ABC.  Serve and openchamber keep the historical serve default;
+        the secure transport points at the secure server.
+        """
+        from constants import OPENCODE_SECURE_SERVE_URL
+        from opencode_backends import (
+            OpenChamberBackend,
+            SecureBackend,
+            ServeBackend,
+        )
+
+        assert OpenChamberBackend().event_bus_url == opencode_bridge.OPENCODE_SERVE_URL
+        assert ServeBackend.event_bus_url == opencode_bridge.OPENCODE_SERVE_URL
+        assert SecureBackend.event_bus_url == OPENCODE_SECURE_SERVE_URL

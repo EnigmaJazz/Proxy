@@ -37,6 +37,33 @@ def _fast_idle_grace() -> None:
     yield
     opencode_bridge._IDLE_GRACE_S = saved
 
+
+@pytest.fixture(autouse=True)
+def _pin_default_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the default ``ServeBackend`` transport for every test.
+
+    ``constants.py`` loads the project ``.env`` at import
+    (``constants.py:110``), so a host ``OPENCODE_BACKEND=secure`` leaks
+    into ``os.environ`` for the whole pytest process; ``opencode_backends``
+    then resolves its module-level ``BACKEND`` from that variable at import
+    (``opencode_backends.py:1148``) and the suite silently exercises
+    whatever transport the host runs in production.  Patching BOTH module
+    bindings — ``opencode_backends.BACKEND`` (the origin) and
+    ``opencode_bridge.BACKEND`` (imported by name at
+    ``opencode_bridge.py:58``) — restores the hermetic ``ServeBackend``
+    default so the suite is invariant to the host's ``OPENCODE_BACKEND``.
+
+    This autouse fixture is set up before the test body, so a test's own
+    ``monkeypatch.setattr(opencode_bridge, "BACKEND", ...)`` runs
+    afterwards and still wins.
+    """
+    import opencode_backends
+    import opencode_bridge
+    from opencode_backends import ServeBackend
+
+    monkeypatch.setattr(opencode_backends, "BACKEND", ServeBackend())
+    monkeypatch.setattr(opencode_bridge, "BACKEND", ServeBackend())
+
 # Ensure project root is importable when pytest loads conftest from tests/.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:

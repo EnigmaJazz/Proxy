@@ -1097,7 +1097,7 @@ async def opencode_chat_stream(
             # fire-and-forget (no replay), so connecting after prompt_async
             # misses the early events (user message, assistant start, first
             # reasoning/tool parts) and the stream would look empty.
-            async with client.stream("GET", f"{OPENCODE_SERVE_URL}/event") as ev:
+            async with client.stream("GET", f"{BACKEND.event_bus_url}/event") as ev:
                 async_resp = None
                 if not skip_prompt:
                     async_resp = await BACKEND.send_prompt(

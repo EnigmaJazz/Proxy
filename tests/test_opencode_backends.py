@@ -241,7 +241,7 @@ async def test_send_prompt_dispatches_via_cli(
         await backend.create_session(client, directory=workdir)
         resp = await backend.send_prompt(
             client, FAKE_SESSION_ID,
-            agent="gentle-orchestrator", system_prompt="sys", user_text="hello",
+            system_prompt="sys", user_text="hello",
         )
     assert resp.status_code == 204
     send_call = _cli_calls(tmp_path)[-1]
@@ -290,7 +290,7 @@ async def test_send_message_returns_assistant_text_parts(
         await backend.create_session(client, directory=workdir)
         resp = await backend.send_message(
             client, FAKE_SESSION_ID,
-            agent="gentle-orchestrator", system_prompt="sys", user_text="hello",
+            system_prompt="sys", user_text="hello",
             timeout=10.0,
         )
     assert resp.status_code == 200
@@ -311,7 +311,7 @@ async def test_send_message_wedge_timeout_returns_empty_parts(
         await backend.create_session(client, directory=workdir)
         resp = await backend.send_message(
             client, FAKE_SESSION_ID,
-            agent="gentle-orchestrator", system_prompt="sys", user_text="hello",
+            system_prompt="sys", user_text="hello",
             timeout=0.25,
         )
     assert resp.status_code == 200
@@ -472,7 +472,6 @@ async def test_send_message_transient_cli_failure_retries_while_daemon_alive(
         resp = await backend.send_message(
             client,
             FAKE_SESSION_ID,
-            agent="gentle-orchestrator",
             system_prompt="sys",
             user_text="hello",
             timeout=1.0,
@@ -517,7 +516,6 @@ async def test_send_message_raises_when_daemon_dies_mid_poll(
             await backend.send_message(
                 client,
                 FAKE_SESSION_ID,
-                agent="gentle-orchestrator",
                 system_prompt="sys",
                 user_text="hello",
                 timeout=1.0,
@@ -568,7 +566,6 @@ async def test_send_message_transient_failure_then_daemon_death(
             await backend.send_message(
                 client,
                 FAKE_SESSION_ID,
-                agent="gentle-orchestrator",
                 system_prompt="sys",
                 user_text="hello",
                 timeout=1.0,
@@ -670,6 +667,18 @@ def test_send_signatures_carry_no_model_override_params() -> None:
         assert "provider_id" not in params, (fn, sorted(params))
 
 
+def test_send_signatures_carry_no_agent_param() -> None:
+    """T8-found agent fix, rule 7: no send primitive accepts an ``agent``
+    parameter, so a caller CANNOT pin the agent — the server's own config
+    (its ``default_agent``) selects the agent, exactly as for the
+    interactive session."""
+    import inspect
+
+    for fn in _send_signatures():
+        params = inspect.signature(fn).parameters
+        assert "agent" not in params, (fn, sorted(params))
+
+
 class _PayloadClient:
     """httpx.AsyncClient stand-in that records each POST's JSON body."""
 
@@ -689,17 +698,39 @@ async def test_send_payload_never_carries_model_override() -> None:
     backend = ob.ServeBackend()
     client = _PayloadClient()
     await backend.send_prompt(
-        client, "ses1", agent="gentle-orchestrator", system_prompt="s",
+        client, "ses1", system_prompt="s",
         user_text="u",
     )
     await backend.send_message(
-        client, "ses1", agent="gentle-orchestrator", system_prompt="s",
+        client, "ses1", system_prompt="s",
         user_text="u", timeout=1.0,
     )
     assert len(client.payloads) == 2, client.payloads
     for payload in client.payloads:
         assert "model" not in payload, payload
-        assert payload["agent"] == "gentle-orchestrator", payload
+        assert "agent" not in payload, payload
+        assert payload["system"] == "s", payload
+        assert payload["parts"] == [{"type": "text", "text": "u"}], payload
+
+
+@pytest.mark.asyncio
+async def test_send_payload_never_carries_agent_key() -> None:
+    """T8-found agent fix, rule 7: the outbound payload has NO ``agent`` key
+    on either send primitive — the streaming prompt_async (``send_prompt``)
+    and the blocking message POST (``send_message``).  Agent selection
+    belongs to the server's own config, so the bridge cannot pin a
+    read-only agent (mirrors the T6 model-override removal)."""
+    backend = ob.ServeBackend()
+    client = _PayloadClient()
+    await backend.send_prompt(
+        client, "ses1", system_prompt="s", user_text="u",
+    )
+    await backend.send_message(
+        client, "ses1", system_prompt="s", user_text="u", timeout=1.0,
+    )
+    assert len(client.payloads) == 2, client.payloads
+    for payload in client.payloads:
+        assert "agent" not in payload, payload
         assert payload["system"] == "s", payload
         assert payload["parts"] == [{"type": "text", "text": "u"}], payload
 
@@ -711,13 +742,13 @@ async def test_secure_backend_urls_target_port_4096() -> None:
     client = _RecordingClient()
     await backend.create_session(client, directory="/tmp/work")
     await backend.send_prompt(
-        client, "ses1", agent="a", system_prompt="s", user_text="u",
+        client, "ses1", system_prompt="s", user_text="u",
     )
     await backend.fetch_messages(client, "ses1")
     await backend.session_exists(client, "ses1")
     await backend.abort_session(client, "ses1")
     await backend.send_message(
-        client, "ses1", agent="a", system_prompt="s", user_text="u",
+        client, "ses1", system_prompt="s", user_text="u",
         timeout=1.0,
     )
     await backend.fetch_message(client, "ses1", "mid1")

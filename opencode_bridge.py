@@ -42,7 +42,6 @@ from typing import Any, AsyncIterator, Optional
 import httpx
 
 from constants import (
-    OPENCODE_AGENT,
     OPENCODE_BIN,
     OPENCODE_SERVE_TIMEOUT,
     OPENCODE_SERVE_URL,
@@ -753,7 +752,6 @@ async def _spawn_serve(mtime: Optional[float]) -> bool:
 async def opencode_chat(
     user_text: str,
     *,
-    agent: str = OPENCODE_AGENT,
     timeout: float = OPENCODE_SERVE_TIMEOUT,
     system_prompt: str = _BRIDGE_SYSTEM_PROMPT,
     directory: Optional[str] = None,
@@ -782,7 +780,7 @@ async def opencode_chat(
         return _serve_unreachable_message()
     async with httpx.AsyncClient() as client:
         text, network_failed = await _opencode_chat_attempt(
-            client, user_text, agent=agent, timeout=timeout,
+            client, user_text, timeout=timeout,
             system_prompt=system_prompt,
             directory=directory,
         )
@@ -795,7 +793,7 @@ async def opencode_chat(
         if not await ensure_opencode_serve():
             return _serve_unreachable_message()
         text, _ = await _opencode_chat_attempt(
-            client, user_text, agent=agent, timeout=timeout,
+            client, user_text, timeout=timeout,
             system_prompt=system_prompt,
             directory=directory,
         )
@@ -806,7 +804,6 @@ async def _opencode_chat_attempt(
     client: httpx.AsyncClient,
     user_text: str,
     *,
-    agent: str,
     timeout: float,
     system_prompt: str,
     directory: Optional[str] = None,
@@ -836,7 +833,7 @@ async def _opencode_chat_attempt(
         post_task = asyncio.create_task(
             BACKEND.send_message(
                 client, session_id,
-                agent=agent, system_prompt=system_prompt, user_text=user_text,
+                system_prompt=system_prompt, user_text=user_text,
                 timeout=timeout,
             )
         )
@@ -905,7 +902,6 @@ async def _opencode_chat_attempt(
 async def opencode_chat_stream(
     user_text: str,
     *,
-    agent: str = OPENCODE_AGENT,
     session_map: Optional[dict[str, str]] = None,
     session_key: Optional[str] = None,
     pending_permissions: Optional[dict[str, tuple[str, bool]]] = None,
@@ -1102,7 +1098,7 @@ async def opencode_chat_stream(
                 if not skip_prompt:
                     async_resp = await BACKEND.send_prompt(
                         client, session_id,
-                        agent=agent, system_prompt=system_prompt,
+                        system_prompt=system_prompt,
                         user_text=user_text,
                     )
                 if async_resp is not None and async_resp.status_code != 204:
@@ -1658,7 +1654,7 @@ async def opencode_escalation(stage: int, prompt: str) -> str:
     user is present to relay the question).
     """
     logger.info("OpenCode escalation (stage=%d): %r", stage, prompt[:200])
-    return await opencode_chat(prompt, agent=OPENCODE_AGENT)
+    return await opencode_chat(prompt)
 
 
 

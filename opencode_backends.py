@@ -70,7 +70,7 @@ class OpenCodeBackend(ABC):
     primitive to a backend so a second transport (the openchamber CLI,
     later steps) can implement the same contract.  Session-oriented
     signatures follow the design doc's shape — ``create_session(directory)``,
-    ``send_prompt(session_id, agent, system_prompt, user_text)``,
+    ``send_prompt(session_id, system_prompt, user_text)``,
     ``fetch_messages(session_id)``,
     ``session_exists(session_id)``, ``abort_session(session_id)`` —
     adjusted only as needed to cover the serve primitives 1:1 (the caller's
@@ -120,7 +120,6 @@ class OpenCodeBackend(ABC):
         client: httpx.AsyncClient,
         session_id: str,
         *,
-        agent: str,
         system_prompt: str,
         user_text: str,
     ) -> httpx.Response:
@@ -158,7 +157,6 @@ class OpenCodeBackend(ABC):
         client: httpx.AsyncClient,
         session_id: str,
         *,
-        agent: str,
         system_prompt: str,
         user_text: str,
         timeout: float,
@@ -233,20 +231,19 @@ class OpenCodeBackend(ABC):
 
 def _build_send_payload(
     *,
-    agent: str,
     system_prompt: str,
     user_text: str,
 ) -> dict[str, Any]:
     """Build the serve message/prompt payload.
 
-    The agent/system/parts shape the serve expects.  The payload carries NO
-    model override: model selection belongs to the server's own agent config
-    (bridge v4, T6), so no caller can dictate a model.  Relocated verbatim
-    from the bridge's two inline construction sites so both send primitives
-    share one copy.
+    The system/parts shape the serve expects.  The payload carries NEITHER a
+    model override NOR an agent override: model and agent selection both
+    belong to the server's own config (the model override went in bridge v4
+    T6; the agent override in the T8-found agent fix), so no caller can
+    dictate either.  Relocated verbatim from the bridge's two inline
+    construction sites so both send primitives share one copy.
     """
     return {
-        "agent": agent,
         "system": system_prompt,
         "parts": [{"type": "text", "text": user_text}],
     }
@@ -291,7 +288,6 @@ class ServeBackend(OpenCodeBackend):
         client: httpx.AsyncClient,
         session_id: str,
         *,
-        agent: str,
         system_prompt: str,
         user_text: str,
     ) -> httpx.Response:
@@ -306,7 +302,7 @@ class ServeBackend(OpenCodeBackend):
         return await client.post(
             f"{self.base_url}/session/{session_id}/prompt_async",
             json=_build_send_payload(
-                agent=agent, system_prompt=system_prompt, user_text=user_text,
+                system_prompt=system_prompt, user_text=user_text,
             ),
             timeout=30.0,
         )
@@ -374,7 +370,6 @@ class ServeBackend(OpenCodeBackend):
         client: httpx.AsyncClient,
         session_id: str,
         *,
-        agent: str,
         system_prompt: str,
         user_text: str,
         timeout: float,
@@ -391,7 +386,7 @@ class ServeBackend(OpenCodeBackend):
         return await client.post(
             f"{self.base_url}/session/{session_id}/message",
             json=_build_send_payload(
-                agent=agent, system_prompt=system_prompt, user_text=user_text,
+                system_prompt=system_prompt, user_text=user_text,
             ),
             timeout=timeout,
         )
@@ -708,8 +703,8 @@ class OpenChamberBackend(OpenCodeBackend):
                 --limit 5``
       list      ``session list --json``
 
-    The ``agent``/``system_prompt``/``user_text`` parameters are the
-    serve payload's; the CLI's agent + model come from the daemon config
+    The ``system_prompt``/``user_text`` parameters are the serve
+    payload's; the CLI's agent + model come from the daemon config
     (patched at spawn to pin gentle-orchestrator to kinver/professional)
     and the agent's own system prompt, so they are intentionally NOT
     forwarded.
@@ -798,7 +793,6 @@ class OpenChamberBackend(OpenCodeBackend):
         client: httpx.AsyncClient,
         session_id: str,
         *,
-        agent: str,
         system_prompt: str,
         user_text: str,
     ) -> httpx.Response:
@@ -926,7 +920,6 @@ class OpenChamberBackend(OpenCodeBackend):
         client: httpx.AsyncClient,
         session_id: str,
         *,
-        agent: str,
         system_prompt: str,
         user_text: str,
         timeout: float,

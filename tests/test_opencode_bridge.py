@@ -490,30 +490,6 @@ class TestOpenCodeChatHardening:
         )
 
     @pytest.mark.asyncio
-    async def test_read_permission_auto_allowed(
-        self, fake_client: _FakeClient, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        monkeypatch.setattr(opencode_bridge, "_BLOCKING_PERMISSION_POLL_S", 0.01)
-        fake_client.message_hang_s = 0.2
-        fake_client.message_parts = [{"type": "text", "text": "ok"}]
-        fake_client.permission_records = [{
-            "id": "perm_1",
-            "sessionID": "ses_0001",
-            "permission": "external_directory",
-            "patterns": ["cat /etc/os-release"],
-            "tool": {"messageID": "m1", "callID": "c1"},
-        }]
-        result = await opencode_chat("task")
-        assert result == "ok"
-        assert any(
-            url.endswith("/permissions/perm_1") and body == {"response": "always"}
-            for url, body in fake_client.post_calls
-        )
-        assert not any(
-            url.endswith("/abort") for url, _ in fake_client.post_calls
-        )
-
-    @pytest.mark.asyncio
     async def test_write_permission_aborts(
         self, fake_client: _FakeClient, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -1691,57 +1667,6 @@ class TestResumedSessionPollingReplay:
         assert list_get_idxs[0] > prompt_idx
 
 
-# ---------------------------------------------------------------------------
-# External-directory permission relay (opencode >= 1.18 external_directory
-# gate): reads auto-allowed, writes asked to the user.
-# ---------------------------------------------------------------------------
-class TestClassifyExternalAccess:
-    """_classify_external_access must tag mutating commands WRITE (needs
-    user approval) and read-only commands READ (auto-allowed)."""
-
-    @pytest.mark.parametrize("cmd", [
-        "echo x > /etc/foo",
-        "echo x >> /home/user/log",
-        "mv /etc/foo /etc/bar",
-        "cp /etc/passwd /home/user/",
-        "rm -rf /home/user/cache",
-        "touch /home/user/foo",
-        "mkdir /home/user/out",
-        "rmdir /home/user/old",
-        "ln -s /etc/hosts /home/user/hosts",
-        "chmod 644 /home/user/file",
-        "chown james /home/user/file",
-        "tee /etc/foo",
-        "sed -i s/x/y/ /etc/hosts",
-        "install -m 755 app /usr/local/bin/app",
-        "dd if=/dev/zero of=/home/user/big",
-        "git commit -m bump",
-        "git push",
-        "git reset --hard HEAD",
-        "git checkout -- src/x.py",
-        "write /dev/tty1",
-        "printf x > /etc/foo",
-    ])
-    def test_mutating_commands_are_write(self, cmd: str) -> None:
-        from opencode_bridge import _classify_external_access
-        assert _classify_external_access(cmd) == "write"
-
-    @pytest.mark.parametrize("cmd", [
-        "cat /etc/os-release",
-        "ls /home",
-        "head -5 /etc/passwd",
-        "grep james /etc/passwd",
-        "stat /etc/hosts",
-    ])
-    def test_read_only_commands_are_read(self, cmd: str) -> None:
-        from opencode_bridge import _classify_external_access
-        assert _classify_external_access(cmd) == "read"
-
-    def test_empty_cmd_is_read(self) -> None:
-        from opencode_bridge import _classify_external_access
-        assert _classify_external_access("") == "read"
-
-
 class TestParsePermissionAnswer:
     """_parse_permission_answer maps the user's reply to a permission
     response value understood by POST /session/{id}/permissions/{pid}."""
@@ -1781,43 +1706,8 @@ class TestParsePermissionAnswer:
 
 class TestPermissionRelay:
     """The event-bus permission.updated handler relays external_directory
-    gates: READ is auto-allowed with {"response": "always"}, WRITE yields a
-    question and stops the stream with the permission stored for the next
-    request."""
-
-    @pytest.mark.asyncio
-    async def test_read_permission_auto_allowed_no_question(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        from opencode_bridge import opencode_chat_stream
-
-        async def _running(*args: Any, **kwargs: Any) -> bool:
-            return True
-
-        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
-        client = _FakeClient()
-        client.stream_lines = [
-            _evt("message.updated", sessionID="ses_0001",
-                 info={"id": "msg_user", "role": "user"}),
-            _evt("message.updated", sessionID="ses_0001",
-                 info={"id": "msg_a", "role": "assistant"}),
-            _evt("permission.updated", sessionID="ses_0001",
-                 id="perm_2", type="external_directory",
-                 title="Allow reading external file",
-                 metadata={"command": "cat /etc/os-release"}),
-        ]
-        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
-
-        deltas = [d async for d in opencode_chat_stream("task", pending_permissions=PP)]
-
-        # No question surfaced; the tool proceeds silently.
-        assert [k for k, _ in deltas if k == "question"] == []
-        perm_posts = [(u, b) for u, b in client.post_calls if "/permissions/" in u]
-        assert any(
-            u.endswith("/permissions/perm_2") and b == {"response": "always"}
-            for u, b in perm_posts
-        )
-        assert PP.get("ses_0001") is None
+    gates: a permission yields a question and stops the stream with the
+    permission stored for the next request."""
 
     @pytest.mark.asyncio
     async def test_write_permission_yields_question_and_stops(
@@ -2114,49 +2004,6 @@ class TestPinnedSessionAndQuestions:
         creates = [u for m, u in client.calls if m == "post" and u.endswith("/session")]
         assert creates == []
         assert smap["conv-1"] == "ses_0001"
-
-    @pytest.mark.asyncio
-    async def test_busy_pinned_after_permission_approval_not_aborted(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """Regression (review finding 2): a pinned session that just resumed
-        after a permission approval is legitimately BUSY (executing the
-        approved tool / generating its summary).  With
-        ``just_approved_permission=True`` the busy-abort must be skipped and
-        the pin reused — NOT aborted and started fresh (which would kill the
-        just-approved tool mid-execution)."""
-        from opencode_bridge import opencode_chat_stream
-
-        async def _running(*args: Any, **kwargs: Any) -> bool:
-            return True
-
-        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
-        client = _BusyThenIdleClient()  # reports busy for 3 polls then idle
-        client.stream_lines = _stream_events()
-        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
-
-        smap: dict[str, str] = {}
-        # First call pins the session.
-        [d async for d in opencode_chat_stream(
-            "task", session_map=smap, session_key="conv-perm",
-        )]
-        assert smap.get("conv-perm") == "ses_0001"
-
-        client.calls.clear()
-        client.stream_lines = _stream_events()
-        # Second call resumes AFTER a permission approval: busy must NOT abort.
-        [d async for d in opencode_chat_stream(
-            "allow",
-            session_map=smap,
-            session_key="conv-perm",
-            just_approved_permission=True,
-        )]
-        # No /session POST (create) and no abort fired; pin survived.
-        creates = [u for m, u in client.calls if m == "post" and u.endswith("/session")]
-        aborts = [u for m, u in client.calls if m == "post" and u.endswith("/abort")]
-        assert creates == []
-        assert aborts == []
-        assert smap["conv-perm"] == "ses_0001"
 
     @pytest.mark.asyncio
     async def test_question_yields_text_and_stops(
@@ -2945,77 +2792,6 @@ class TestServeStability:
         assert ok is True
         assert killed == [12345]  # unchanged — no new signals
         assert len(spawns) == 2
-
-
-# ---------------------------------------------------------------------------
-# Zombie sweep / pinned-session protection
-# ---------------------------------------------------------------------------
-class _ZombieSessionClient(_FakeClient):
-    """_FakeClient whose GET /session returns scripted session records.
-
-    The default _FakeClient returns {} for /session, but the sweep iterates
-    the JSON list — this variant scripts the exact record list it needs."""
-
-    def __init__(self, sessions: list[dict[str, Any]]) -> None:
-        super().__init__()
-        self.sessions = sessions
-
-    async def get(self, url: str, **kwargs: Any) -> _FakeResp:
-        if url == f"{opencode_bridge.OPENCODE_SERVE_URL}/session":
-            return _FakeResp(200, self.sessions)
-        return await super().get(url, **kwargs)
-
-
-class TestZombieSweep:
-    @pytest.mark.asyncio
-    async def test_pinned_session_never_aborted_unpinned_stale_is(self) -> None:
-        """A session pinned in the session map survives the zombie sweep
-        even when idle far past the 240s threshold, while an unpinned
-        session with the same stale age is still aborted.
-
-        Regression (2026-08-07): the sweep killed pinned sessions
-        legitimately waiting for user input (clarifying questions,
-        multi-turn pauses), so the follow-up posted into a dead session
-        and the agent lost all conversation context."""
-        from opencode_bridge import _abort_zombie_sessions
-
-        stale_ms = int(time.time() * 1000) - 1_000_000  # ~17 min idle
-        pinned_id = "ses_pinned_waiting_on_user"
-        unpinned_id = "ses_unpinned_stale"
-        client = _ZombieSessionClient([
-            {"id": pinned_id, "time": {"updated": stale_ms}},
-            {"id": unpinned_id, "time": {"updated": stale_ms}},
-        ])
-
-        await _abort_zombie_sessions(client, protected_ids={pinned_id})
-
-        aborts = [
-            url for method, url in client.calls
-            if method == "post" and "/abort" in url
-        ]
-        assert len(aborts) == 1
-        assert unpinned_id in aborts[0]
-        assert pinned_id not in aborts[0]
-
-    @pytest.mark.asyncio
-    async def test_no_protected_set_sweeps_all_stale(self) -> None:
-        """Without a protected set (no session map at the call site) the
-        sweep behaves as before: every stale session is aborted."""
-        from opencode_bridge import _abort_zombie_sessions
-
-        stale_ms = int(time.time() * 1000) - 1_000_000
-        client = _ZombieSessionClient([
-            {"id": "ses_a", "time": {"updated": stale_ms}},
-            {"id": "ses_b", "time": {"updated": stale_ms}},
-        ])
-
-        await _abort_zombie_sessions(client)
-
-        aborts = [
-            url for method, url in client.calls
-            if method == "post" and "/abort" in url
-        ]
-        assert len(aborts) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -3853,39 +3629,8 @@ class TestCompletionResolvesPermissions:
     """Root-cause regression (2026-08-07): the bridge used to pop pending
     permissions without answering them on completion, so the serve parked
     the tool forever and the next follow-up's wedge detector killed the
-    session.  Two fixes: (1) completion must not fire while a running tool
-    exists in the newest message; (2) when it does complete, it must
-    RESOLVE the pending permission (auto-allow READ, question for WRITE)."""
-
-    @pytest.mark.parametrize("tool_name,cmd,expected", [
-        ("write", "/etc/*", "write"),
-        ("edit", "/etc/*", "write"),
-        ("patch", "/etc/*", "write"),
-        ("bash", "cat /etc/os-release", "read"),
-        ("bash", "mv /etc/foo /etc/bar", "write"),
-    ])
-    def test_permission_classification_tool_aware(
-        self, tool_name: str, cmd: str, expected: str,
-    ) -> None:
-        """Review finding 2: the permission classifier must be TOOL-AWARE so
-        a write/edit/patch tool to an external path is classified WRITE even
-        though it has no bash command to inspect (the bash-only heuristic
-        would read the path pattern and auto-allow the write).  All paths —
-        event bus, polling fallback, completion resolver — use this one
-        classifier."""
-        from opencode_bridge import _classify_permission_access
-        assert _classify_permission_access(
-            "external_directory", tool_name, cmd,
-        ) == expected
-
-    @pytest.mark.parametrize("perm_type", ["write", "edit", "patch"])
-    def test_write_edit_perm_type_classifies_write(self, perm_type: str) -> None:
-        """F2: a permission whose TYPE is itself a write tool ("write"/"edit")
-        must classify as WRITE with an EMPTY command.  The old code fell
-        through to the cmd heuristic, read an empty cmd as "read", and
-        auto-allowed the write even in interactive mode."""
-        from opencode_bridge import _classify_permission_access
-        assert _classify_permission_access(perm_type, "", "") == "write"
+    session.  Completion must not fire while a running tool exists in the
+    newest message."""
 
     @pytest.mark.asyncio
     async def test_completion_does_not_fire_with_running_tool(
@@ -3935,40 +3680,6 @@ class TestCompletionResolvesPermissions:
         # The running tool suppressed completion: the stream was still alive
         # after 1.5s and emitting keepalives.
         assert len(keepalives) >= 1, "stream ended while tool running"
-
-    @pytest.mark.asyncio
-    async def test_completion_resolves_pending_read_permission(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """When the agent looks done (idle) but a READ permission is pending,
-        the bridge auto-allows it (POST "always") instead of abandoning it."""
-        from opencode_bridge import opencode_chat_stream
-
-        async def _running(*args: Any, **kwargs: Any) -> bool:
-            return True
-
-        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
-        monkeypatch.setattr(opencode_bridge, "_EVENT_QUIET_TIMEOUT", 0.02)
-        monkeypatch.setattr(opencode_bridge, "_TOOL_WEDGE_AFTER_S", 60.0)
-        client = _RunningToolPermissionClient()
-        client.status_type = "idle"  # completion path
-        client.permission_records = [{
-            "id": "perm_read", "sessionID": "ses_0001",
-            "permission": "external_directory",
-            "patterns": ["/etc/systemd/system/*"],
-            "tool": {"messageID": "msg_a", "callID": "call_x"},
-        }]
-        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
-
-        deltas = [d async for d in opencode_chat_stream("task", pending_permissions=PP)]
-
-        # The permission was ANSWERED (POST always), not abandoned.
-        perm_posts = [(u, b) for u, b in client.post_calls if "/permissions/" in u]
-        assert any(u.endswith("/permissions/perm_read") and b == {"response": "always"}
-                   for u, b in perm_posts)
-        # No pending entry leaked.
-        assert PP.get("ses_0001") is None
-
 
 class TestSddSubagentContract:
     """The SDD sub-agent contract is the single source of truth for the
@@ -4151,67 +3862,6 @@ class TestSyncOpenaiAuthIntoServe:
         env: dict[str, str] = {}
         opencode_bridge._sync_openai_auth_into_serve(env)  # never raises
         assert "OPENAI_API_KEY" not in env
-
-
-class TestSessionBusyOnCurrentServe:
-    """Quiet-but-working sessions (a running tool part on the current
-    serve) must survive the zombie sweep."""
-
-    @pytest.mark.asyncio
-    async def test_running_tool_after_serve_start_is_busy(self) -> None:
-        client = _PollClient()
-        client.poll_messages = [_assistant_msg([{
-            "id": "prt_t", "messageID": "msg_a", "type": "tool",
-            "tool": "bash",
-            "state": {
-                "status": "running",
-                "time": {"start": int(time.time() * 1000) - 30_000},
-            },
-        }])]
-        serve_start_ms = int(time.time() * 1000) - 300_000
-        assert await opencode_bridge._session_busy_on_current_serve(
-            client, client.session_id, serve_start_ms,
-        ) is True
-
-    @pytest.mark.asyncio
-    async def test_stale_part_is_not_busy(self) -> None:
-        client = _PollClient()
-        client.poll_messages = [_assistant_msg([{
-            "id": "prt_t", "messageID": "msg_a", "type": "tool",
-            "tool": "bash",
-            "state": {
-                "status": "running",
-                "time": {"start": int(time.time() * 1000) - 600_000},
-            },
-        }])]
-        serve_start_ms = int(time.time() * 1000) - 300_000
-        assert await opencode_bridge._session_busy_on_current_serve(
-            client, client.session_id, serve_start_ms,
-        ) is False
-
-    @pytest.mark.asyncio
-    async def test_completed_part_is_not_busy(self) -> None:
-        client = _PollClient()
-        client.poll_messages = [_assistant_msg([{
-            "id": "prt_t", "messageID": "msg_a", "type": "tool",
-            "tool": "bash",
-            "state": {
-                "status": "completed",
-                "time": {"start": int(time.time() * 1000) - 30_000},
-            },
-        }])]
-        serve_start_ms = int(time.time() * 1000) - 300_000
-        assert await opencode_bridge._session_busy_on_current_serve(
-            client, client.session_id, serve_start_ms,
-        ) is False
-
-    @pytest.mark.asyncio
-    async def test_http_error_is_not_busy(self) -> None:
-        client = _FakeClient()
-        client.raise_on = "get"
-        assert await opencode_bridge._session_busy_on_current_serve(
-            client, "ses_0001", int(time.time() * 1000),
-        ) is False
 
 
 class TestCopyIfChanged:

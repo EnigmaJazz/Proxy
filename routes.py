@@ -24,7 +24,6 @@ import json
 import re
 import sqlite3
 import subprocess
-import shutil
 import time
 from datetime import datetime
 import uuid
@@ -49,7 +48,6 @@ from constants import (
     _HEAVY_MODEL_KEYS,
     MODEL_LABELS,
     OPENCODE_AGENT,
-    OPENCODE_SDD_TIMEOUT,
     OPENCODE_SDD_DIRECTORY,
     OPENCODE_BRIDGE_DIRECTORY,
     OPENCODE_SERVE_TIMEOUT,
@@ -69,7 +67,6 @@ from llm import (
 )
 from opencode_bridge import (
     _BRIDGE_SYSTEM_PROMPT,
-    _SDD_AUTONOMOUS_SYSTEM_PROMPT,
     _parse_permission_answer,
     _post_permission_response,
     opencode_chat_stream_resilient,
@@ -266,16 +263,15 @@ def _parse_coding_answer(text: str) -> str:
     """Map the user's reply to a routing decision.
 
     ``"opencode"`` when the reply mentions opencode; ``"cancel"`` when it
-    aborts the task; otherwise the safe default ``"professional"`` (the
-    local code pathway).
+    aborts the task; anything else — including replies naming a retired
+    mode — falls to the safe default ``"professional"`` (the local code
+    pathway).
     """
     lowered = (text or "").strip().lower()
     if _is_cancel_answer(lowered):
         return "cancel"
     if any(k in lowered for k in ("opencode", "/opencode")):
         return "opencode"
-    if any(k in lowered for k in ("sdd", "spec-driven", "spec driven", "sd cycle")):
-        return "sdd"
     return "professional"
 
 
@@ -613,34 +609,6 @@ async def list_models(request: Request) -> JSONResponse:
 #: prompt_cache F6 carve-out).  Small, per-process; dies with the process.
 _RECENT_OPENCODE_WORK: list[dict[str, Any]] = []
 _MAX_RECENT_WORK = 2
-
-
-def _copy_sdd_output_to_workspace(change_name: str, summary: str) -> str:
-    """Copy a completed SDD cycle's artifacts into the nanobot workspace.
-
-    SDD-autonomous cycles run in the proxy repo (OPENCODE_SDD_DIRECTORY —
-    the OpenSpec store lives there).  The cycle's final output is copied
-    to ``<bridge-directory>/sdd-work/<change>/`` — the shared workspace
-    the local model reads — with the final summary as FINAL-SUMMARY.md.
-    Returns the destination path ("" when the change dir is missing).
-    Runs in a worker thread (file I/O).  Never raises.
-    """
-    src = Path(OPENCODE_SDD_DIRECTORY) / "openspec" / "changes" / change_name
-    dst = Path(OPENCODE_BRIDGE_DIRECTORY) / "sdd-work" / change_name
-    try:
-        if not src.is_dir():
-            return ""
-        dst.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(src, dst, dirs_exist_ok=True)
-        if summary:
-            (dst / "FINAL-SUMMARY.md").write_text(summary, encoding="utf-8")
-        logger.info(
-            "Copied SDD output for change %s to %s", change_name, dst,
-        )
-        return str(dst)
-    except OSError:
-        logger.exception("copying SDD output to workspace failed")
-        return ""
 
 
 def _capture_opencode_work(text_parts: list[str]) -> None:
@@ -1051,7 +1019,6 @@ async def chat_completions(request: Request) -> Response:
     caller_type = discriminate_caller(headers)
     lane_b = is_lane_b(headers)
     is_dream = False
-    is_apply_local = False  # bound for every caller path (2026-08-11)
 
     # ---- Prepare messages (Glass Pipe Rule: NO text alteration) ------------
     processed_messages: list[dict[str, Any]] = list(messages)  # Shallow copy
@@ -1083,16 +1050,6 @@ async def chat_completions(request: Request) -> Response:
             if isinstance(m.get("content"), str)
         ).lower()
         is_dream = await is_dream_process(raw_text)
-        # LOCAL-APPLY BYPASS: the opencode serve's kinver calls for the
-        # sdd-apply-local agent (the task text always starts 'You are the
-        # apply executor for SDD change') must NEVER be triaged or sent
-        # through the coding gate — the user explicitly chose the LOCAL
-        # model for the apply, so the request goes straight to the
-        # professional service (mirrors the dream-request bypass).
-        is_apply_local = (
-            "you are the apply executor for sdd change" in raw_text
-            or "you are the apply executor for sd" in raw_text
-        )
 
         effective_domain = model_domain if model_domain in (
             "coder", "architect", "professional", "creative", "scholar",
@@ -1178,10 +1135,9 @@ async def chat_completions(request: Request) -> Response:
     if last_user and _OPENCODE_RE.search(last_user.lower()):
         return await _handle_opencode_command(last_user, request.app)
 
-    # model: "opencode" / "opencode-sdd" — client picked the opencode
-    # bridge model.  This bypasses llama routing entirely: the task goes to
-    # the headless opencode serve backend (gentle-orchestrator SDD agent).
-    # "opencode-sdd" runs the FULL SDD cycle autonomously in one turn.
+    # model: "opencode" — client picked the opencode bridge model.  This
+    # bypasses llama routing entirely: the task goes to the headless
+    # opencode serve backend (the gentle-orchestrator agent).
     session_key = _resolve_session_id(processed_messages, request.app)
     if requested_model in BRIDGE_MODEL_KEYS:
         resp = await _handle_opencode_request(
@@ -1190,7 +1146,6 @@ async def chat_completions(request: Request) -> Response:
             session_map=await _opencode_session_state(request.app),
             session_key=session_key,
             pending_permissions=_pending_permissions_state(request.app),
-            sdd=(requested_model == "opencode-sdd"),
         )
         await _persist_opencode_sessions(request.app)
         return resp
@@ -1573,24 +1528,6 @@ async def chat_completions(request: Request) -> Response:
             project_id="general",
             is_factual=False,
             is_lane_b=True,
-            bypass_frontdesk=True,
-        )
-    elif is_apply_local:
-        # LOCAL-APPLY BYPASS (2026-08-09): the request is the opencode
-        # serve's sdd-apply-local delegation — the user explicitly chose
-        # the local model.  Pin professional directly, no frontdesk
-        # triage, no coding gate.
-        port = await systemd.get_port("professional")
-        route = RouteDecision(
-            model_key="professional",
-            port=port,
-            is_cpu_fallback=False,
-            hardware_path="gpu",
-            priority=1,
-            intent="CODE",
-            project_id="general",
-            is_factual=False,
-            is_lane_b=False,
             bypass_frontdesk=True,
         )
     else:
@@ -2759,16 +2696,6 @@ async def _opencode_task_response(
         # Best-effort: capture failures must never break the stream.
         if _resp_text:
             try:
-                # SDD-autonomous cycles run in the proxy repo (the OpenSpec
-                # store); copy their artifacts into the nanobot workspace so
-                # the local model can see the final output (2026-08-14,
-                # user-requested) BEFORE the context capture snapshots the
-                # tree (the copied files then appear in the block).
-                if autonomous and _chg is not None:
-                    await asyncio.to_thread(
-                        _copy_sdd_output_to_workspace,
-                        _chg.group(1), "".join(_resp_text),
-                    )
                 await asyncio.to_thread(_capture_opencode_work, _resp_text)
             except Exception:
                 logger.exception("capturing opencode work failed")
@@ -2821,7 +2748,6 @@ async def _handle_opencode_request(
     session_map: Optional[dict[str, str]] = None,
     session_key: Optional[str] = None,
     pending_permissions: Optional[dict[str, tuple[str, bool]]] = None,
-    sdd: bool = False,
 ) -> Response:
     """Handle ``model: "opencode"`` — direct the task to the opencode agent.
 
@@ -2841,11 +2767,6 @@ async def _handle_opencode_request(
         session_map=session_map,
         session_key=session_key,
         pending_permissions=pending_permissions,
-        system_prompt=(
-            _SDD_AUTONOMOUS_SYSTEM_PROMPT if sdd else _BRIDGE_SYSTEM_PROMPT
-        ),
-        timeout=OPENCODE_SDD_TIMEOUT if sdd else OPENCODE_SERVE_TIMEOUT,
-        autonomous=sdd,
     )
     return resp
 
@@ -2917,7 +2838,7 @@ async def _apply_coding_decision_gate(
     continue the normal flow.
     """
     if route.is_lane_b or route.bypass_frontdesk:
-        return None  # opencode caller / pinned local apply → direct, never prompt
+        return None  # opencode caller → direct, never prompt
 
     decisions = _coding_decision_state(app)
 
@@ -2936,19 +2857,13 @@ async def _apply_coding_decision_gate(
         decisions[session_id] = decision
         logger.info("Coding decision for session %s: %s", session_id, decision)
         task_messages = messages[:question_idx]  # task = convo up to the question
-        if decision in ("opencode", "sdd"):
-            is_sdd = decision == "sdd"
+        if decision == "opencode":
             resp = await _opencode_task_response(
                 _last_user_text(task_messages),
                 client_stream,
                 session_map=await _opencode_session_state(app),
                 session_key=session_id,
                 pending_permissions=_pending_permissions_state(app),
-                system_prompt=(
-                    _SDD_AUTONOMOUS_SYSTEM_PROMPT if is_sdd else _BRIDGE_SYSTEM_PROMPT
-                ),
-                timeout=OPENCODE_SDD_TIMEOUT if is_sdd else OPENCODE_SERVE_TIMEOUT,
-                autonomous=is_sdd,
             )
             await _persist_opencode_sessions(app)
             return resp
@@ -2968,28 +2883,21 @@ async def _apply_coding_decision_gate(
         if _looks_like_gibberish(_last_user_text(messages)):
             return None
         decision = decisions.get(session_id)
-        if decision in ("opencode", "sdd"):
-            is_sdd = decision == "sdd"
+        if decision == "opencode":
             resp = await _opencode_task_response(
                 _last_user_text(messages),
                 client_stream,
                 session_map=await _opencode_session_state(app),
                 session_key=session_id,
                 pending_permissions=_pending_permissions_state(app),
-                system_prompt=(
-                    _SDD_AUTONOMOUS_SYSTEM_PROMPT if is_sdd else _BRIDGE_SYSTEM_PROMPT
-                ),
-                timeout=OPENCODE_SDD_TIMEOUT if is_sdd else OPENCODE_SERVE_TIMEOUT,
-                autonomous=is_sdd,
             )
             await _persist_opencode_sessions(app)
             return resp
         if decision is None:
             question = (
                 f"{_CODING_QUESTION_PREFIX} Coding task detected — route to OpenCode, "
-                f"the local code pathway (Professional), or a full SDD cycle "
-                f"(proposal → spec → design → tasks → apply → verify → archive)? "
-                f"Reply `opencode`, `local`, or `sdd`."
+                f"the local code pathway (Professional)? "
+                f"Reply `opencode` or `local`."
             )
             # Advisory local-model difficulty assessment shown in the question.
             # Best-effort: any failure here must never block the gate, so the
@@ -3011,12 +2919,12 @@ async def _apply_coding_decision_gate(
                 reason = assessment.get("reason", "")
                 if difficulty and recommendation:
                     reason_suffix = f" ({reason})" if reason else ""
-                    if difficulty == "low" and recommendation in ("opencode", "sdd"):
+                    if difficulty == "low" and recommendation == "opencode":
                         # SECURITY GUARD (2026-09-12): a raw-model completion
                         # must never be silently diverted into the agent
                         # bridge.  An agentic route requires the user's
                         # explicit answer — fall through to the question
-                        # below instead of auto-launching opencode/SDD.
+                        # below instead of auto-launching opencode.
                         logger.info(
                             "Coding decision for session %s: low difficulty "
                             "but agentic recommendation %r — prompting "
@@ -3039,11 +2947,10 @@ async def _apply_coding_decision_gate(
                         return None
                     question = (
                         f"{_CODING_QUESTION_PREFIX} Coding task detected — route to OpenCode, "
-                        f"the local code pathway (Professional), or a full SDD cycle "
-                        f"(proposal → spec → design → tasks → apply → verify → archive)?\n\n"
+                        f"the local code pathway (Professional)?\n\n"
                         f"🔍 Local model assessment: {difficulty} difficulty — "
                         f"recommends `{recommendation}`{reason_suffix}\n\n"
-                        f"Reply `opencode`, `local`, or `sdd`."
+                        f"Reply `opencode` or `local`."
                     )
             except (httpx.HTTPError, OSError, AttributeError, ValueError):
                 logger.exception(

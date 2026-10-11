@@ -442,7 +442,10 @@ async def call_model(
                 "required": ["difficulty", "recommendation", "reason"],
                 "properties": {
                     "difficulty": {"type": "string"},
-                    "recommendation": {"type": "string"},
+                    "recommendation": {
+                        "type": "string",
+                        "enum": ["opencode", "local"],
+                    },
                     "reason": {"type": "string"},
                 },
             },

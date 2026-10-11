@@ -271,7 +271,7 @@ OPCODE_CONFIG_PATH: str = _machine(
 
 # Bridge model keys exposed to clients, validated alongside ALL_MODEL_KEYS.
 # "opencode" routes to the opencode serve bridge instead of llama.cpp.
-BRIDGE_MODEL_KEYS: frozenset[str] = frozenset({"opencode", "opencode-sdd"})
+BRIDGE_MODEL_KEYS: frozenset[str] = frozenset({"opencode"})
 
 # Time budget for a single bridge turn.  The regular bridge streams one
 # agentic task; the SDD-autonomous mode runs the FULL cycle (proposal →

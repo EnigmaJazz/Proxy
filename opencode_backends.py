@@ -94,6 +94,15 @@ class OpenCodeBackend(ABC):
     #: POST an answer; it only reports that the session is waiting.
     answers_permissions: bool = True
 
+    #: The SSE event-bus URL the streaming path dials
+    #: (``opencode_bridge.opencode_chat_stream``).  The transport decides
+    #: where its event bus lives; the default preserves the historical
+    #: serve behaviour (``OPENCODE_SERVE_URL``).  Deliberately separate from
+    #: ``ServeBackend.base_url``: that attribute is the serve HTTP surface,
+    #: which a non-serve transport (the openchamber CLI) does not have, so
+    #: dialing the bus via ``base_url`` raised ``AttributeError`` there.
+    event_bus_url: str = OPENCODE_SERVE_URL
+
     # -- Session lifecycle (the design's core five) ---------------------
 
     @abstractmethod
@@ -535,6 +544,7 @@ class SecureBackend(ServeBackend):
     """
 
     base_url: str = OPENCODE_SECURE_SERVE_URL
+    event_bus_url: str = OPENCODE_SECURE_SERVE_URL
     owns_server: bool = False
     answers_permissions: bool = False
 
@@ -725,6 +735,12 @@ class OpenChamberBackend(OpenCodeBackend):
     sessions this process created), per-instance, and it dies with the
     process; ``ServeBackend`` (the default) remains stateless.
     """
+
+    #: ``event_bus_url`` stays the inherited ``OPENCODE_SERVE_URL`` default:
+    #: openchamber is a prototyped transport being deleted in T9, and
+    #: pointing its bus dial elsewhere would be an untested behaviour change.
+    #: (It has no ``base_url`` — the reason the earlier ``base_url`` dial
+    #: raised ``AttributeError`` on this transport.)
 
     def __init__(self) -> None:
         self._session_dirs: dict[str, str] = {}

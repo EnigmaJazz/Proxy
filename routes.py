@@ -796,8 +796,8 @@ def _inject_current_datetime(messages: list[dict[str, Any]]) -> list[dict[str, A
 
     Frontends (nanobot, OpenWebUI) never send the date, so the models
     they drive run date-blind; the opencode app's own sessions do get a
-    date-only stamp.  This mirrors that on the proxy path with the full
-    date AND time.  R1 carve-out: only the outbound model-copy is
+    date-only stamp.  This mirrors that on the proxy path, date-only as
+    well.  R1 carve-out: only the outbound model-copy is
     touched; the client's stored conversation and the DB audit copy are
     never mutated.  Opt out per request with ``X-Proxy-Date-Time: off``.
     """
@@ -2686,6 +2686,11 @@ async def _opencode_task_response(
         if _resp_text:
             try:
                 await asyncio.to_thread(_capture_opencode_work, _resp_text)
+            # AGENTS.md rule 10 permits `except Exception` at this process
+            # boundary: the capture runs in a worker thread and is
+            # best-effort, so a failure after [DONE] must never propagate
+            # into the SSE generator. Narrowing this would let an
+            # unexpected capture bug escape into the stream.
             except Exception:
                 logger.exception("capturing opencode work failed")
 

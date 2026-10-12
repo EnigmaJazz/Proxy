@@ -369,3 +369,40 @@ async def test_secure_ensure_probe_only_when_up(
     assert await obr.ensure_opencode_serve() is True
     assert created == []
     assert signals == []
+
+
+class _ValueErrorAsyncClient:
+    """httpx.AsyncClient stand-in whose GET raises ``ValueError``.
+
+    Models a probe response that cannot be parsed — the third error class
+    the secure probe must absorb (U2's broadened catch arm)."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    async def __aenter__(self) -> "_ValueErrorAsyncClient":
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        return None
+
+    async def get(self, url: str, **kwargs: Any) -> _RecordingResp:
+        raise ValueError("malformed probe response")
+
+
+@pytest.mark.asyncio
+async def test_secure_probe_returns_false_on_value_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3-secure-probe-narrow-catch (T9-U4, rule 7): the secure probe
+    catches ``ValueError`` as well as ``httpx.HTTPError``/``OSError`` — a
+    GET that raises ``ValueError`` reports the server DOWN, it never
+    escapes.  The sibling probes already caught ``ValueError``; this test
+    is the regression proving the secure probe's broadened arm."""
+    import opencode_bridge as obr
+
+    monkeypatch.setattr(obr, "BACKEND", ob.SecureBackend())
+    monkeypatch.setattr(obr.httpx, "AsyncClient", _ValueErrorAsyncClient)
+
+    assert await obr._secure_serve_answering() is False
+    assert await obr.ensure_opencode_serve() is False

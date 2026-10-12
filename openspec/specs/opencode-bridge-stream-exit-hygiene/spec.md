@@ -100,4 +100,4 @@ New code paths SHALL have hermetic regression tests in `tests/test_opencode_brid
 
 - Capability directory: `openspec/specs/opencode-bridge-stream-exit-hygiene/`. This is a distinct code region from the cycle-5 blocking-path capability (`opencode-bridge-blocking-path`); the two helper names differ intentionally.
 - No changes to routes.py, proxy.py, config, systemd, error-string formats, wedge detection, zombie sweep, or escalation behavior.
-- `opencode-serve-config.opencode.jsonc` is never touched by this change.
+- The proxy owns no opencode config of its own (bridge v4): the systemd-owned secure server is the single transport and owns its configuration, so this change touches no proxy-side config file.

@@ -2239,51 +2239,19 @@ class TestSecurePermissionGate:
         assert not any(u.endswith("/abort") for u, _ in client.post_calls)
         assert [u for u, _ in client.post_calls if "/permissions/" in u] == []
 
-    @pytest.mark.parametrize("backend_name", ["serve", "openchamber"])
     @pytest.mark.asyncio
     async def test_answering_backends_still_relay_question(
-        self, monkeypatch: pytest.MonkeyPatch, backend_name: str,
+        self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The gate is scoped: the serve and openchamber transports still
-        relay the permission as a question and store the pending entry, so
-        the pinned-continuation resume has something to POST.
-
-        Real openchamber behaviour (source-observed): the SSE
-        ``permission.updated`` event relays because ``answers_permissions``
-        stays True, but openchamber has NO polling permission surface —
-        ``OpenChamberBackend.fetch_permissions`` always returns ``[]`` — so
-        only an SSE-delivered permission is relayed.  This test drives the
-        SSE path."""
+        """The gate is scoped: the serve transport still relays the
+        permission as a question and stores the pending entry, so the
+        pinned-continuation resume has something to POST."""
         from opencode_bridge import opencode_chat_stream
         import opencode_backends as _ob
 
-        backend = (
-            _ob.ServeBackend() if backend_name == "serve"
-            else _ob.OpenChamberBackend()
-        )
+        backend = _ob.ServeBackend()
         monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _ensure_true)
         monkeypatch.setattr(opencode_bridge, "BACKEND", backend)
-        if backend_name == "openchamber":
-            # Hermetic openchamber: the CLI transport spawns a REAL daemon on
-            # first use (``ensure_openchamber_daemon``) and runs the
-            # openchamber binary per call (``chamber._run_cli``).  A test must
-            # never create a process, so stub both — the daemon reports up and
-            # the CLI answers create/send from a canned payload.  Mirrors the
-            # autouse fixture in tests/test_opencode_backends.py.
-            async def _fake_ensure() -> tuple[bool, str]:
-                return True, "ok"
-
-            async def _fake_run_cli(
-                args: list[str], timeout: float,
-            ) -> tuple[int, str]:
-                if args[:2] == ["session", "create"]:
-                    return 0, json.dumps({"sessionId": "ses_0001"})
-                return 0, json.dumps({})
-
-            monkeypatch.setattr(
-                _ob.chamber, "ensure_openchamber_daemon", _fake_ensure,
-            )
-            monkeypatch.setattr(_ob.chamber, "_run_cli", _fake_run_cli)
         client = _SecurePermissionClient()
         client.lines = [
             _evt("message.updated", sessionID="ses_0001",
@@ -4636,18 +4604,12 @@ class TestEventBusDialTargetsActiveBackend:
     def test_event_bus_url_defined_on_every_transport(self) -> None:
         """Every transport resolves ``event_bus_url`` (no ``AttributeError``).
 
-        ``OpenChamberBackend`` has no ``base_url`` — the earlier
-        ``BACKEND.base_url`` dial raised there — so the bus URL must live on
-        the ABC.  Serve and openchamber keep the historical serve default;
-        the secure transport points at the secure server.
+        The bus URL lives on the ABC: a transport without a ``base_url``
+        would raise if the dial read it.  Serve keeps the historical serve
+        default; the secure transport points at the secure server.
         """
         from constants import OPENCODE_SECURE_SERVE_URL
-        from opencode_backends import (
-            OpenChamberBackend,
-            SecureBackend,
-            ServeBackend,
-        )
+        from opencode_backends import SecureBackend, ServeBackend
 
-        assert OpenChamberBackend().event_bus_url == opencode_bridge.OPENCODE_SERVE_URL
         assert ServeBackend.event_bus_url == opencode_bridge.OPENCODE_SERVE_URL
         assert SecureBackend.event_bus_url == OPENCODE_SECURE_SERVE_URL

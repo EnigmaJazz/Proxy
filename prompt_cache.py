@@ -45,7 +45,7 @@ logger = get_logger("prompt_cache")
 #: runtime and the nanobot/OpenWebUI defaults can be seeded by callers.
 # F6 note (2026-08-11): ``_PROMPTS`` / ``_LAST_PRIMED`` are runtime-mutable
 # module-level registries (Rule 6 carve-out, same precedent as the
-# ``_serve_config_mtime`` scalar in opencode_bridge.py): when wired (it is
+# ``BACKEND`` service reference in opencode_backends.py): when wired (it is
 # currently disabled, see the module docstring), the priming runs from the
 # residency monitor loop (hardware.py) AND the request path
 # (routes.py) with no app.state handle in the monitor, so threading app

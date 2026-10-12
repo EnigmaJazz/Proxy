@@ -1,19 +1,18 @@
 """
-opencode_backends.py — transport backends for the opencode bridge.
+opencode_backends.py — the opencode bridge's HTTP transport.
 
-The serve transport is extracted behind a small backend interface so a
-second transport can slot in behind the SAME public bridge API
-(``opencode_bridge.opencode_chat`` / ``opencode_chat_stream`` /
-``ensure_opencode_serve``).
+The bridge's message path (``opencode_bridge.opencode_chat`` /
+``opencode_chat_stream`` / ``ensure_opencode_serve``) delegates every HTTP
+primitive to a backend so the transport lives behind one interface.  Bridge
+v4 leaves exactly ONE transport: ``SecureBackend``, the systemd-owned
+secure-opencode server on ``OPENCODE_SECURE_SERVE_URL`` (127.0.0.1:4096).
+The proxy owns no opencode server of its own.
 
-This module holds the interface (``OpenCodeBackend``) and the serve
-implementation (``ServeBackend``): the exact HTTP calls the bridge made
+This module holds the interface (``OpenCodeBackend``) and that single
+implementation (``SecureBackend``): the exact HTTP calls the bridge made
 inline — same URLs, same request shapes, same timeouts, same error
 handling — relocated verbatim.  ``opencode_bridge.py`` routes its
-message-path HTTP primitives through the module-level ``BACKEND``
-instance.  Zero behavior change by construction: each method wraps ONE
-serve HTTP call and the bridge call sites keep their existing
-status/id/error checks byte-for-byte.
+message-path HTTP primitives through the module-level ``BACKEND`` instance.
 
 The caller's ``httpx.AsyncClient`` is passed IN rather than owned: the
 streaming path deliberately shares ONE client per request for connection
@@ -23,10 +22,9 @@ behavior.  Methods return the raw ``httpx.Response`` (or the shaped
 return the relocated helper produced); call sites keep their try/except
 wrappers unchanged, which preserves the exact error-handling semantics.
 
-The ``OPENCODE_BACKEND`` env selector resolves ``BACKEND``: the literal
-``"secure"`` picks the systemd-owned secure-server transport, and anything
-else keeps the serve transport (production default until the evidence gate
-flips it — design §6; the secure transport is bridge v4, T4).
+``OPENCODE_BACKEND`` no longer selects a transport — ``SecureBackend`` is
+the only one — but it is still read ONCE at import so an operator migrating
+off a retired value is warned plainly instead of silently ignored.
 """
 from __future__ import annotations
 
@@ -38,7 +36,6 @@ import httpx
 
 from constants import (
     OPENCODE_SECURE_SERVE_URL,
-    OPENCODE_SERVE_URL,
     get_logger,
 )
 
@@ -51,8 +48,8 @@ class OpenCodeBackend(ABC):
     """Transport abstraction behind the opencode bridge's message path.
 
     The bridge's public API and its helpers delegate every serve HTTP
-    primitive to a backend so a second transport can implement the same
-    contract.  Session-oriented signatures follow the design doc's shape —
+    primitive to a backend so the transport stays behind one contract.
+    Session-oriented signatures follow the design doc's shape —
     ``create_session(directory)``,
     ``send_prompt(session_id, system_prompt, user_text)``,
     ``fetch_messages(session_id)``,
@@ -62,30 +59,25 @@ class OpenCodeBackend(ABC):
     list/send-message primitives).
     """
 
-    #: Whether this transport owns its server's lifecycle.  True by default
-    #: (the serve transport spawns/recycles its backend); ``SecureBackend``
-    #: sets it False because the secure-opencode server is systemd-owned and
-    #: the proxy must never spawn, recycle, reconfigure, auth-copy or signal
-    #: it.
-    owns_server: bool = True
+    #: Whether this transport owns its server's lifecycle.  ``SecureBackend``
+    #: — the bridge's only transport — sets it False because the
+    #: secure-opencode server is systemd-owned and the proxy must never
+    #: spawn, recycle, reconfigure, auth-copy or signal it.
+    owns_server: bool
 
     #: Whether this transport answers/relays permission prompts to the
-    #: client.  True by default: the serve transport relays write/git asks
-    #: to the user as questions and POSTs the user's answer back so the
-    #: parked tool resumes.  ``SecureBackend`` sets it False — the
-    #: secure-opencode server's own ``opencode-perm`` process resolves
-    #: prompts out-of-band, so the bridge must neither relay a question nor
-    #: POST an answer; it only reports that the session is waiting.
-    answers_permissions: bool = True
+    #: client.  ``SecureBackend`` sets it False — the secure-opencode
+    #: server's own ``opencode-perm`` process resolves prompts out-of-band,
+    #: so the bridge must neither relay a question nor POST an answer; it
+    #: only reports that the session is waiting.
+    answers_permissions: bool
 
     #: The SSE event-bus URL the streaming path dials
     #: (``opencode_bridge.opencode_chat_stream``).  The transport decides
-    #: where its event bus lives; the default preserves the historical
-    #: serve behaviour (``OPENCODE_SERVE_URL``).  Deliberately separate from
-    #: ``ServeBackend.base_url``: that attribute is the serve HTTP surface,
-    #: so a transport without it would raise ``AttributeError`` if the bus
-    #: dial read ``base_url``.
-    event_bus_url: str = OPENCODE_SERVE_URL
+    #: where its event bus lives.  Deliberately separate from ``base_url``:
+    #: that attribute is the serve HTTP surface, so a transport without it
+    #: would raise ``AttributeError`` if the bus dial read ``base_url``.
+    event_bus_url: str
 
     # -- Session lifecycle (the design's core five) ---------------------
 
@@ -233,20 +225,33 @@ def _build_send_payload(
     }
 
 
-class ServeBackend(OpenCodeBackend):
-    """The ``opencode serve`` HTTP transport — today's bridge behavior.
+class SecureBackend(OpenCodeBackend):
+    """The systemd-owned secure-opencode server transport (bridge v4).
 
-    Every method wraps ONE serve HTTP call exactly as the bridge made it
-    inline before the extraction: same URL, same request shape, same
-    timeout, same error handling.  Stateless by design — session/request
-    state lives in the caller's dicts and per-request ``httpx`` clients.
+    The secure server on ``OPENCODE_SECURE_SERVE_URL`` (127.0.0.1:4096) was
+    launched by systemd with its own config and speaks the ``opencode serve``
+    HTTP surface; this is the bridge's ONLY transport.  Every method wraps ONE
+    serve HTTP call exactly as the bridge made it inline before the backend
+    extraction: same URL shape, same request shape, same timeout, same error
+    handling.  Stateless by design — session/request state lives in the
+    caller's dicts and per-request ``httpx`` clients.
+
+    ``owns_server`` is False: the proxy performs a health probe only and
+    never spawns, recycles, config-syncs, auth-copies or signals this
+    server.  The systemd unit is the user's to manage.
+
+    ``answers_permissions`` is also False: the server's own
+    ``opencode-perm`` resolves permission prompts out-of-band, so the bridge
+    never relays a question and never POSTs an answer — while a prompt is
+    pending it only reports the wait on the stream.
     """
 
-    #: The serve base URL this transport talks to.  Parameterized (rather
-    #: than hardcoding ``OPENCODE_SERVE_URL``) so ``SecureBackend`` can reuse
-    #: this whole implementation against the systemd-owned secure server —
-    #: the secure server speaks the same serve HTTP surface.
-    base_url: str = OPENCODE_SERVE_URL
+    #: The secure server's HTTP base URL (the 13 primitives dial it) and the
+    #: origin of its SSE event bus.
+    base_url: str = OPENCODE_SECURE_SERVE_URL
+    event_bus_url: str = OPENCODE_SECURE_SERVE_URL
+    owns_server: bool = False
+    answers_permissions: bool = False
 
     async def create_session(
         self,
@@ -504,46 +509,28 @@ class ServeBackend(OpenCodeBackend):
         return False
 
 
-class SecureBackend(ServeBackend):
-    """The systemd-owned secure-opencode server transport (bridge v4, T4).
-
-    The secure server on ``OPENCODE_SECURE_SERVE_URL`` (127.0.0.1:4096) was
-    launched by systemd with its own config, so it speaks the SAME serve
-    HTTP surface as ``ServeBackend`` — this class only overrides the base
-    URL and the ownership flag rather than copying the 13 method bodies.
-
-    ``owns_server`` is False: the proxy performs a health probe only and
-    never spawns, recycles, config-syncs, auth-copies or signals this
-    server.  The systemd unit is the user's to manage.
-
-    ``answers_permissions`` is also False: the server's own
-    ``opencode-perm`` resolves permission prompts out-of-band, so the bridge
-    never relays a question and never POSTs an answer — while a prompt is
-    pending it only reports the wait on the stream.
-    """
-
-    base_url: str = OPENCODE_SECURE_SERVE_URL
-    event_bus_url: str = OPENCODE_SECURE_SERVE_URL
-    owns_server: bool = False
-    answers_permissions: bool = False
+# The ``OPENCODE_BACKEND`` env no longer selects a transport (``SecureBackend``
+# is the only one); it is read once here at import so an operator migrating
+# off a retired value is told plainly instead of being silently ignored.
+# Never fails on an unknown value.
+if os.environ.get("OPENCODE_BACKEND") not in (None, "secure"):
+    logger.warning(
+        "OPENCODE_BACKEND=%r is retired or unrecognised; the opencode bridge "
+        "always uses the systemd-owned secure server (%s). Remove the setting "
+        "or set OPENCODE_BACKEND=secure.",
+        os.environ.get("OPENCODE_BACKEND"),
+        OPENCODE_SECURE_SERVE_URL,
+    )
 
 
-#: The bridge's active backend, resolved ONCE at import.  The
-#: ``OPENCODE_BACKEND`` env selects the transport:
-#:   * the literal ``"secure"`` picks ``SecureBackend`` — the
-#:     systemd-owned secure-opencode server on ``OPENCODE_SECURE_SERVE_URL``
-#:     (127.0.0.1:4096).  It owns no server: ensure is a health probe only
-#:     and no spawn/recycle/config-sync/auth-copy/SIGTERM path runs.
-#:   * ANY other value (unset, "serve", unknown) keeps the production
-#:     default ``ServeBackend`` until the evidence gate flips it (design §6
-#:     — one env line, no redeploy).
+#: The bridge's active backend, resolved ONCE at import.  Bridge v4 left
+#: exactly ONE transport, so this is always ``SecureBackend`` — the
+#: systemd-owned secure-opencode server on ``OPENCODE_SECURE_SERVE_URL``
+#: (127.0.0.1:4096).  It owns no server: ensure is a health probe only and
+#: no spawn/recycle/config-sync/auth-copy/SIGTERM path runs.
 #:
-#: ``ServeBackend`` and ``SecureBackend`` are STATELESS (session/request
-#: state lives in the caller's dicts and per-request httpx clients), so
-#: this module-level service reference carries no mutable state — the same
-#: class of exception the F5/F6 carve-outs document for ``opencode_bridge``.
-BACKEND: OpenCodeBackend = (
-    SecureBackend()
-    if os.environ.get("OPENCODE_BACKEND") == "secure"
-    else ServeBackend()
-)
+#: ``SecureBackend`` is STATELESS (session/request state lives in the
+#: caller's dicts and per-request httpx clients), so this module-level
+#: service reference carries no mutable state — the same class of exception
+#: the prompt-priming registry carve-out documents for ``prompt_cache.py``.
+BACKEND: OpenCodeBackend = SecureBackend()

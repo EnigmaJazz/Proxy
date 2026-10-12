@@ -22,12 +22,12 @@ The response text is post-processed to drop proxy-status content
 assistant text.
 
 Message-path HTTP primitives route through the module-level ``BACKEND``
-instance from ``opencode_backends.py`` (openchamber-bridge-backend design,
-step 1): session create/send/fetch/abort, permission and question relay.
-The ``/event`` SSE bus stays in this module.  The proxy owns no opencode
-server (bridge v4): every bridged request goes to the systemd-owned secure
-server, so ``ensure_opencode_serve`` is a pure health probe and no spawn,
-recycle, config-sync or signal path remains here.
+instance from ``opencode_backends.py`` (its sole transport, the
+systemd-owned secure server): session create/send/fetch/abort and the
+question relay.  The ``/event`` SSE bus stays in this module.  The proxy
+owns no opencode server (bridge v4): every bridged request goes to the
+systemd-owned secure server, so ``ensure_opencode_serve`` is a pure health
+probe and no spawn, recycle, config-sync or signal path remains here.
 """
 from __future__ import annotations
 
@@ -494,14 +494,15 @@ def _waiting_permission_status(
 ) -> Optional[str]:
     """The once-per-permission "waiting" status for a non-answering backend.
 
-    On a backend that answers permissions (the serve/openchamber transports)
-    this returns None — the caller relays the permission as a question
-    instead, exactly as before.  On the secure backend there is no question
-    to relay and no answer to POST (``opencode-perm`` resolves the prompt
-    out-of-band), so the caller keeps the stream alive and reports the wait.
-    Deduped by permission id (the existing announce-dedupe pattern), so a
-    poll every tick never repeats the line.  Returns None when this
-    permission id was already announced or has no id.
+    The secure backend is the only transport and answers NO permission:
+    there is no question to relay and no answer to POST (the server's own
+    ``opencode-perm`` resolves the prompt out-of-band), so the caller keeps
+    the stream alive and reports the wait.  The ``answers_permissions``
+    guard returns None for a hypothetical answering transport (the caller
+    would relay the permission as a question instead).  Deduped by
+    permission id (the existing announce-dedupe pattern), so a poll every
+    tick never repeats the line.  Returns None when this permission id was
+    already announced or has no id.
     """
     if BACKEND.answers_permissions:
         return None
@@ -539,9 +540,9 @@ async def _secure_serve_answering() -> bool:
 def _serve_unreachable_message() -> str:
     """The bridge-failure text for ``ensure_opencode_serve`` returning False.
 
-    On a backend that owns no server (the secure backend) the message names
-    the systemd-owned server so the operator knows the proxy will not start
-    it; the serve backends keep the original byte-identical string.
+    The sole transport owns no server, so the message names the
+    systemd-owned server so the operator knows the proxy will not start it
+    (an owning transport would keep the original, generic string).
     """
     if not BACKEND.owns_server:
         return (

@@ -18,7 +18,6 @@ import httpx
 import pytest
 
 import opencode_bridge
-from constants import OPENCODE_SERVE_URL
 from opencode_bridge import (
     _strip_proxy_status_text,
     opencode_chat,
@@ -69,8 +68,8 @@ class _FakeClient:
         self.get_timeouts: list[Any] = []
         self.stream_lines: list[str] = []
         # The dial URL of every client.stream(...) call — lets a test assert
-        # the /event bus targets the ACTIVE backend's base_url, never the raw
-        # bridge-owned OPENCODE_SERVE_URL constant (T8-found regression).
+        # the /event bus targets the ACTIVE transport's event_bus_url, never
+        # a hardcoded URL (T8-found regression).
         self.stream_calls: list[str] = []
         self.message_get_parts: list[dict[str, Any]] = []
         # Blocking-path scripting (opencode_chat hardening): scripted
@@ -330,27 +329,6 @@ class TestOpenCodeChatHardening:
         )
 
     @pytest.mark.asyncio
-    async def test_write_permission_aborts(
-        self, fake_client: _FakeClient, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        monkeypatch.setattr(opencode_bridge, "_BLOCKING_PERMISSION_POLL_S", 0.01)
-        fake_client.message_hang_s = 0.2
-        fake_client.message_parts = [{"type": "text", "text": "ok"}]
-        fake_client.permission_records = [{
-            "id": "perm_2",
-            "sessionID": "ses_0001",
-            "permission": "write",
-            "patterns": ["rm -rf /x"],
-            "tool": {"messageID": "m1", "callID": "c1"},
-        }]
-        result = await opencode_chat("task")
-        assert "[OpenCode Bridge Error:" in result
-        assert "write permission" in result
-        assert any(
-            url.endswith("/abort") for url, _ in fake_client.post_calls
-        )
-
-    @pytest.mark.asyncio
     async def test_success_no_permissions_unchanged(
         self, fake_client: _FakeClient, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -464,7 +442,11 @@ class TestOpenCodeChatHardening:
         fake_client.fail_post_times = 1
         result = await opencode_chat("task")
 
-        assert result == "[OpenCode Bridge Failed: opencode serve not reachable.]"
+        assert result == (
+            "[OpenCode Bridge Failed: the systemd-owned secure opencode "
+            "server (http://127.0.0.1:4096) is not answering; start "
+            "secure-opencode.service (the proxy never starts it).]"
+        )
         msg_posts = [
             url for url, _ in fake_client.post_calls if "/message" in url
         ]
@@ -1367,133 +1349,26 @@ class TestParsePermissionAnswer:
         assert _parse_permission_answer(reply, write=True) == expected
 
 
-class TestPermissionRelay:
-    """The event-bus permission.updated handler relays external_directory
-    gates: a permission yields a question and stops the stream with the
-    permission stored for the next request."""
-
-    @pytest.mark.asyncio
-    async def test_write_permission_yields_question_and_stops(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        from opencode_bridge import opencode_chat_stream
-
-        async def _running(*args: Any, **kwargs: Any) -> bool:
-            return True
-
-        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
-        client = _FakeClient()
-        client.stream_lines = [
-            _evt("message.updated", sessionID="ses_0001",
-                 info={"id": "msg_user", "role": "user"}),
-            _evt("message.updated", sessionID="ses_0001",
-                 info={"id": "msg_a", "role": "assistant"}),
-            _evt("permission.updated", sessionID="ses_0001",
-                 id="perm_1", type="external_directory",
-                 title="Allow writing external file",
-                 metadata={"command": "mv /etc/foo /etc/bar",
-                           "filepath": "/etc/foo"}),
-        ]
-        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
-
-        deltas = [d async for d in opencode_chat_stream("task", pending_permissions=PP)]
-
-        assert len(deltas) == 1
-        kind, text = deltas[0]
-        assert kind == "question"
-        assert "outside its workspace" in text
-        assert "Target: /etc/foo" in text
-        assert "Command: mv /etc/foo /etc/bar" in text
-        assert "Reply" in text
-        # No permission POST fired; the pending entry awaits the user's
-        # answer on the next (pinned-continuation) request.
-        assert [u for u, _ in client.post_calls if "/permissions/" in u] == []
-        assert PP.get("ses_0001") == ("perm_1", True)
-
-    @pytest.mark.asyncio
-    async def test_other_permission_types_ignored(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """A permission.updated event whose type is NOT relayed
-        (external_directory or bash) is ignored: no question, no pending
-        store, no permission POST."""
-        from opencode_bridge import opencode_chat_stream
-
-        async def _running(*args: Any, **kwargs: Any) -> bool:
-            return True
-
-        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
-        client = _FakeClient()
-        client.stream_lines = [
-            _evt("message.updated", sessionID="ses_0001",
-                 info={"id": "msg_user", "role": "user"}),
-            _evt("message.updated", sessionID="ses_0001",
-                 info={"id": "msg_a", "role": "assistant"}),
-            _evt("permission.updated", sessionID="ses_0001",
-                 id="perm_x", type="webfetch",
-                 title="Allow web fetch",
-                 metadata={"command": "curl https://x"}),
-            _evt("message.part.updated", sessionID="ses_0001",
-                 part={"id": "prt_t", "messageID": "msg_a", "type": "text",
-                       "text": "ok"}),
-        ]
-        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
-
-        deltas = [d async for d in opencode_chat_stream("task", pending_permissions=PP)]
-
-        assert [k for k, _ in deltas if k == "question"] == []
-        assert [u for u, _ in client.post_calls if "/permissions/" in u] == []
-        assert PP.get("ses_0001") is None
-
-    @pytest.mark.asyncio
-    async def test_git_permission_yields_question_and_stops(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """A bash-type permission.updated (the git ask-rules: commit/push/
-        reset/rebase) is relayed to the user with the git question template
-        and stops the stream with the permission stored."""
-        from opencode_bridge import opencode_chat_stream
-
-        async def _running(*args: Any, **kwargs: Any) -> bool:
-            return True
-
-        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
-        client = _FakeClient()
-        client.stream_lines = [
-            _evt("message.updated", sessionID="ses_0001",
-                 info={"id": "msg_user", "role": "user"}),
-            _evt("message.updated", sessionID="ses_0001",
-                 info={"id": "msg_a", "role": "assistant"}),
-            _evt("permission.updated", sessionID="ses_0001",
-                 id="perm_g", type="bash",
-                 title="Allow git commit",
-                 metadata={"command": "git commit -m bump"}),
-        ]
-        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
-
-        deltas = [d async for d in opencode_chat_stream("task", pending_permissions=PP)]
-
-        assert len(deltas) == 1
-        kind, text = deltas[0]
-        assert kind == "question"
-        assert "git command" in text
-        assert "Command: git commit -m bump" in text
-        assert "Reply" in text
-        assert [u for u, _ in client.post_calls if "/permissions/" in u] == []
-        assert PP.get("ses_0001") == ("perm_g", True)
+class TestPostPermissionResponse:
+    """The permission-answer POST helper survives the serve-transport
+    retirement: it still posts ``{"response": ...}`` to the active
+    backend's permission endpoint.  The bridge itself never reaches it now
+    (the secure server's ``opencode-perm`` resolves prompts out-of-band),
+    but the helper stays part of the backend contract."""
 
     @pytest.mark.asyncio
     async def test_post_permission_response_posts_body(
         self, fake_client: _FakeClient,
     ) -> None:
-        """_post_permission_response POSTs {"response": ...} to the serve's
-        permission endpoint and reports success on 200."""
+        """_post_permission_response POSTs {"response": ...} to the active
+        backend's permission endpoint and reports success on 200."""
+        from constants import OPENCODE_SECURE_SERVE_URL
         from opencode_bridge import _post_permission_response
 
         ok = await _post_permission_response("ses_0001", "perm_1", "once")
         assert ok is True
         assert (
-            f"{OPENCODE_SERVE_URL}/session/ses_0001/permissions/perm_1",
+            f"{OPENCODE_SECURE_SERVE_URL}/session/ses_0001/permissions/perm_1",
             {"response": "once"},
         ) in fake_client.post_calls
 
@@ -1508,132 +1383,6 @@ class TestPermissionRelay:
         fake_client.raise_on = "post"
         ok = await _post_permission_response("ses_0001", "perm_1", "always")
         assert ok is False
-
-
-class TestPermissionRelayPolicy:
-    """REQ-1: write/edit gates (opencode 1.18.15 write/edit tools may OMIT
-    the permission.updated SSE event — the relay flows through the polling
-    GET /permission paths too) must be RELAYED in interactive mode."""
-
-    @pytest.mark.asyncio
-    async def test_permission_write_relayed_interactive(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """REQ-1 Scenario-1 + F2: a write-type permission.updated event
-        (perm_type "write", no bash command to inspect) is relayed as a
-        question in interactive mode — never auto-allowed."""
-        from opencode_bridge import opencode_chat_stream
-
-        async def _running(*args: Any, **kwargs: Any) -> bool:
-            return True
-
-        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
-        client = _FakeClient()
-        client.stream_lines = [
-            _evt("message.updated", sessionID="ses_0001",
-                 info={"id": "msg_user", "role": "user"}),
-            _evt("message.updated", sessionID="ses_0001",
-                 info={"id": "msg_a", "role": "assistant"}),
-            _evt("permission.updated", sessionID="ses_0001",
-                 id="perm_w", type="write",
-                 title="Allow writing to /home/user/out.txt",
-                 metadata={"filepath": "/home/user/out.txt"}),
-        ]
-        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
-
-        deltas = [d async for d in opencode_chat_stream("task", pending_permissions=PP)]
-
-        assert len(deltas) == 1
-        kind, text = deltas[0]
-        assert kind == "question"
-        assert "outside its workspace" in text
-        assert "Target: /home/user/out.txt" in text
-        # No auto-allow POST fired; the write awaits the user's answer.
-        assert [u for u, _ in client.post_calls if "/permissions/" in u] == []
-        assert PP.get("ses_0001") == ("perm_w", True)
-
-    @pytest.mark.asyncio
-    async def test_interactive_does_not_auto_allow_write(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """REQ-2 Scenario-3 + F2: interactive mode must NOT auto-allow a
-        write gate.  Uses the POLLING path (GET /permission record with
-        ``permission: "write"`` — the 1.18.15 write tools omit the SSE
-        event): the record must surface a question, never a silent
-        auto-allow."""
-        from opencode_bridge import opencode_chat_stream
-
-        async def _running(*args: Any, **kwargs: Any) -> bool:
-            return True
-
-        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
-        monkeypatch.setattr(opencode_bridge, "_EVENT_QUIET_TIMEOUT", 0.02)
-        monkeypatch.setattr(opencode_bridge, "_TOOL_WEDGE_AFTER_S", 60.0)
-        client = _RunningToolPermissionClient()
-        client.status_type = "idle"  # completion path
-        client.permission_records = [{
-            "id": "perm_w", "sessionID": "ses_0001",
-            "permission": "write",
-            "patterns": ["/home/user/out.txt"],
-            "tool": {"messageID": "msg_a", "callID": "call_w"},
-        }]
-        client.stream_lines = []  # empty event bus → polling fallback
-        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
-
-        deltas = [d async for d in opencode_chat_stream("task", pending_permissions=PP)]
-
-        questions = [(k, t) for k, t in deltas if k == "question"]
-        assert len(questions) == 1
-        _, text = questions[0]
-        assert "Target: /home/user/out.txt" in text
-        # Interactive: never auto-allowed (no "always" POST to the write id).
-        perm_posts = [(u, b) for u, b in client.post_calls if "/permissions/" in u]
-        assert all("perm_w" not in u for u, _ in perm_posts)
-        assert PP.get("ses_0001") == ("perm_w", True)
-
-    @pytest.mark.asyncio
-    async def test_opencode_command_write_relay(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """REQ-3 Scenario-1 + threat-matrix (routing parity): the /opencode
-        command must flow through ``opencode_chat_stream`` (the relay path),
-        NOT the bare blocking ``opencode_chat`` (the old silent write/edit
-        drop).  A write gate inside a /opencode task surfaces as an SSE
-        content question (no auto-allow)."""
-        from routes import _handle_opencode_command
-
-        async def _running(*args: Any, **kwargs: Any) -> bool:
-            return True
-
-        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _running)
-
-        # ---- Interactive leg: write gate surfaces as a question ---------
-        client = _FakeClient()
-        client.stream_lines = [
-            _evt("message.updated", sessionID="ses_0001",
-                 info={"id": "msg_user", "role": "user"}),
-            _evt("message.updated", sessionID="ses_0001",
-                 info={"id": "msg_a", "role": "assistant"}),
-            _evt("permission.updated", sessionID="ses_0001",
-                 id="perm_w", type="write",
-                 title="Allow writing to /home/user/out.txt",
-                 metadata={"filepath": "/home/user/out.txt"}),
-        ]
-        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
-
-        resp = await _handle_opencode_command(
-            "/opencode write config", _FakeApp(pending=PP),
-        )
-        text = await _drain_stream(resp)
-        # The write question is relayed as visible SSE content — never dropped.
-        assert "Target: /home/user/out.txt" in text
-        # Interactive: no auto-allow POST fired; the gate awaits the user.
-        assert [u for u, _ in client.post_calls if "/permissions/" in u] == []
-        assert PP.get("ses_0001") == ("perm_w", True)
-        # The stream relay path is used: prompt_async (streaming send) fired
-        # and NO bare blocking /message POST (the old opencode_chat drop path).
-        assert any("prompt_async" in u for u, _ in client.post_calls)
-        assert not any("/message" in u for u, _ in client.post_calls)
 
 
 # ---------------------------------------------------------------------------
@@ -1731,8 +1480,9 @@ class _SecurePermissionClient(_FakeClient):
 
 class TestSecurePermissionGate:
     """T5 (ct-58464): the secure backend answers NO permission — no relay,
-    no pending entry, no POST — and reports the wait on the stream.  The
-    relay stays byte-identical on the answering backends."""
+    no pending entry, no POST — and reports the wait on the stream.  With
+    the answering transports retired, this is the only permission policy
+    the bridge can exhibit."""
 
     @pytest.mark.asyncio
     async def test_secure_sse_event_reports_wait_no_relay_no_post(
@@ -1898,136 +1648,6 @@ class TestSecurePermissionGate:
         assert result == "done"
         assert not any(u.endswith("/abort") for u, _ in client.post_calls)
         assert [u for u, _ in client.post_calls if "/permissions/" in u] == []
-
-    @pytest.mark.asyncio
-    async def test_answering_backends_still_relay_question(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """The gate is scoped: the serve transport still relays the
-        permission as a question and stores the pending entry, so the
-        pinned-continuation resume has something to POST."""
-        from opencode_bridge import opencode_chat_stream
-        import opencode_backends as _ob
-
-        backend = _ob.ServeBackend()
-        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _ensure_true)
-        monkeypatch.setattr(opencode_bridge, "BACKEND", backend)
-        client = _SecurePermissionClient()
-        client.lines = [
-            _evt("message.updated", sessionID="ses_0001",
-                 info={"id": "msg_user", "role": "user"}),
-            _evt("message.updated", sessionID="ses_0001",
-                 info={"id": "msg_a", "role": "assistant"}),
-            _evt("permission.updated", sessionID="ses_0001",
-                 id="perm_w", type="write",
-                 title="Allow writing to /home/user/out.txt",
-                 metadata={"filepath": "/home/user/out.txt"}),
-        ]
-        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
-
-        deltas = [d async for d in opencode_chat_stream("task", pending_permissions=PP)]
-
-        assert len(deltas) == 1, deltas
-        kind, text = deltas[0]
-        assert kind == "question"
-        assert "Target: /home/user/out.txt" in text
-        assert [u for u, _ in client.post_calls if "/permissions/" in u] == []
-        assert PP.get("ses_0001") == ("perm_w", True)
-
-
-class TestRelayEveryPermission:
-    """R3 (T6, ct-58463): the removed READ auto-allow means every permission
-    that reaches the handler is relayed now — including ``external_directory``,
-    the formerly-auto-allowed read class.  The three relay paths (headless
-    blocking chat, stream event-bus, idle-completion resolver) each assert the
-    serve still relays it as a question with a stored pending entry."""
-
-    @pytest.mark.asyncio
-    async def test_blocking_path_relays_formerly_auto_allowed_read(
-        self, fake_client: _FakeClient, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """Headless/blocking chat path: an ``external_directory`` permission
-        (formerly auto-allowed) is relayed — the handler builds a question,
-        so the headless caller aborts instead of silently allowing it."""
-        from opencode_bridge import opencode_chat
-
-        monkeypatch.setattr(opencode_bridge, "_BLOCKING_PERMISSION_POLL_S", 0.01)
-        fake_client.message_hang_s = 0.2
-        fake_client.message_parts = [{"type": "text", "text": "ok"}]
-        fake_client.permission_records = [{
-            "id": "perm_read",
-            "sessionID": "ses_0001",
-            "permission": "external_directory",
-            "patterns": ["cat /etc/os-release"],
-            "tool": {"messageID": "m1", "callID": "c1"},
-        }]
-        result = await opencode_chat("task")
-        assert "[OpenCode Bridge Error:" in result
-        assert "headless escalation cannot relay" in result
-        assert any(
-            url.endswith("/abort") for url, _ in fake_client.post_calls
-        )
-
-    @pytest.mark.asyncio
-    async def test_event_bus_relays_formerly_auto_allowed_read(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """Stream event-bus path: an ``external_directory`` SSE permission
-        (``permission.updated``) is relayed as a question, once, with a
-        stored pending entry and no permission POST."""
-        from opencode_bridge import opencode_chat_stream
-
-        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _ensure_true)
-        client = _FakeClient()
-        client.stream_lines = [
-            _evt("message.updated", sessionID="ses_0001",
-                 info={"id": "msg_user", "role": "user"}),
-            _evt("message.updated", sessionID="ses_0001",
-                 info={"id": "msg_a", "role": "assistant"}),
-            _evt("permission.updated", sessionID="ses_0001",
-                 id="perm_read", type="external_directory",
-                 title="Allow reading /etc/os-release",
-                 metadata={"filepath": "/etc/os-release"}),
-        ]
-        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
-
-        deltas = [d async for d in opencode_chat_stream("task", pending_permissions=PP)]
-
-        questions = [(k, t) for k, t in deltas if k == "question"]
-        assert len(questions) == 1, deltas
-        assert [u for u, _ in client.post_calls if "/permissions/" in u] == []
-        assert PP.get("ses_0001") == ("perm_read", True)
-
-    @pytest.mark.asyncio
-    async def test_idle_completion_resolver_relays_formerly_auto_allowed_read(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """Idle-completion resolver: an ``external_directory`` permission
-        (formerly auto-allowed) is relayed as a question instead of the
-        parked session being declared done, with a stored pending entry."""
-        from opencode_bridge import opencode_chat_stream
-
-        monkeypatch.setattr(opencode_bridge, "ensure_opencode_serve", _ensure_true)
-        monkeypatch.setattr(opencode_bridge, "_EVENT_QUIET_TIMEOUT", 0.02)
-        monkeypatch.setattr(opencode_bridge, "_TOOL_WEDGE_AFTER_S", 60.0)
-        client = _RunningToolPermissionClient()
-        client.status_type = "idle"  # completion path
-        client.permission_records = [{
-            "id": "perm_read", "sessionID": "ses_0001",
-            "permission": "external_directory",
-            "patterns": ["/etc/os-release"],
-            "tool": {"messageID": "msg_a", "callID": "call_read"},
-        }]
-        client.stream_lines = []  # empty event bus → polling fallback
-        monkeypatch.setattr(opencode_bridge.httpx, "AsyncClient", lambda *a, **k: client)
-
-        deltas = [d async for d in opencode_chat_stream("task", pending_permissions=PP)]
-
-        questions = [(k, t) for k, t in deltas if k == "question"]
-        assert len(questions) == 1, deltas
-        assert all("perm_read" not in u for u, _ in client.post_calls if "/permissions/" in u)
-        assert PP.get("ses_0001") == ("perm_read", True)
-
 
 # ---------------------------------------------------------------------------
 # Pinned sessions + clarifying questions (a701e8d)
@@ -2997,9 +2617,9 @@ class TestCompletionResolvesPermissions:
 class TestSddSubagentContract:
     """The SDD sub-agent contract is the single source of truth for the
     bounded delegation rule (artifact-check-first, retry-once, inline
-    fallback, loud terminal failure).  The bridge prompt and the
-    serve-config orchestrator prompt must both carry the canonical
-    contract; drift fails here."""
+    fallback, loud terminal failure).  The retired serve-config template
+    that used to mirror it no longer exists (bridge v4 T9-U3), so the
+    canonical text is asserted directly here."""
 
     def test_contract_has_bounded_rule_and_marker(self) -> None:
         c = opencode_bridge._SDD_SUBAGENT_CONTRACT
@@ -3010,16 +2630,6 @@ class TestSddSubagentContract:
         assert "never start a retry while the original sub-agent session" in c
         # The old unbounded rule is gone from the canonical text.
         assert "DO NOT retry the sub-agent" not in c
-
-    def test_serve_config_prompt_embeds_contract(self) -> None:
-        import json as _json
-
-        raw = open("opencode-serve-config.opencode.jsonc", encoding="utf-8-sig").read()
-        cfg = _json.loads(raw)
-        prompt = cfg["agent"]["gentle-orchestrator"]["prompt"]
-        assert "SUB-AGENT CONTRACT (MANDATORY" in prompt
-        assert "SDD-CYCLE-TERMINAL-FAILURE" in prompt
-        assert "RETRY the " in prompt
 
 
 class TestWedgeReplayCarveOut:
@@ -3354,11 +2964,10 @@ class TestEventBusDialTargetsActiveBackend:
     """T8-found regression: the ``/event`` bus dial must follow the ACTIVE
     transport's ``BACKEND.event_bus_url``.
 
-    The bus URL is its own ABC attribute: the default serve transport keeps
-    the historical ``OPENCODE_SERVE_URL`` (18900), and the secure transport
-    points at ``OPENCODE_SECURE_SERVE_URL`` (4096).  Because the bus opens
-    BEFORE the prompt POST, a wrong-port dial under
-    ``OPENCODE_BACKEND=secure`` ended every attempt before ``send_prompt``.
+    The bus URL is its own transport attribute pointing at
+    ``OPENCODE_SECURE_SERVE_URL`` (4096).  Because the bus opens BEFORE the
+    prompt POST, a dial at the wrong port ended every attempt before
+    ``send_prompt``.
     """
 
     @pytest.mark.asyncio
@@ -3382,20 +2991,14 @@ class TestEventBusDialTargetsActiveBackend:
 
         assert client.stream_calls == [f"{SecureBackend.event_bus_url}/event"]
         assert client.stream_calls[0] == f"{OPENCODE_SECURE_SERVE_URL}/event"
-        assert OPENCODE_SERVE_URL not in client.stream_calls[0]
         # The prompt WAS reached (the pre-fix bug aborted BEFORE send_prompt).
         assert any("prompt_async" in u for u, _ in client.post_calls)
         assert "Done." in "".join(t for _, t in deltas)
 
-    def test_event_bus_url_defined_on_every_transport(self) -> None:
-        """Every transport resolves ``event_bus_url`` (no ``AttributeError``).
-
-        The bus URL lives on the ABC: a transport without a ``base_url``
-        would raise if the dial read it.  Serve keeps the historical serve
-        default; the secure transport points at the secure server.
-        """
+    def test_event_bus_url_resolves_on_the_transport(self) -> None:
+        """The sole transport resolves ``event_bus_url`` (no
+        ``AttributeError``) and it points at the secure server."""
         from constants import OPENCODE_SECURE_SERVE_URL
-        from opencode_backends import SecureBackend, ServeBackend
+        from opencode_backends import SecureBackend
 
-        assert ServeBackend.event_bus_url == OPENCODE_SERVE_URL
         assert SecureBackend.event_bus_url == OPENCODE_SECURE_SERVE_URL

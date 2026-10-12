@@ -1,15 +1,17 @@
-"""Tests for opencode_backends.py — the selector and the secure backend.
+"""Tests for opencode_backends.py — the sole secure transport.
 
-The openchamber CLI transport and its fake-CLI fixture were retired in
-bridge v4 T9, so these tests cover the two remaining transports: the
-selector map (serve / secure / unset / unknown), the secure backend's
-ownership and permission flags, its ``127.0.0.1:4096`` URLs, and the
-no-spawn/no-signal lifecycle guard.
+Bridge v4 leaves exactly ONE opencode transport: ``SecureBackend``, the
+systemd-owned secure-opencode server on ``127.0.0.1:4096``.  The serve and
+openchamber transports were retired in T9, so these tests cover the selector
+(every value resolves to ``SecureBackend``; a retired/unrecognised value is
+warned about once at import), the backend's ownership and permission flags,
+its ``127.0.0.1:4096`` URLs, and the no-spawn/no-signal lifecycle guard.
 """
 from __future__ import annotations
 
 import asyncio
 import importlib
+import logging
 import os
 import subprocess
 import types
@@ -23,20 +25,27 @@ import opencode_backends as ob
 
 # -- Selector ---------------------------------------------------------------
 
-def test_backend_selector_defaults_to_serve(
+def test_backend_selector_defaults_to_secure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("OPENCODE_BACKEND", raising=False)
     mod = importlib.reload(ob)
-    assert isinstance(mod.BACKEND, mod.ServeBackend)
+    assert isinstance(mod.BACKEND, mod.SecureBackend)
 
 
-def test_backend_selector_unknown_value_falls_back_to_serve(
+def test_backend_selector_unknown_value_still_resolves_to_secure(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    """An unknown value never fails selection: it resolves to SecureBackend
+    and is reported plainly at import (U1's R4-001 advisory)."""
     monkeypatch.setenv("OPENCODE_BACKEND", "bogus")
-    mod = importlib.reload(ob)
-    assert isinstance(mod.BACKEND, mod.ServeBackend)
+    with caplog.at_level(logging.WARNING, logger="kinver.opencode_bridge"):
+        mod = importlib.reload(ob)
+    assert isinstance(mod.BACKEND, mod.SecureBackend)
+    assert any(
+        "bogus" in record.getMessage() for record in caplog.records
+    ), caplog.records
     monkeypatch.delenv("OPENCODE_BACKEND", raising=False)
     importlib.reload(ob)
 
@@ -44,46 +53,74 @@ def test_backend_selector_unknown_value_falls_back_to_serve(
 # -- Secure backend (bridge v4, T4) -----------------------------------------
 
 @pytest.mark.parametrize(
-    ("env_value", "expected"),
-    [
-        (None, "ServeBackend"),
-        ("serve", "ServeBackend"),
-        ("bogus", "ServeBackend"),
-        ("secure", "SecureBackend"),
-    ],
+    "env_value",
+    [None, "serve", "openchamber", "secure", "bogus"],
 )
-def test_backend_selector_maps_each_value(
+def test_backend_selector_maps_every_value_to_secure(
     monkeypatch: pytest.MonkeyPatch,
     env_value: Optional[str],
-    expected: str,
 ) -> None:
-    """secure/serve/unset/unknown each pick the right class."""
+    """secure/serve/openchamber/unset/unknown all pick the one transport."""
     if env_value is None:
         monkeypatch.delenv("OPENCODE_BACKEND", raising=False)
     else:
         monkeypatch.setenv("OPENCODE_BACKEND", env_value)
     mod = importlib.reload(ob)
-    assert type(mod.BACKEND).__name__ == expected
+    assert type(mod.BACKEND).__name__ == "SecureBackend"
     # Restore the production default for the rest of the suite.
     monkeypatch.delenv("OPENCODE_BACKEND", raising=False)
     importlib.reload(ob)
 
 
-def test_secure_backend_owns_no_server() -> None:
-    """SecureBackend is a concrete ServeBackend pointed at 127.0.0.1:4096
-    that never owns the server lifecycle; the serve backend still does."""
+@pytest.mark.parametrize("env_value", ["serve", "openchamber", "bogus"])
+def test_retired_selector_value_warns_once_at_import(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    env_value: str,
+) -> None:
+    """A retired or unrecognised OPENCODE_BACKEND is warned about exactly
+    ONCE at import — an operator migrating off it is told plainly, and the
+    value selects nothing (never fails)."""
+    monkeypatch.setenv("OPENCODE_BACKEND", env_value)
+    with caplog.at_level(logging.WARNING, logger="kinver.opencode_bridge"):
+        mod = importlib.reload(ob)
+    warnings = [
+        record for record in caplog.records
+        if record.levelno == logging.WARNING
+        and env_value in record.getMessage()
+    ]
+    assert len(warnings) == 1, caplog.records
+    assert isinstance(mod.BACKEND, mod.SecureBackend)
+    monkeypatch.delenv("OPENCODE_BACKEND", raising=False)
+    importlib.reload(ob)
+
+
+def test_secure_selector_value_does_not_warn(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``OPENCODE_BACKEND=secure`` is the supported setting — no warning."""
+    monkeypatch.setenv("OPENCODE_BACKEND", "secure")
+    with caplog.at_level(logging.WARNING, logger="kinver.opencode_bridge"):
+        mod = importlib.reload(ob)
+    assert not any(
+        "OPENCODE_BACKEND" in record.getMessage() for record in caplog.records
+    ), caplog.records
+    assert isinstance(mod.BACKEND, mod.SecureBackend)
+    monkeypatch.delenv("OPENCODE_BACKEND", raising=False)
+    importlib.reload(ob)
+
+
+def test_secure_backend_is_the_only_transport() -> None:
+    """SecureBackend is a concrete OpenCodeBackend pointed at 127.0.0.1:4096
+    that never owns the server lifecycle and never answers permissions; the
+    retired transports no longer exist."""
     assert ob.SecureBackend.__abstractmethods__ == frozenset()
-    assert issubclass(ob.SecureBackend, ob.ServeBackend)
+    assert issubclass(ob.SecureBackend, ob.OpenCodeBackend)
+    assert not hasattr(ob, "ServeBackend")
     assert ob.SecureBackend.base_url == "http://127.0.0.1:4096"
+    assert ob.SecureBackend.event_bus_url == "http://127.0.0.1:4096"
     assert ob.SecureBackend.owns_server is False
-    assert ob.ServeBackend.owns_server is True
-
-
-def test_answers_permissions_flag_scoped_to_secure() -> None:
-    """The permission-relay capability defaults True and is switched off
-    ONLY for the secure backend (T5, ct-58464)."""
-    assert ob.OpenCodeBackend.answers_permissions is True
-    assert ob.ServeBackend.answers_permissions is True
     assert ob.SecureBackend.answers_permissions is False
 
 
@@ -108,13 +145,13 @@ class _RecordingClient:
 
 
 def _send_signatures() -> list[Any]:
-    """Every send primitive that could carry a model override: the ABC
-    contract plus the concrete serve transport (T6, ct-58463)."""
+    """Every send primitive that could carry a model override or an agent
+    pin: the ABC contract plus the concrete transport (T6, T8-found)."""
     return [
         ob.OpenCodeBackend.send_prompt,
         ob.OpenCodeBackend.send_message,
-        ob.ServeBackend.send_prompt,
-        ob.ServeBackend.send_message,
+        ob.SecureBackend.send_prompt,
+        ob.SecureBackend.send_message,
     ]
 
 
@@ -158,7 +195,7 @@ async def test_send_payload_never_carries_model_override() -> None:
     """T6 (ct-58463) rule 7: the outbound payload has NO ``model`` key on
     either send primitive — the streaming prompt_async (``send_prompt``)
     and the blocking message POST (``send_message``)."""
-    backend = ob.ServeBackend()
+    backend = ob.SecureBackend()
     client = _PayloadClient()
     await backend.send_prompt(
         client, "ses1", system_prompt="s",
@@ -183,7 +220,7 @@ async def test_send_payload_never_carries_agent_key() -> None:
     and the blocking message POST (``send_message``).  Agent selection
     belongs to the server's own config, so the bridge cannot pin a
     read-only agent (mirrors the T6 model-override removal)."""
-    backend = ob.ServeBackend()
+    backend = ob.SecureBackend()
     client = _PayloadClient()
     await backend.send_prompt(
         client, "ses1", system_prompt="s", user_text="u",
@@ -332,6 +369,3 @@ async def test_secure_ensure_probe_only_when_up(
     assert await obr.ensure_opencode_serve() is True
     assert created == []
     assert signals == []
-
-
-

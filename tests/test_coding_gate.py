@@ -1235,17 +1235,6 @@ class TestPinnedPermissionResume:
         return posted
 
     @pytest.mark.asyncio
-    async def test_resume_posts_answer_under_relay_backend(
-        self, gate_client: Any, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        from opencode_backends import ServeBackend
-
-        posted = await self._drive_resume(
-            gate_client, monkeypatch, backend=ServeBackend(),
-        )
-        assert posted == [("ses_0001", "perm_1", "once")]
-
-    @pytest.mark.asyncio
     async def test_resume_never_posts_under_secure_backend(
         self, gate_client: Any, monkeypatch: pytest.MonkeyPatch,
     ) -> None:

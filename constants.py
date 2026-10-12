@@ -177,19 +177,16 @@ ALL_MODEL_KEYS: tuple[str, ...] = tuple(
 )
 
 # ---------------------------------------------------------------------------
-# OpenCode bridge (routes requests to a headless opencode serve backend)
+# OpenCode bridge (routes requests to the systemd-owned secure server)
 # ---------------------------------------------------------------------------
 
-# Headless opencode serve backend (opencode_bridge.py).  A client that
-# picks model "opencode" (or embeds /opencode) directs the request to the
-# opencode agent instead of a local llama model.
-OPENCODE_SERVE_URL: str = "http://127.0.0.1:18900"
-
-# The systemd-owned secure-opencode server (bridge v4, T4).  Unlike
-# OPENCODE_SERVE_URL, the proxy NEVER owns this server's lifecycle: the
+# The systemd-owned secure-opencode server (bridge v4).  It is the bridge's
+# ONLY opencode transport, and the proxy NEVER owns its lifecycle: the
 # secure backend performs a health probe only — no spawn, no recycle, no
-# config sync, no auth copy and no SIGTERM.  Selected by
-# OPENCODE_BACKEND=secure; a down server is the user's to start.
+# config sync, no auth copy and no SIGTERM.  A client that picks model
+# "opencode" (or embeds /opencode) is directed to the opencode agent on
+# this server instead of a local llama model.  A down server is the user's
+# to start.
 OPENCODE_SECURE_SERVE_URL: str = "http://127.0.0.1:4096"
 
 # Directory the opencode bridge creates sessions in.  Passing an explicit

@@ -95,15 +95,6 @@ project-specific.
    request, shared state lives on `proxy.app.state.*`. Module-level mutable
    globals are forbidden except cached constants in `constants.py`.
 
-   **Documented carve-out — serve-config mtime cache** (`opencode_bridge.py`
-   `_serve_config_mtime`): a scalar `Optional[float]` cache of the serve
-   config's last-synced mtime, mutated only in `_sync_serve_config` /
-   `_spawn_serve`. The spawn gate has no `app.state` handle (it runs from
-   scripts and tests too), so threading app state through would couple the
-   bridge's core to the FastAPI app. Accepted as a project exception
-   (2026-08-09, F5 note in `opencode_bridge.py`); the cache is a scalar
-   timestamp, never a container.
-
    **Documented carve-out — prompt priming registries** (`prompt_cache.py`
    `_PROMPTS` / `_LAST_PRIMED`): runtime-mutable module-level registries
    for the frontend system-prompt priming. Priming is currently DISABLED
@@ -119,18 +110,12 @@ project-specific.
 
    **Documented carve-out — bridge backend service reference**
    (`opencode_backends.py` `BACKEND`): a module-level `OpenCodeBackend`
-   service reference for the opencode bridge's transport abstraction.
-   Accepted as a project exception (2026-08-16, F7 note in
-   `opencode_backends.py`); the reference is a never-mutated pointer to a
-   STATELESS backend (session/request state lives in the caller's dicts
-   and per-request httpx clients), so it carries no mutable state — the
-   same class of exception as the F5/F6 scalar/registry carve-outs.
-   When `OPENCODE_BACKEND=openchamber` selects `OpenChamberBackend`, the
-   reference points at an instance that carries ONE piece of per-session
-   state (a session_id → directory map — the CLI needs `--dir` on every
-   call while the interface only carries the directory at create) —
-   documented as the F8 exception in `opencode_backends.py`; the default
-   `ServeBackend` remains stateless.
+   service reference for the opencode bridge's single transport.  Accepted
+   as a project exception (2026-08-16, F7 note in
+   `opencode_backends.py`); the reference is a never-mutated pointer to
+   the STATELESS `SecureBackend` (session/request state lives in the
+   caller's dicts and per-request httpx clients), so it carries no mutable
+   state — the same class of exception as the F6 registry carve-out.
 
 7. **Tests**: new code paths MUST have a regression test. Use the harness in
    `tests/conftest.py` (stubs FlashRank + heavy deps, lifespan disabled).

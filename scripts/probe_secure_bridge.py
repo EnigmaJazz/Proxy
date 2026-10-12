@@ -594,7 +594,8 @@ def _scan_sessions(data_dir: Path, since: float, *, cap: int = 20000) -> Optiona
 #: Delegation verbs/phrases the agent's own summary may use.
 _DELEGATION_CUES = ("delegat", "subagent", "sub-agent", "handed off", "handed over")
 #: A delegation statement that NAMES the delegate (``... to <Name>``).  Used
-#: only as a prose fallback: never a PASS basis without the file on disk.
+#: only as a prose fallback: a prose claim can never credit delegation by
+#: itself (it is reported UNKNOWN, never PASS).
 _DELEGATE_NAME_RE = re.compile(
     r"(?:delegat\w*|handed (?:off|over))\s+"
     r"(?:the\s+\S+\s+)?to\s+(?:the\s+)?([A-Za-z][A-Za-z0-9_.-]{2,})",
@@ -609,21 +610,31 @@ _NOT_A_DELEGATE = frozenset({
 })
 
 
+#: Punctuation the name pattern can absorb at a token edge (it allows '.' and
+#: '-' inside a name); stripped before the stop-word test so "Alpha." reads as
+#: "Alpha".
+_NAME_EDGE_PUNCT = ".,;:!?\"'`()[]{}"
+
+
 def _named_delegate(text: str) -> Optional[str]:
     """Return the delegate name when the summary says it delegated to one.
 
     Conservative prose-only fallback: requires a delegation cue AND a
     ``delegated ... to <Name>`` token that is not a common English word.  The
-    stream marker is the primary evidence; this supports a PASS only when the
-    file on disk also exists.
+    captured token is stripped of edge punctuation and case-folded before the
+    stop-word test, so a sentence-final "Alpha." reads as "Alpha" and a
+    capitalized stop-word ("Worker") is still rejected.  The stream marker is
+    the primary evidence: this prose claim is reported UNKNOWN, never a PASS.
     """
     if not any(cue in text.lower() for cue in _DELEGATION_CUES):
         return None
     match = _DELEGATE_NAME_RE.search(text)
     if match is None:
         return None
-    name = match.group(1)
-    return None if name.lower() in _NOT_A_DELEGATE else name
+    name = match.group(1).strip(_NAME_EDGE_PUNCT)
+    if not name:
+        return None
+    return None if name.casefold() in _NOT_A_DELEGATE else name
 
 
 def _acceptance_facts(
@@ -676,11 +687,13 @@ def _acceptance_facts(
             "stream shows a subagent/delegation tool marker: "
             + ", ".join(outcome.delegation_signals),
         ))
-    elif named_delegate and ok:
+    elif named_delegate:
         facts.append(Check(
-            "2b. delegation observed", "PASS",
-            f"no stream marker; the agent's summary names the delegate "
-            f"{named_delegate!r} AND {write_path} exists (prose + on-disk sources)",
+            "2b. delegation observed", "UNKNOWN",
+            f"the agent's summary names the delegate {named_delegate!r} but the "
+            "stream shows NO subagent/delegation tool marker: delegation was "
+            "claimed, not positively observed"
+            + (f"; the on-disk file {write_path} exists" if ok else ""),
         ))
     elif stream_write or ok:
         source = "a write tool marker" if stream_write else f"the on-disk file {write_path}"
@@ -777,17 +790,30 @@ def _remove_probe_dir(probe_dir: Path, workspace: Path) -> bool:
 
     HARD GUARD: the ONLY path this may remove is exactly
     ``<workspace>/.opencode_bridge_probe`` — that directory name in that parent,
-    and not a symlink.  A path that fails the guard is refused and logged, so a
-    mis-built target can never rmtree the workspace or any path outside the
-    probe's own fixture directory.  Returns True when the entry is absent
-    afterwards (removed, or already gone) and False when it still exists.
+    and not a symlink.  Both the probe dir and the workspace are CANONICALIZED
+    (fully resolved) before the parent and basename comparison, so a
+    non-canonical/symlinked workspace path cannot make an unresolved-vs-resolved
+    comparison disagree and let cleanup act on the wrong target.  A path that
+    fails the guard is refused and logged, so a mis-built target can never
+    rmtree the workspace or any path outside the probe's own fixture directory.
+    Returns True when the entry is absent afterwards (removed, or already gone)
+    and False when it still exists (or the guard could not canonicalize).
 
     Removal failure is logged and swallowed: the probe's result is already
     decided, and a leftover fixture directory must not fail a run.
     """
+    try:
+        resolved_probe = probe_dir.resolve()
+        resolved_workspace = workspace.resolve()
+    except (OSError, RuntimeError) as exc:
+        log.warning(
+            "refusing to remove %s: could not resolve the probe/workspace path: %s",
+            probe_dir, exc,
+        )
+        return False
     if (
-        probe_dir.name != _PROBE_DIRNAME
-        or probe_dir.parent.resolve() != workspace.resolve()
+        resolved_probe.name != _PROBE_DIRNAME
+        or resolved_probe.parent != resolved_workspace
         or probe_dir.is_symlink()
     ):
         log.warning(

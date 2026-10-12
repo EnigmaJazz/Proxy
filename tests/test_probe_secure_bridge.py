@@ -13,7 +13,7 @@ afterwards, as a positive control on the guard.
 Hermetic: ``tmp_path`` only — no live server, no network, no subprocess.  The
 full suite's ``tests/conftest.py`` needs ``httpx``/``prometheus_client`` (absent
 in the sandbox worker), so these tests were executed under a stub harness that
-skips conftest; all 32 passed.
+skips conftest; all passed.
 """
 from __future__ import annotations
 
@@ -120,6 +120,32 @@ def test_remove_probe_dir_refuses_symlink_and_leaves_target_intact(
     assert keeper.read_text(encoding="utf-8") == "keep"
 
 
+def test_remove_probe_dir_symlinked_workspace_cannot_bypass_guard(
+    tmp_path: Path,
+) -> None:
+    """A non-canonical (symlinked) workspace path must not let the guard act
+    on a foreign target: parent + basename are compared on the RESOLVED probe
+    dir, not on an unresolved path."""
+    real_workspace = tmp_path / "real_workspace"
+    real_workspace.mkdir()
+    link_workspace = tmp_path / "link_workspace"
+    link_workspace.symlink_to(real_workspace, target_is_directory=True)
+
+    # Right basename, but NOT directly in the workspace: a foreign sibling one
+    # level down.  Reached through the symlinked workspace it is still foreign.
+    foreign = real_workspace / "nested" / ".opencode_bridge_probe"
+    foreign.mkdir(parents=True)
+    keeper = foreign / "keep.txt"
+    keeper.write_text("keep", encoding="utf-8")
+
+    attempted = link_workspace / "nested" / ".opencode_bridge_probe"
+    assert psb._remove_probe_dir(attempted, link_workspace) is False
+    # Positive control: the foreign target STILL EXISTS, byte-for-byte.
+    assert foreign.is_dir()
+    assert keeper.read_text(encoding="utf-8") == "keep"
+    assert real_workspace.is_dir()  # the resolved workspace was not touched
+
+
 def test_remove_probe_dir_returns_true_when_absent(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -155,11 +181,12 @@ def test_named_delegate_extracts_a_real_name() -> None:
     )
 
 
-def test_named_delegate_captures_trailing_punctuation_verbatim() -> None:
-    # OBSERVED actual behaviour: the name pattern includes '.' and '-', so a
-    # sentence-final period is captured as part of the token.  Asserted as-is;
-    # the production module is out of this unit's scope.
-    assert psb._named_delegate("I delegated the write to Alpha.") == "Alpha."
+def test_named_delegate_strips_trailing_punctuation() -> None:
+    # The name pattern allows '.'/'-' INSIDE a name, so a sentence-final period
+    # is captured into the token; it must be stripped: "Alpha." -> "Alpha".
+    assert psb._named_delegate("I delegated the write to Alpha.") == "Alpha"
+    # An internal hyphen is preserved; only the trailing edge punctuation goes.
+    assert psb._named_delegate("I delegated the write to Beta-X.") == "Beta-X"
 
 
 def test_named_delegate_rejects_common_stop_words() -> None:
@@ -173,6 +200,13 @@ def test_named_delegate_rejects_common_stop_words() -> None:
         psb._named_delegate("I delegated the write to the tool and it applied.")
         is None
     )
+    # A CAPITALIZED stop-word must also be rejected: the stop-word test is
+    # case-folded, so capitalization cannot evade it.
+    assert (
+        psb._named_delegate("I delegated the write to Worker and it applied.")
+        is None
+    )
+    assert psb._named_delegate("I delegated the write to The.") is None
 
 
 def test_named_delegate_returns_none_without_a_delegate() -> None:
@@ -290,27 +324,28 @@ def test_fact2b_delegation_pass_on_positive_stream_marker(
     assert _fact(facts, "2b.").status == "PASS"
 
 
-def test_fact2b_prose_needs_the_file_on_disk_to_pass(
+def test_fact2b_prose_only_is_unknown_never_pass(
     tmp_path: Path, absent_data_dir: Path,
 ) -> None:
     write = tmp_path / "out.txt"
     prose = "I delegated the write to Alpha and it applied the change."
 
-    # prose names a delegate AND the file exists -> PASS
+    # prose names a delegate AND the file exists -> still NOT a PASS: the
+    # positive stream marker is required, so a prose-only claim is UNKNOWN.
     write.write_text(psb._WRITE_CONTENT, encoding="utf-8")
     facts = psb._acceptance_facts(
         psb.ProbeOutcome(text=[prose]), str(write), 0.0,
     )
-    assert _fact(facts, "2b.").status == "PASS"
+    fact = _fact(facts, "2b.")
+    assert fact.status == "UNKNOWN"
+    assert "Alpha" in fact.evidence
 
-    # prose names a delegate but the file is ABSENT -> NOT a PASS
+    # prose names a delegate but the file is ABSENT -> also UNKNOWN, never PASS
     write.unlink()
     facts = psb._acceptance_facts(
         psb.ProbeOutcome(text=[prose]), str(write), 0.0,
     )
-    fact = _fact(facts, "2b.")
-    assert fact.status != "PASS"
-    assert fact.status == "UNKNOWN"
+    assert _fact(facts, "2b.").status == "UNKNOWN"
 
 
 def test_fact2b_delegation_fail_when_a_write_happened_without_delegation(

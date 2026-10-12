@@ -192,19 +192,6 @@ OPENCODE_SERVE_URL: str = "http://127.0.0.1:18900"
 # OPENCODE_BACKEND=secure; a down server is the user's to start.
 OPENCODE_SECURE_SERVE_URL: str = "http://127.0.0.1:4096"
 
-# OpenChamber daemon for the bridge's second transport (openchamber-bridge
-# backend, step 2+).  The bridge owns its lifecycle like the serve: the
-# daemon spawns on a fixed loopback port with ISOLATED XDG homes under
-# OPENCHAMBER_CONFIG_DIR (sibling of the serve-config dir).  Port 8791 is
-# the prototype's 8790 + 1 (the prototype daemon may still be running).
-OPENCHAMBER_SERVE_URL: str = "http://127.0.0.1:8791"
-
-# The OpenChamber CLI binary (the bridge spawns the daemon through it).
-OPENCHAMBER_BIN: str = _machine(
-    "OPENCHAMBER_BIN", os.path.expanduser("~/.bun/bin/openchamber"),
-)
-
-
 # Working directory for the headless opencode serve.  Deliberately OUTSIDE
 # the proxy repo: bridge sessions (gentle-orchestrator/build agents) write
 # files there, and running them in the repo polluted the proxy git tree
@@ -218,15 +205,6 @@ OPENCODE_WORKSPACE_DIR: str = _machine(
 # bridge sessions operate on a real project (e.g. the proxy repo, which
 # hosts the OpenSpec SDD store) instead of the scratch workspace.
 OPENCODE_BRIDGE_DIRECTORY: str = _machine("OPENCODE_BRIDGE_DIRECTORY", _REPO_ROOT)
-
-# Isolated homes for the bridge-owned OpenChamber daemon (sibling of the
-# serve-config dir): XDG_CONFIG_HOME here, XDG_DATA_HOME here/data,
-# XDG_CACHE_HOME here/cache.  The daemon's managed opencode runtime never
-# shares the TUI's data — same isolation rationale as the serve.
-OPENCHAMBER_CONFIG_DIR: str = _machine(
-    "OPENCHAMBER_CONFIG_DIR",
-    os.path.join(OPENCODE_WORKSPACE_DIR, "openchamber-config"),
-)
 
 # Absolute path to the opencode binary.  systemd services run with a
 # minimal PATH that does not include ~/.opencode/bin, so the bridge spawn

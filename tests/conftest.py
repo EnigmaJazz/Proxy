@@ -198,18 +198,6 @@ import proxy  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# 4. Markers
-# ---------------------------------------------------------------------------
-def pytest_configure(config: pytest.Config) -> None:
-    config.addinivalue_line(
-        "markers",
-        "real_recycle: exercise the REAL serve recycle primitive; "
-        "hermetic_serve skips its noop patches while the teardown guard "
-        "still runs (fake pids never match the live serve)",
-    )
-
-
-# ---------------------------------------------------------------------------
 # 5. Fixtures
 # ---------------------------------------------------------------------------
 @pytest_asyncio.fixture

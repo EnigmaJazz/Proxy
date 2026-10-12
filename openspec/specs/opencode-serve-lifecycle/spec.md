@@ -1,3 +1,15 @@
+> **SUPERSEDED (2026-10-12, bridge v4 T9).**  The whole subject of this
+> specification — the proxy-owned `opencode serve` lifecycle (spawn,
+> recycle, config-drift, auth-copy, PID discovery/verification and the
+> bounded SIGTERM drain) — was retired in T9-U2.  The proxy now owns no
+> opencode server: every bridged request goes to the systemd-owned
+> secure-opencode server, `ensure_opencode_serve` is a pure health probe,
+> and the recycle/kill/drain primitives no longer exist.  These
+> requirements are therefore SUPERSEDED.  The file itself is to be
+> REMOVED by the T9-U3 archive commit (U3 owns archiving); this note is
+> the tombstone left in place so the spec set and its removal commit can
+> be reconciled.
+
 # OpenCode Serve-Lifecycle Specification
 
 ## Purpose

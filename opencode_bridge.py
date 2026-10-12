@@ -24,15 +24,15 @@ assistant text.
 Message-path HTTP primitives route through the module-level ``BACKEND``
 instance from ``opencode_backends.py`` (openchamber-bridge-backend design,
 step 1): session create/send/fetch/abort, permission and question relay.
-The ``/event`` SSE bus and the serve lifecycle (spawn/recycle/config
-sync) stay in this module — they are serve-specific and belong to later
-steps of the design.
+The ``/event`` SSE bus stays in this module.  The proxy owns no opencode
+server (bridge v4): every bridged request goes to the systemd-owned secure
+server, so ``ensure_opencode_serve`` is a pure health probe and no spawn,
+recycle, config-sync or signal path remains here.
 """
 from __future__ import annotations
 
 import asyncio
 import json
-import os
 import re
 import time
 from datetime import datetime
@@ -42,16 +42,9 @@ from typing import Any, AsyncIterator, Optional
 import httpx
 
 from constants import (
-    OPENCODE_BIN,
     OPENCODE_SERVE_TIMEOUT,
-    OPENCODE_SERVE_URL,
     OPENCODE_SECURE_SERVE_URL,
     OPENCODE_BRIDGE_DIRECTORY,
-    OPENCODE_SERVE_CONFIG_DIR,
-    OPENCODE_SERVE_PURE,
-    OPENCODE_WORKSPACE_DIR,
-    OPCODE_CONFIG_PATH,
-    _machine,
     get_logger,
 )
 from opencode_backends import BACKEND
@@ -116,12 +109,6 @@ _SDD_SUBAGENT_CONTRACT = (
     "so far - do NOT retry, do NOT continue the pipeline, do NOT ask the "
     "user anything."
 )
-
-# Recycle the opencode serve after this uptime: the serve's agent-loop
-# tool runner progressively wedges (bash hangs on trivial commands even
-# with healthy memory); a fresh serve runs bash reliably.
-_SERVE_RECYCLE_AFTER_S: float = 1800.0
-
 
 # Quiet period after a finished step before the bridge considers the
 # agentic session complete (the final summary message follows the last
@@ -532,41 +519,20 @@ def _strip_proxy_status_text(text: str) -> str:
     return _STATUS_SEGMENT_RE.sub("", text)
 
 
-async def is_opencode_serve_running() -> bool:
-    """True when a complete HTTP response arrives from the serve transport.
-
-    Transport-liveness semantics: ANY received HTTP response — 2xx, 3xx,
-    4xx, or 5xx — proves a process holds the configured port, so a
-    non-2xx responder (version-specific, missing, or degraded /config)
-    still blocks a duplicate spawn.  Only an ``httpx.HTTPError``
-    (ConnectError / ConnectTimeout / ReadTimeout) or ``OSError`` means
-    down.  The buffered ``.get()`` completion is the received-response
-    boundary; the body is never explicitly read and the status is never
-    interpreted.
-    """
-    try:
-        async with httpx.AsyncClient() as client:
-            await client.get(f"{OPENCODE_SERVE_URL}/config", timeout=3.0)
-            return True
-    except (httpx.HTTPError, OSError):
-        return False
-
-
 async def _secure_serve_answering() -> bool:
     """Pure health probe for the systemd-owned secure server.
 
     ANY received HTTP response proves a process holds the secure port
-    (the same transport-liveness semantics as ``is_opencode_serve_running``);
-    only a transport error (``httpx.HTTPError`` / ``OSError``) means down.
-    Never raises, and never touches the serve-lifecycle helpers — it probes
-    ``OPENCODE_SECURE_SERVE_URL`` directly, so no spawn/recycle/probe against
-    the bridge-owned serve runs under the secure backend.
+    (transport-liveness semantics); a transport error or an unparseable
+    probe response (``httpx.HTTPError`` / ``OSError`` / ``ValueError``)
+    means down.  Never raises — this is the proxy's only server-liveness
+    check now that it owns no server.
     """
     try:
         async with httpx.AsyncClient() as client:
             await client.get(f"{OPENCODE_SECURE_SERVE_URL}/config", timeout=3.0)
             return True
-    except (httpx.HTTPError, OSError):
+    except (httpx.HTTPError, OSError, ValueError):
         return False
 
 
@@ -587,166 +553,16 @@ def _serve_unreachable_message() -> str:
 
 
 async def ensure_opencode_serve() -> bool:
-    """Ensure the opencode serve backend is up (spawn if missing).
+    """Ensure the opencode backend is answering (pure health probe).
 
-    Returns True when the backend is answering.  Spawns ``opencode serve``
-    as a detached child process bound to ``OPENCODE_SERVE_URL`` — the
-    proxy owns its lifecycle so no systemd unit is required.  Never raises.
-
-    On a backend that does NOT own its server (``BACKEND.owns_server`` is
-    False — the systemd-owned secure server), this degenerates to a pure
-    health probe: no spawn, no config sync, no auth copy and no signal.
-    A down secure server returns False and the callers fail with an error
-    naming it; the proxy never starts it.
-
-    Config-drift gate (REQ-5): when a serve IS running and the serve
-    template (OPCODE_CONFIG_PATH) is newer than the mtime cached at the
-    last successful spawn, the serve is recycled via ``_force_recycle_serve``
-    and respawned so the edited config actually loads.  An unreadable
-    template is treated as no-drift.
+    The proxy owns no opencode server (bridge v4): every bridged request
+    goes to the systemd-owned secure-opencode server, so this is a health
+    probe of ``OPENCODE_SECURE_SERVE_URL`` alone.  There is no spawn, no
+    recycle, no config sync, no auth copy and no drift detection — a down
+    server returns False and the callers fail with an error naming it; the
+    proxy never starts it.  Never raises.
     """
-    global _serve_config_mtime
-    if not BACKEND.owns_server:
-        return await _secure_serve_answering()
-    mtime = await asyncio.to_thread(_config_mtime)
-    if await is_opencode_serve_running():
-        if mtime is None:
-            return True  # template unreadable — treat as no-drift
-        if _serve_config_mtime is not None and mtime > _serve_config_mtime:
-            logger.warning(
-                "opencode serve config drifted (mtime %.3f > cached %.3f) — "
-                "recycling serve", mtime, _serve_config_mtime,
-            )
-            await _force_recycle_serve()
-            # Drain the old listener so the respawn can bind the port.
-            for _ in range(4):
-                if not await is_opencode_serve_running():
-                    break
-                await asyncio.sleep(0.25)
-        else:
-            if _serve_config_mtime is None:
-                # Proxy restarted while the serve survived: adopt the
-                # current template as the baseline, no recycle.
-                _serve_config_mtime = mtime
-            return True
-    return await _spawn_serve(mtime)
-
-
-
-def _sync_openai_auth_into_serve(serve_env: dict[str, str]) -> None:
-    """Refresh the serve's openai OAuth access token from the TUI/CLI
-    auth.json and copy the auth file into the serve's ISOLATED data
-    home (the chatgpt-headless route the TUI/CLI use — the env apiKey
-    alone is rejected: the ChatGPT-Plus OAuth token lacks the
-    api.responses.write scope).  Sync file I/O: callers run it via
-    asyncio.to_thread.  Never raises.
-    """
-    try:
-        with open(
-            os.path.expanduser("~/.local/share/opencode/auth.json"),
-            encoding="utf-8",
-        ) as _af:
-            _auth = json.load(_af)
-        _tok = (_auth.get("openai") or {}).get("access")
-        if _tok:
-            serve_env["OPENAI_API_KEY"] = _tok
-        # The serve's data home is ISOLATED (XDG_DATA_HOME ->
-        # serve-config), so its auth lookup would miss the TUI/CLI's
-        # auth.json (OAuth tokens) and fall back to the env apiKey
-        # (which the API rejects).  Copy the auth file into the serve's
-        # data home so the serve resolves the openai provider through
-        # the SAME chatgpt-headless OAuth route the TUI/CLI use
-        # (2026-08-09).
-        _serve_auth = os.path.join(
-            OPENCODE_SERVE_CONFIG_DIR, "opencode", "auth.json",
-        )
-        _src_auth = os.path.expanduser("~/.local/share/opencode/auth.json")
-        if os.path.exists(_src_auth):
-            os.makedirs(os.path.dirname(_serve_auth), exist_ok=True)
-            with open(_src_auth, "rb") as _sf, open(_serve_auth, "wb") as _df:
-                _df.write(_sf.read())
-            # The copy holds OAuth tokens: enforce the same 0600 the
-            # source auth.json carries (open('wb') would create it
-            # 0644 under a normal umask — world-readable).
-            try:
-                os.chmod(_serve_auth, 0o600)
-            except OSError:
-                pass
-    except (OSError, ValueError, TypeError):
-        pass
-
-async def _spawn_serve(mtime: Optional[float]) -> bool:
-    """Spawn the opencode serve with the serve-scoped config (candidate B).
-
-    Syncs the reduced template into ``OPENCODE_SERVE_CONFIG_DIR`` and
-    spawns with ``XDG_CONFIG_HOME`` pointing there, so ONLY the referenced
-    plugins load (the rate-limit-fallback plugin; the wedge-prone
-    skill-registry / review-result-artifacts / model-variants .ts plugins
-    never auto-load — the serve-config dir holds no .ts files).
-    ``OPENCODE_SERVE_PURE`` toggles candidate A (``--pure``, no plugins).
-    Records ``_serve_config_mtime`` on success so the drift gate can
-    compare.  Never raises.
-    """
-    if not BACKEND.owns_server:
-        # Systemd-owned server (secure backend): the proxy never spawns,
-        # config-syncs or auth-copies it — the whole spawn cluster is a
-        # no-op and ensure_opencode_serve stays a pure health probe.
-        return False
-    global _serve_config_mtime
-    try:
-        port = OPENCODE_SERVE_URL.rsplit(":", 1)[-1]
-        await asyncio.to_thread(_sync_serve_config)
-        serve_log = await asyncio.to_thread(_open_serve_log)
-        # The serve inherits a minimal systemd PATH; give it the usual
-        # user paths so the fallback plugin's gentle-ai binary resolves.
-        serve_env = dict(os.environ)
-        serve_env["PATH"] = (
-            _machine("LINUXBREW_PREFIX", os.path.expanduser("~/.linuxbrew")) + "/bin:"
-            + _machine("LOCAL_BIN_DIR", os.path.expanduser("~/.local/bin")) + ":"
-            + _machine("OPENCODE_BIN_DIR", os.path.expanduser("~/.opencode/bin")) + ":"
-            + "/usr/local/bin:/usr/bin:/bin"
-        )
-        # Candidate B: serve-scoped config dir (never ~/.config/opencode).
-        serve_env["XDG_CONFIG_HOME"] = OPENCODE_SERVE_CONFIG_DIR
-        # The auth sync is sync file I/O: keep it off the event loop
-        # (Rule 3 discipline — the config sync and log opens do the same).
-        await asyncio.to_thread(_sync_openai_auth_into_serve, serve_env)
-        # Full serve isolation (2026-08-09): the serve must NOT share the
-        # TUI's data/cache locations.  The shared session DB + plugin
-        # caches caused cross-process contention (systematic plugin's
-        # models.json cache, session storage churn) and let the serve's
-        # stalls poison the TUI and vice versa.  Data (sessions) and cache
-        # now live under the serve-config dir, unique to the serve.
-        serve_env["XDG_DATA_HOME"] = OPENCODE_SERVE_CONFIG_DIR
-        serve_env["XDG_CACHE_HOME"] = os.path.join(OPENCODE_SERVE_CONFIG_DIR, "cache")
-        args = [
-            OPENCODE_BIN, "serve", "--port", port, "--hostname", "127.0.0.1",
-        ]
-        if OPENCODE_SERVE_PURE:
-            args.append("--pure")  # candidate A fallback: no plugins at all
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdout=serve_log,
-            stderr=serve_log,
-            start_new_session=True,
-            cwd=OPENCODE_WORKSPACE_DIR,
-            env=serve_env,
-        )
-        logger.info(
-            "Opened opencode serve (pid=%s) on %s", proc.pid, OPENCODE_SERVE_URL,
-        )
-        # Wait briefly for the listener to come up.
-        for _ in range(10):
-            await asyncio.sleep(0.5)
-            if await is_opencode_serve_running():
-                _serve_config_mtime = mtime
-                return True
-    except asyncio.CancelledError:
-        # Cancellation must propagate (never swallow it).
-        raise
-    except OSError as exc:
-        logger.error("Failed to spawn opencode serve: %s", exc)
-    return False
+    return await _secure_serve_answering()
 
 
 async def opencode_chat(
@@ -772,9 +588,8 @@ async def opencode_chat(
     zombie is left on the serve.
 
     A network-class failure after a successful first ensure triggers one
-    bounded respawn: the serve is force-recycled, re-ensured, and the whole
-    call retried exactly once.  HTTP-status errors and permission aborts
-    never retry.
+    bounded retry: the backend is re-ensured and the whole call retried
+    exactly once.  HTTP-status errors and permission aborts never retry.
     """
     if not await ensure_opencode_serve():
         return _serve_unreachable_message()
@@ -786,10 +601,11 @@ async def opencode_chat(
         )
         if not network_failed:
             return text
-        # The serve died mid-call (network-class failure after a successful
-        # ensure): recycle once, re-ensure, and retry the whole call once.
-        # No loop — a failed re-ensure or failed retry returns its error.
-        await _force_recycle_serve("blocking-path respawn")
+        # The server went away mid-call (network-class failure after a
+        # successful ensure): re-ensure and retry the whole call once.  The
+        # proxy owns no server, so there is nothing to recycle — the health
+        # probe decides.  No loop — a failed re-ensure or a failed retry
+        # returns its error.
         if not await ensure_opencode_serve():
             return _serve_unreachable_message()
         text, _ = await _opencode_chat_attempt(
@@ -925,11 +741,6 @@ async def opencode_chat_stream(
     "question" → the agent is waiting for user input (stop streaming).
     On failure yields a status tuple (never raises).
     """
-    # Recycle BEFORE ensure: the recycle SIGTERMs the serve (low memory or
-    # uptime > _SERVE_RECYCLE_AFTER_S) and never respawns, so running it
-    # after ensure would break the next request with a spurious ConnectError.
-    # The ensure below respawns a fresh serve when a recycle fired.
-    await _recycle_serve_if_low_memory()
     if not await ensure_opencode_serve():
         yield ("status", _serve_unreachable_message())
         return
@@ -1590,19 +1401,18 @@ async def opencode_chat_stream_resilient(
     user_text: str,
     **kwargs: Any,
 ) -> AsyncIterator[tuple[str, str]]:
-    """``opencode_chat_stream`` with one automatic retry on a fresh serve.
+    """``opencode_chat_stream`` with one automatic retry.
 
-    The headless serve's tool runner fails at a high rate (upstream defect
-    family anomalyco/opencode #35066: glob/grep/read error or wedge, and a
-    tool error can kill the session processing silently).  When the first
+    The upstream serve's tool runner fails at a high rate (defect family
+    anomalyco/opencode #35066: glob/grep/read error or wedge, and a tool
+    error can kill the session processing silently).  When the first
     attempt ends in a bridge failure WITHOUT delivering any assistant text
-    or question, the serve is recycled (fresh runner) and the FULL task is
-    retried once — the same bounded-retry pattern the SDD cycle driver
-    uses.  A stream that delivered text or ended in a question is never
-    retried (the agent produced output or is waiting for the user); a
-    failed attempt that already delivered text surfaces its error as-is so
-    the partial result is never duplicated.  Never raises; yields (kind,
-    text) tuples exactly like the underlying stream.
+    or question, the FULL task is retried once.  A stream that delivered
+    text or ended in a question is never retried (the agent produced output
+    or is waiting for the user); a failed attempt that already delivered
+    text surfaces its error as-is so the partial result is never
+    duplicated.  Never raises; yields (kind, text) tuples exactly like the
+    underlying stream.
     """
     attempt1: list[tuple[str, str]] = []
     failed: Optional[str] = None
@@ -1621,17 +1431,17 @@ async def opencode_chat_stream_resilient(
             failed = payload
         attempt1.append((kind, payload))
     if failed and not delivered:
-        # The first attempt died before producing any output: recycle the
-        # serve (its tool runner is suspect) and retry the full task once.
+        # The first attempt died before producing any output: retry the
+        # full task once (the proxy cannot recycle the systemd-owned
+        # server, so this is a plain bounded retry).
         logger.warning(
-            "opencode bridge attempt failed (%s) — retrying once on a fresh serve",
+            "opencode bridge attempt failed (%s) — retrying once",
             failed[:80],
         )
         yield (
             "status",
-            "[OpenCode Bridge: attempt failed — retrying once on a fresh serve…]\n",
+            "[OpenCode Bridge: attempt failed — retrying once…]\n",
         )
-        await _force_recycle_serve("plain bridge auto-retry")
         async for kind, payload in opencode_chat_stream(user_text, **kwargs):
             yield kind, payload
         return
@@ -1977,16 +1787,8 @@ async def _detect_wedged_tool(client: httpx.AsyncClient, session_id: str) -> boo
     "running") but never actually execute it, leaving the session busy
     forever.  A running tool part with no output whose start is older than
     ``_TOOL_WEDGE_AFTER_S`` is wedged, not working.  Never raises.
-
-    STALE-PART GUARD (2026-08-08): tool parts started BEFORE the current
-    serve process are debris from a dead serve (the serve dies silently
-    under load; the session storage survives and the pinned session is
-    resumed on a fresh serve).  Aborting the session for stale debris
-    kills a healthy resumed cycle, so parts older than the serve's start
-    are ignored.
     """
     try:
-        serve_start_ms = await asyncio.to_thread(_serve_start_epoch_ms)
         resp = await BACKEND.fetch_messages(client, session_id)
         if resp.status_code != 200:
             return False
@@ -2002,9 +1804,6 @@ async def _detect_wedged_tool(client: httpx.AsyncClient, session_id: str) -> boo
                 if start is None:
                     continue
                 start_ms = int(start)
-                if serve_start_ms is not None and start_ms < serve_start_ms:
-                    # Stale part from a previous serve — not a live wedge.
-                    continue
                 elapsed_s = (now_ms - start_ms) / 1000
                 threshold_s = (
                     _TASK_WEDGE_AFTER_S if p.get("tool") == "task"
@@ -2053,24 +1852,6 @@ async def _detect_wedged_tool(client: httpx.AsyncClient, session_id: str) -> boo
     except (httpx.HTTPError, OSError, ValueError):
         return False
     return False
-
-
-def _serve_start_epoch_ms() -> Optional[int]:
-    """Epoch-ms when the current serve process started (from /proc), or
-    None when it cannot be determined (no stale guard)."""
-    try:
-        pid = _find_serve_pid(OPENCODE_SERVE_URL.rsplit(":", 1)[-1])
-        if not pid:
-            return None
-        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
-            parts = fh.read().split()
-        start_ticks = int(parts[21])
-        with open("/proc/uptime", encoding="utf-8") as fh:
-            uptime_s = float(fh.read().split()[0])
-        start_s = time.time() - uptime_s + start_ticks / os.sysconf("SC_CLK_TCK")
-        return int(start_s * 1000)
-    except (OSError, ValueError, IndexError):
-        return None
 
 
 async def _seed_resumed_session_state(
@@ -2175,271 +1956,10 @@ async def _poll_session_deltas(
 
 
 
-_DRAIN_PROBES = 4
-_DRAIN_PROBE_S = 0.25
-
-
-async def _drain_serve_shutdown() -> None:
-    """Boundedly wait for the killed serve listener to stop.
-
-    is_opencode_serve_running() answers True mid-SIGTERM, so
-    ensure_opencode_serve would otherwise skip the respawn and the stream
-    POSTs into a dying listener.  Poll a few times and return — never
-    raises, never exceeds the budget.
-    """
-    for _ in range(_DRAIN_PROBES):
-        if not await is_opencode_serve_running():
-            return
-        await asyncio.sleep(_DRAIN_PROBE_S)
-
-
-async def _recycle_serve_if_low_memory() -> None:
-    """Restart the opencode serve when the system is critically short of
-    memory.
-
-    The serve's ~1GB RSS is a significant reclaim when the box is swap
-    thrashing, and a memory-starved serve hangs its bash tool on trivial
-    commands (the agent-loop tool runner cannot spawn/complete shells).
-    Killing the serve lets the next ``ensure_opencode_serve`` respawn a
-    fresh one.  Never raises.
-    """
-    if not BACKEND.owns_server:
-        return
-    try:
-        port = OPENCODE_SERVE_URL.rsplit(":", 1)[-1]
-        pressure, elapsed = await asyncio.to_thread(_serve_health, port)
-        reason = None
-        if pressure:
-            reason = "low memory"
-        elif elapsed is not None and elapsed > _SERVE_RECYCLE_AFTER_S:
-            reason = f"up {elapsed / 60:.0f} min (progressive tool-runner wedging)"
-        if not reason:
-            return
-        logger.warning("Recycling opencode serve: %s", reason)
-        pid = await asyncio.to_thread(_find_serve_pid, port)
-        if pid:
-            if not await asyncio.to_thread(_pid_is_serve, pid, port):
-                # Pid-reuse race guard: this pid no longer belongs to the
-                # serve (it died and the OS recycled the pid between the
-                # scan and the kill).  Skip the kill; the serve stays
-                # absent and the next ensure respawns a fresh one.
-                logger.warning(
-                    "skipping recycle: pid %s no longer matches the serve", pid,
-                )
-                return
-            try:
-                os.kill(pid, 15)
-            except (OSError, ProcessLookupError):
-                pass
-            await _drain_serve_shutdown()
-    except (OSError, ValueError):
-        return
-
-
-async def _force_recycle_serve(reason: str = "long-lived call") -> None:
-    """Kill the opencode serve unconditionally so the next
-    ``ensure_opencode_serve`` respawns a fresh one.
-
-    Used by the plain-bridge auto-retry and the config-drift gate (REQ-5):
-    the serve's tool runner progressively wedges (bash hangs on trivial
-    commands), so a fresh serve before a retry removes that risk.  The
-    drift gate recycles when the serve template changes under a running
-    serve.  Never raises.
-    """
-    if not BACKEND.owns_server:
-        return
-    try:
-        port = OPENCODE_SERVE_URL.rsplit(":", 1)[-1]
-        pid = await asyncio.to_thread(_find_serve_pid, port)
-        if pid:
-            if not await asyncio.to_thread(_pid_is_serve, pid, port):
-                # Pid-reuse race guard: the found pid no longer belongs to
-                # the serve — never signal a reused pid.  The serve stays
-                # absent and the next ensure respawns a fresh one.
-                logger.warning(
-                    "skipping force-recycle: pid %s no longer matches the serve", pid,
-                )
-                return
-            logger.warning("Forcing opencode serve recycle (%s)", reason)
-            os.kill(pid, 15)
-            await _drain_serve_shutdown()
-    except (OSError, ProcessLookupError):
-        pass
-    except (OSError, ValueError):
-        return
-
-
-# F5 (tasks 4.4): the config-mtime cache lives module-level, NOT on
-# proxy.app.state — the spawn gate (ensure_opencode_serve) is a
-# bridge-internal function with no request/app handle (pending_permissions
-# is threaded IN from routes as a plain dict; this cache is owned by the
-# spawn gate itself, so there is no clean app.state channel).  Design.md
-# chose module-level; review-accepted via F5.  Set after every successful
-# spawn; drives the REQ-5 drift recycle.
-_serve_config_mtime: Optional[float] = None
-
-
-def _config_mtime() -> Optional[float]:
-    """mtime of OPCODE_CONFIG_PATH, or None when unreadable (no drift)."""
-    try:
-        return os.path.getmtime(OPCODE_CONFIG_PATH)
-    except OSError:
-        return None
-
-
-def _sync_serve_config() -> None:
-    """Idempotently copy the serve template + fallback-plugin config into the
-    serve-config dir.
-
-    opencode is an XDG app: with XDG_CONFIG_HOME=OPENCODE_SERVE_CONFIG_DIR it
-    reads <dir>/opencode/opencode.jsonc — so the template lands in the
-    ``opencode/`` subdir (empirically verified 2026-08-08: the file at the
-    XDG base root is NOT read).  The reduced file there (file:// plugin ref
-    for the fallback plugin ONLY, no .ts plugin files) is the serve's whole
-    config.  The fallback plugin resolves its OWN config
-    (rate-limit-fallback.json) via $XDG_CONFIG_HOME/opencode/ too — without
-    a copy there it initializes with its defaults (logging OFF, which
-    would blind the REQ-4 fallback-log evidence), so the proxy syncs the
-    user's plugin config alongside the template.  Copies are skipped when
-    the destination already matches, so repeated spawns do not churn the
-    dir."""
-    if not BACKEND.owns_server:
-        # Secure backend: the server's config is systemd-owned; nothing to sync.
-        return
-    dst_dir = os.path.join(OPENCODE_SERVE_CONFIG_DIR, "opencode")
-    os.makedirs(dst_dir, exist_ok=True)
-    _copy_if_changed(
-        OPCODE_CONFIG_PATH, os.path.join(dst_dir, "opencode.jsonc"),
-    )
-    plugin_cfg = os.path.expanduser(
-        "~/.config/opencode/rate-limit-fallback.json"
-    )
-    if os.path.exists(plugin_cfg):
-        _copy_if_changed(
-            plugin_cfg, os.path.join(dst_dir, "rate-limit-fallback.json"),
-        )
-
-
-def _copy_if_changed(src: str, dst: str) -> None:
-    """Copy ``src`` to ``dst`` when the contents differ (idempotent)."""
-    with open(src, encoding="utf-8") as fh:
-        data = fh.read()
-    try:
-        with open(dst, encoding="utf-8") as fh:
-            if fh.read() == data:
-                return
-    except OSError:
-        pass
-    with open(dst, "w", encoding="utf-8") as fh:
-        fh.write(data)
-    logger.info("Synced opencode serve config template -> %s", dst)
-
-
-def _serve_health(port: str) -> tuple[bool, Optional[float]]:
-    """Sync health probe (offloaded by the caller): (memory_pressure,
-    serve_elapsed_seconds).  Returns (False, None) when the serve is
-    healthy and recent — callers recycle only on low memory or age."""
-    pressure = _memory_pressure()
-    pid = _find_serve_pid(port)
-    elapsed: Optional[float] = None
-    if pid:
-        try:
-            with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
-                parts = fh.read().split()
-            start_ticks = int(parts[21])
-            with open("/proc/uptime", encoding="utf-8") as fh:
-                uptime_s = float(fh.read().split()[0])
-            # Process uptime = system uptime - (start ticks / clock rate).
-            elapsed = uptime_s - (start_ticks / os.sysconf("SC_CLK_TCK"))
-        except (OSError, ValueError, IndexError):
-            elapsed = None
-    return pressure, elapsed
 
 
 
 
-def _open_serve_log() -> Any:
-    """Open (create) the serve log file with sync I/O off the event loop."""
-    os.makedirs(OPENCODE_WORKSPACE_DIR, exist_ok=True)
-    return open(
-        os.path.join(OPENCODE_WORKSPACE_DIR, "opencode-serve.log"), "ab", buffering=0,
-    )
 
 
-def _memory_pressure() -> bool:
-    """True when the system is critically short of memory (sync /proc read,
-    offloaded to a worker thread by the caller — Rule 3)."""
-    try:
-        with open("/proc/meminfo", encoding="utf-8") as fh:
-            for line in fh:
-                if line.startswith("MemAvailable:"):
-                    avail_kb = int(line.split()[1])
-                    break
-            else:
-                return False
-        if avail_kb < 2_000_000:
-            logger.warning(
-                "Low memory (%.1fGB available) — recycling opencode serve",
-                avail_kb / 1048576,
-            )
-            return True
-    except (OSError, ValueError):
-        pass
-    return False
 
-
-def _cmdline_matches_serve(cmd: str, port: str) -> bool:
-    """True when a normalized /proc cmdline belongs to the opencode serve
-    bound to ``port``.
-
-    /proc/<pid>/cmdline separates argv with NUL bytes, not spaces — the old
-    space-form match NEVER matched any process, so serve recycling (age,
-    low-memory, wedge recovery) silently did nothing and a wedged tool
-    runner lived forever.  NULs are normalized to spaces and the argv is
-    tokenized before matching.  PORT MATCHING IS EXACT ONLY: neither a
-    longer advertised value (--port 189990 vs search "18999") nor a shorter
-    search (--port 18999 vs search "1899") may match (prefix-false-positive
-    bug, cycle 9).
-    """
-    tokens = cmd.replace("\x00", " ").split()
-    if not any("opencode" in tok for tok in tokens) or "serve" not in tokens:
-        return False
-    if f"--port={port}" in tokens:
-        return True
-    for i, tok in enumerate(tokens):
-        if tok == "--port" and i + 1 < len(tokens) and tokens[i + 1] == port:
-            return True
-    return False
-
-
-def _pid_is_serve(pid: int, port: str) -> bool:
-    """Re-verify ``pid`` still belongs to the opencode serve before a kill.
-
-    Guards the pid-reuse TOCTOU race: the pid found by ``_find_serve_pid``
-    may have died and been recycled by the OS between the scan and the
-    kill.  Unreadable/missing cmdline counts as mismatch (never raises).
-    """
-    try:
-        with open(f"/proc/{pid}/cmdline", "rb") as fh:
-            cmd = fh.read().decode("utf-8", "ignore")
-        return _cmdline_matches_serve(cmd, port)
-    except OSError:
-        return False
-
-
-def _find_serve_pid(port: str) -> Optional[int]:
-    """Locate the opencode serve process pid by scanning /proc cmdlines."""
-    try:
-        for entry in os.listdir("/proc"):
-            if not entry.isdigit():
-                continue
-            try:
-                with open(f"/proc/{entry}/cmdline", "rb") as fh:
-                    cmd = fh.read().decode("utf-8", "ignore")
-                if _cmdline_matches_serve(cmd, port):
-                    return int(entry)
-            except (OSError, ValueError):
-                continue
-    except OSError:
-        pass
-    return None

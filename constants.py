@@ -177,55 +177,22 @@ ALL_MODEL_KEYS: tuple[str, ...] = tuple(
 )
 
 # ---------------------------------------------------------------------------
-# OpenCode bridge (routes requests to a headless opencode serve backend)
+# OpenCode bridge (routes requests to the systemd-owned secure server)
 # ---------------------------------------------------------------------------
 
-# Headless opencode serve backend (opencode_bridge.py).  A client that
-# picks model "opencode" (or embeds /opencode) directs the request to the
-# opencode agent instead of a local llama model.
-OPENCODE_SERVE_URL: str = "http://127.0.0.1:18900"
+# The systemd-owned secure-opencode server (bridge v4).  It is the bridge's
+# ONLY opencode transport, and the proxy NEVER owns its lifecycle: the
+# secure backend performs a health probe only — no spawn, no recycle, no
+# config sync, no auth copy and no SIGTERM.  A client that picks model
+# "opencode" (or embeds /opencode) is directed to the opencode agent on
+# this server instead of a local llama model.  A down server is the user's
+# to start.
+OPENCODE_SECURE_SERVE_URL: str = "http://127.0.0.1:4096"
 
-# OpenChamber daemon for the bridge's second transport (openchamber-bridge
-# backend, step 2+).  The bridge owns its lifecycle like the serve: the
-# daemon spawns on a fixed loopback port with ISOLATED XDG homes under
-# OPENCHAMBER_CONFIG_DIR (sibling of the serve-config dir).  Port 8791 is
-# the prototype's 8790 + 1 (the prototype daemon may still be running).
-OPENCHAMBER_SERVE_URL: str = "http://127.0.0.1:8791"
-
-# The OpenChamber CLI binary (the bridge spawns the daemon through it).
-OPENCHAMBER_BIN: str = _machine(
-    "OPENCHAMBER_BIN", os.path.expanduser("~/.bun/bin/openchamber"),
-)
-
-
-# Working directory for the headless opencode serve.  Deliberately OUTSIDE
-# the proxy repo: bridge sessions (gentle-orchestrator/build agents) write
-# files there, and running them in the repo polluted the proxy git tree
-# (stray artifacts + corrupt index objects).
-OPENCODE_WORKSPACE_DIR: str = _machine(
-    "OPENCODE_WORKSPACE_DIR", os.path.expanduser("~/opencode-workspace"),
-)
-
-# Directory the opencode bridge creates sessions in.  The serve defaults to
-# its own cwd (OPENCODE_WORKSPACE_DIR); passing an explicit directory lets
-# bridge sessions operate on a real project (e.g. the proxy repo, which
-# hosts the OpenSpec SDD store) instead of the scratch workspace.
+# Directory the opencode bridge creates sessions in.  Passing an explicit
+# directory lets bridge sessions operate on a real project (e.g. the proxy
+# repo, which hosts the OpenSpec SDD store) instead of a scratch workspace.
 OPENCODE_BRIDGE_DIRECTORY: str = _machine("OPENCODE_BRIDGE_DIRECTORY", _REPO_ROOT)
-
-# Isolated homes for the bridge-owned OpenChamber daemon (sibling of the
-# serve-config dir): XDG_CONFIG_HOME here, XDG_DATA_HOME here/data,
-# XDG_CACHE_HOME here/cache.  The daemon's managed opencode runtime never
-# shares the TUI's data — same isolation rationale as the serve.
-OPENCHAMBER_CONFIG_DIR: str = _machine(
-    "OPENCHAMBER_CONFIG_DIR",
-    os.path.join(OPENCODE_WORKSPACE_DIR, "openchamber-config"),
-)
-
-# Directory the SDD-AUTONOMOUS sessions run in.  The full-SDD-cycle path
-# operates on the OpenSpec store + repo, which lives in the proxy repo
-# (NOT the nanobot workspace the plain bridge sessions use).  Machine
-# override via local_config.OPENCODE_SDD_DIRECTORY.
-OPENCODE_SDD_DIRECTORY: str = _machine("OPENCODE_SDD_DIRECTORY", _REPO_ROOT)
 
 # Absolute path to the opencode binary.  systemd services run with a
 # minimal PATH that does not include ~/.opencode/bin, so the bridge spawn
@@ -242,42 +209,9 @@ OPENCODE_AGENT: str = "gentle-orchestrator"
 # How long to wait for the opencode agent to finish a task.
 OPENCODE_SERVE_TIMEOUT: float = 600.0
 
-# Serve stability mode (REQ-4): candidate B (serve-scoped config dir via
-# XDG_CONFIG_HOME, default) vs candidate A (`--pure` arg).  When True the
-# serve spawns with `--pure`, disabling ALL external plugin auto-load
-# incl. the rate-limit-fallback plugin — kept as a documented fallback
-# only; the reduced-config path is the default.  Subprocess-scoped toggle,
-# never touches the user's TUI config.
-OPENCODE_SERVE_PURE: bool = False
-
-# Scratch config dir the proxy OWNS for the headless serve (candidate B).
-# The serve spawns with XDG_CONFIG_HOME pointing here, and the proxy
-# syncs a REDUCED opencode.jsonc template into its ``opencode/`` subdir
-# (opencode-serve-config.opencode.jsonc) so ONLY the rate-limit-fallback
-# plugin loads.  Never points at ~/.config/opencode — the user's TUI
-# config stays untouched.
-OPENCODE_SERVE_CONFIG_DIR: str = _machine(
-    "OPENCODE_SERVE_CONFIG_DIR",
-    os.path.join(OPENCODE_WORKSPACE_DIR, "serve-config"),
-)
-
-# Path whose mtime drives config-drift detection (REQ-5): the committed
-# serve template.  Hot-editing it while a serve runs recycles the serve
-# before the next request so the new config actually loads.
-OPCODE_CONFIG_PATH: str = _machine(
-    "OPCODE_CONFIG_PATH",
-    os.path.join(_REPO_ROOT, "opencode-serve-config.opencode.jsonc"),
-)
-
 # Bridge model keys exposed to clients, validated alongside ALL_MODEL_KEYS.
 # "opencode" routes to the opencode serve bridge instead of llama.cpp.
-BRIDGE_MODEL_KEYS: frozenset[str] = frozenset({"opencode", "opencode-sdd"})
-
-# Time budget for a single bridge turn.  The regular bridge streams one
-# agentic task; the SDD-autonomous mode runs the FULL cycle (proposal →
-# spec → design → tasks → apply → verify → archive) in one long-lived
-# turn, so it gets a much larger budget.
-OPENCODE_SDD_TIMEOUT: float = 7200.0
+BRIDGE_MODEL_KEYS: frozenset[str] = frozenset({"opencode"})
 
 # Queue-worker escalation backend after local tiers are exhausted:
 # "opencode" → headless opencode serve (build agent);

@@ -10,9 +10,6 @@ Use generic placeholders here — never commit real absolute paths.
 # Kinver hub root (the parent directory that holds models/, prompts/, ...).
 KINVER_HOME: str = "/home/you/kinver-hub"
 
-# opencode headless serve workspace (logs, sessions).
-OPENCODE_WORKSPACE_DIR: str = "/home/you/opencode-workspace"
-
 # opencode CLI binary.
 OPENCODE_BIN: str = "/home/you/.opencode/bin/opencode"
 

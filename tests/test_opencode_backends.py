@@ -1,580 +1,408 @@
-"""Tests for opencode_backends.py — transport backends + the selector.
+"""Tests for opencode_backends.py — the sole secure transport.
 
-The openchamber CLI transport is exercised against a FAKE ``openchamber``
-CLI on PATH (session-aware create/send/messages/list with a JSON message
-store), mirroring the fake-CLI fixture in test_opencode_chamber.py.  No
-real daemon is ever started: ``ensure_openchamber_daemon`` and
-``is_openchamber_daemon_running`` are stubbed in the autouse fixture.
+Bridge v4 leaves exactly ONE opencode transport: ``SecureBackend``, the
+systemd-owned secure-opencode server on ``127.0.0.1:4096``.  The serve and
+openchamber transports were retired in T9, so these tests cover the selector
+(every value resolves to ``SecureBackend``; a retired/unrecognised value is
+warned about once at import), the backend's ownership and permission flags,
+its ``127.0.0.1:4096`` URLs, and the no-spawn/no-signal lifecycle guard.
 """
 from __future__ import annotations
 
+import asyncio
 import importlib
-import json
+import logging
 import os
-from pathlib import Path
-from typing import Any
+import subprocess
+import types
+from typing import Any, Optional
 
 import httpx
 import pytest
 
 import opencode_backends as ob
-import opencode_chamber as oc
-
-FAKE_SESSION_ID = "ses_fake00000000000000000001"
-FAKE_MESSAGE_ID = "msg_fake00000000000000000001"
-
-
-FAKE_CLI = r"""#!/usr/bin/env python3
-import json, os, sys
-FAKE_CLI_LOG = os.environ.get("FAKE_CLI_LOG")
-with open(FAKE_CLI_LOG, "a") as f:
-    f.write(json.dumps(sys.argv[1:]) + "\n")
-
-def _arg(name):
-    return sys.argv[sys.argv.index(name) + 1] if name in sys.argv else ""
-
-def _load_store():
-    try:
-        with open(os.environ["FAKE_MESSAGES_STORE"]) as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-def _save_store(store):
-    with open(os.environ["FAKE_MESSAGES_STORE"], "w") as f:
-        json.dump(store, f)
-
-cmd = sys.argv[1] if len(sys.argv) > 1 else ""
-if cmd == "session" and len(sys.argv) > 2:
-    sub = sys.argv[2]
-    if sub == "create":
-        # The failure counter lives in the SHARED store, not the env: an
-        # env decrement inside the subprocess would die with it.
-        store = _load_store()
-        fails = store.get("create_failures_left", 0)
-        if fails > 0:
-            store["create_failures_left"] = fails - 1
-            _save_store(store)
-            print("create error", file=sys.stderr)
-            sys.exit(1)
-        print(json.dumps({"status": "ok", "sessionId": "ses_fake00000000000000000001",
-                          "sessionStatus": {"type": "idle"}}))
-    elif sub == "send":
-        sid = _arg("--session")
-        store = _load_store()
-        if os.environ.get("FAKE_SMOKE_ENGAGED", "1") == "1":
-            msgs = store.get(sid, [])
-            msgs.append({"id": "msg_fake00000000000000000001", "role": "assistant",
-                         "createdAt": 1786820611723, "completedAt": 1786820706479,
-                         "text": "PONG"})
-            store[sid] = msgs
-            _save_store(store)
-        print(json.dumps({"status": "ok", "action": "send", "sessionId": sid,
-                          "model": {"providerID": "kinver", "modelID": "professional"},
-                          "promptDispatched": True, "sessionStatus": {"type": "idle"}}))
-    elif sub == "messages":
-        sid = _arg("--session")
-        if os.environ.get("FAKE_UNKNOWN_SESSION", "") == sid:
-            print("session not found", file=sys.stderr)
-            sys.exit(1)
-        store = _load_store()
-        print(json.dumps({"status": "ok", "sessionId": sid,
-                          "sessionStatus": {"type": "idle"},
-                          "messages": store.get(sid, [])}))
-    elif sub == "list":
-        store = _load_store()
-        print(json.dumps({"status": "ok", "sessions": [{"id": sid} for sid in store]}))
-    else:
-        print("ok")
-else:
-    print("ok")
-"""
-
-
-@pytest.fixture(autouse=True)
-def _fake_cli_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Install the fake CLI on PATH + stub the daemon lifecycle per test.
-
-    Mirrors test_opencode_chamber's fixture: the fake binary records argv
-    and answers create/send/messages/list from a JSON store.  The daemon
-    lifecycle is stubbed so no real spawn ever happens; the module-level
-    ``BACKEND`` instance is untouched (each test builds its own
-    ``OpenChamberBackend()``).
-    """
-    fake_bin = tmp_path / "fake-bin"
-    fake_bin.mkdir()
-    cli = fake_bin / "openchamber"
-    cli.write_text(FAKE_CLI)
-    cli.chmod(0o755)
-    monkeypatch.setenv("FAKE_CLI_LOG", str(tmp_path / "cli-args.log"))
-    monkeypatch.setenv("FAKE_MESSAGES_STORE", str(tmp_path / "messages.json"))
-    monkeypatch.setenv("FAKE_SMOKE_ENGAGED", "1")
-    monkeypatch.setenv("PATH", f"{fake_bin}:" + os.environ.get("PATH", ""))
-    monkeypatch.setattr(oc, "OPENCHAMBER_BIN", str(cli))
-    monkeypatch.setattr(oc, "_OPENCHAMBER_BIN_DIR", str(fake_bin))
-    monkeypatch.setattr(oc, "OPENCHAMBER_CONFIG_DIR", str(tmp_path / "iso-config"))
-    monkeypatch.setattr(oc, "OPENCHAMBER_SERVE_URL", "http://127.0.0.1:8791")
-
-    async def _fake_ensure() -> tuple[bool, str]:
-        return True, "ok"
-
-    monkeypatch.setattr(oc, "ensure_openchamber_daemon", _fake_ensure)
-    monkeypatch.setattr(oc, "is_openchamber_daemon_running", lambda: True)
-
-
-def _backend() -> ob.OpenChamberBackend:
-    return ob.OpenChamberBackend()
-
-
-def _seed_store(tmp_path: Path, msgs: list[dict[str, Any]]) -> None:
-    store = tmp_path / "messages.json"
-    store.write_text(json.dumps({FAKE_SESSION_ID: msgs}))
-
-
-def _seed_create_failures(tmp_path: Path, failures: int) -> None:
-    (tmp_path / "messages.json").write_text(json.dumps({"create_failures_left": failures}))
-
-
-def _cli_calls(tmp_path: Path) -> list[list[str]]:
-    return [json.loads(line) for line in (tmp_path / "cli-args.log").read_text().splitlines()]
 
 
 # -- Selector ---------------------------------------------------------------
 
-def test_backend_selector_defaults_to_serve(
+def test_backend_selector_defaults_to_secure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("OPENCODE_BACKEND", raising=False)
     mod = importlib.reload(ob)
-    assert isinstance(mod.BACKEND, mod.ServeBackend)
-    assert not isinstance(mod.BACKEND, mod.OpenChamberBackend)
+    assert isinstance(mod.BACKEND, mod.SecureBackend)
 
 
-def test_backend_selector_openchamber(
+def test_backend_selector_unknown_value_still_resolves_to_secure(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    monkeypatch.setenv("OPENCODE_BACKEND", "openchamber")
+    """An unknown value never fails selection: it resolves to SecureBackend
+    and is reported plainly at import (U1's R4-001 advisory)."""
+    monkeypatch.setenv("OPENCODE_BACKEND", "bogus")
+    with caplog.at_level(logging.WARNING, logger="kinver.opencode_bridge"):
+        mod = importlib.reload(ob)
+    assert isinstance(mod.BACKEND, mod.SecureBackend)
+    assert any(
+        "bogus" in record.getMessage() for record in caplog.records
+    ), caplog.records
+    monkeypatch.delenv("OPENCODE_BACKEND", raising=False)
+    importlib.reload(ob)
+
+
+# -- Secure backend (bridge v4, T4) -----------------------------------------
+
+@pytest.mark.parametrize(
+    "env_value",
+    [None, "serve", "openchamber", "secure", "bogus"],
+)
+def test_backend_selector_maps_every_value_to_secure(
+    monkeypatch: pytest.MonkeyPatch,
+    env_value: Optional[str],
+) -> None:
+    """secure/serve/openchamber/unset/unknown all pick the one transport."""
+    if env_value is None:
+        monkeypatch.delenv("OPENCODE_BACKEND", raising=False)
+    else:
+        monkeypatch.setenv("OPENCODE_BACKEND", env_value)
     mod = importlib.reload(ob)
-    assert isinstance(mod.BACKEND, mod.OpenChamberBackend)
+    assert type(mod.BACKEND).__name__ == "SecureBackend"
     # Restore the production default for the rest of the suite.
     monkeypatch.delenv("OPENCODE_BACKEND", raising=False)
     importlib.reload(ob)
 
 
-def test_backend_selector_unknown_value_falls_back_to_serve(
+@pytest.mark.parametrize("env_value", ["serve", "openchamber", "bogus"])
+def test_retired_selector_value_warns_once_at_import(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    env_value: str,
 ) -> None:
-    monkeypatch.setenv("OPENCODE_BACKEND", "bogus")
-    mod = importlib.reload(ob)
-    assert isinstance(mod.BACKEND, mod.ServeBackend)
+    """A retired or unrecognised OPENCODE_BACKEND is warned about exactly
+    ONCE at import — an operator migrating off it is told plainly, and the
+    value selects nothing (never fails)."""
+    monkeypatch.setenv("OPENCODE_BACKEND", env_value)
+    with caplog.at_level(logging.WARNING, logger="kinver.opencode_bridge"):
+        mod = importlib.reload(ob)
+    warnings = [
+        record for record in caplog.records
+        if record.levelno == logging.WARNING
+        and env_value in record.getMessage()
+    ]
+    assert len(warnings) == 1, caplog.records
+    assert isinstance(mod.BACKEND, mod.SecureBackend)
     monkeypatch.delenv("OPENCODE_BACKEND", raising=False)
     importlib.reload(ob)
 
 
-# -- Create / send / messages round-trip ------------------------------------
-
-@pytest.mark.asyncio
-async def test_create_session_round_trip(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+def test_secure_selector_value_does_not_warn(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    backend = _backend()
-    workdir = str(tmp_path / "work")
-    async with httpx.AsyncClient() as client:
-        resp = await backend.create_session(client, directory=workdir)
-    assert resp.status_code == 200
-    assert resp.json() == {"id": FAKE_SESSION_ID}
-    # The CLI argv is recorded verbatim.
-    assert _cli_calls(tmp_path) == [["session", "create", "--dir", workdir, "--json"]]
-    # The directory is recorded for the later --dir-carrying calls.
-    assert backend._session_dirs == {FAKE_SESSION_ID: workdir}
+    """``OPENCODE_BACKEND=secure`` is the supported setting — no warning."""
+    monkeypatch.setenv("OPENCODE_BACKEND", "secure")
+    with caplog.at_level(logging.WARNING, logger="kinver.opencode_bridge"):
+        mod = importlib.reload(ob)
+    assert not any(
+        "OPENCODE_BACKEND" in record.getMessage() for record in caplog.records
+    ), caplog.records
+    assert isinstance(mod.BACKEND, mod.SecureBackend)
+    monkeypatch.delenv("OPENCODE_BACKEND", raising=False)
+    importlib.reload(ob)
 
 
-@pytest.mark.asyncio
-async def test_create_session_retries_control_timeout_then_succeeds(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-) -> None:
-    _seed_create_failures(tmp_path, 2)
-    backend = _backend()
-    async with httpx.AsyncClient() as client:
-        resp = await backend.create_session(client, directory=str(tmp_path / "work"))
-    assert resp.status_code == 200
-    assert len(_cli_calls(tmp_path)) == 3  # two failures + one success
+def test_secure_backend_is_the_only_transport() -> None:
+    """SecureBackend is a concrete OpenCodeBackend pointed at 127.0.0.1:4096
+    that never owns the server lifecycle and never answers permissions; the
+    retired transports no longer exist."""
+    assert ob.SecureBackend.__abstractmethods__ == frozenset()
+    assert issubclass(ob.SecureBackend, ob.OpenCodeBackend)
+    assert not hasattr(ob, "ServeBackend")
+    assert ob.SecureBackend.base_url == "http://127.0.0.1:4096"
+    assert ob.SecureBackend.event_bus_url == "http://127.0.0.1:4096"
+    assert ob.SecureBackend.owns_server is False
+    assert ob.SecureBackend.answers_permissions is False
 
 
-@pytest.mark.asyncio
-async def test_create_session_fails_after_exhausted_retries(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-) -> None:
-    _seed_create_failures(tmp_path, 99)
-    monkeypatch.setattr(ob, "_CREATE_RETRIES", 2)
-    backend = _backend()
-    async with httpx.AsyncClient() as client:
-        resp = await backend.create_session(client, directory=str(tmp_path / "work"))
-    assert resp.status_code == 500
-    assert len(_cli_calls(tmp_path)) == 2  # exactly the retry budget
+class _RecordingResp:
+    def __init__(self, status_code: int = 200) -> None:
+        self.status_code = status_code
 
 
-@pytest.mark.asyncio
-async def test_create_session_raises_when_daemon_unavailable(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-) -> None:
-    async def _fake_ensure_fail() -> tuple[bool, str]:
-        return False, "daemon_dead"
+class _RecordingClient:
+    """httpx.AsyncClient stand-in that records every URL it is asked to hit."""
 
-    monkeypatch.setattr(oc, "ensure_openchamber_daemon", _fake_ensure_fail)
-    backend = _backend()
-    async with httpx.AsyncClient() as client:
-        with pytest.raises(httpx.ConnectError):
-            await backend.create_session(client, directory=str(tmp_path / "work"))
+    def __init__(self) -> None:
+        self.urls: list[str] = []
 
+    async def get(self, url: str, **kwargs: Any) -> _RecordingResp:
+        self.urls.append(url)
+        return _RecordingResp()
 
-@pytest.mark.asyncio
-async def test_send_prompt_dispatches_via_cli(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-) -> None:
-    backend = _backend()
-    workdir = str(tmp_path / "work")
-    async with httpx.AsyncClient() as client:
-        await backend.create_session(client, directory=workdir)
-        resp = await backend.send_prompt(
-            client, FAKE_SESSION_ID,
-            agent="gentle-orchestrator", system_prompt="sys", user_text="hello",
-            model_id=None, provider_id="kinver",
-        )
-    assert resp.status_code == 204
-    send_call = _cli_calls(tmp_path)[-1]
-    assert send_call[0:4] == ["session", "send", "--session", FAKE_SESSION_ID]
-    assert send_call[4:6] == ["--dir", workdir]
-    assert send_call[6:8] == ["--prompt", "hello"]
-    assert "--wait" in send_call and "--json" in send_call
+    async def post(self, url: str, **kwargs: Any) -> _RecordingResp:
+        self.urls.append(url)
+        return _RecordingResp()
 
 
-@pytest.mark.asyncio
-async def test_fetch_messages_normalizes_plain_text_shape(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-) -> None:
-    """The prototype's messages payload (plain text fields, no parts) is
-    translated into the serve's message-list shape the bridge consumes."""
-    _seed_store(tmp_path, [
-        {"id": "msg_user1", "role": "user", "text": "hello"},
-        {"id": "msg_assistant1", "role": "assistant", "text": "PONG"},
-    ])
-    backend = _backend()
-    backend._session_dirs[FAKE_SESSION_ID] = str(tmp_path / "work")
-    async with httpx.AsyncClient() as client:
-        resp = await backend.fetch_messages(client, FAKE_SESSION_ID)
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body[0] == {
-        "info": {"role": "user"},
-        "parts": [{"type": "text", "text": "hello"}],
-        "id": "msg_user1",
-    }
-    assert body[1] == {
-        "info": {"role": "assistant"},
-        "parts": [{"type": "text", "text": "PONG"}],
-        "id": "msg_assistant1",
-    }
+def _send_signatures() -> list[Any]:
+    """Every send primitive that could carry a model override or an agent
+    pin: the ABC contract plus the concrete transport (T6, T8-found)."""
+    return [
+        ob.OpenCodeBackend.send_prompt,
+        ob.OpenCodeBackend.send_message,
+        ob.SecureBackend.send_prompt,
+        ob.SecureBackend.send_message,
+    ]
+
+
+def test_send_signatures_carry_no_model_override_params() -> None:
+    """T6 (ct-58463): no send primitive accepts model_id/provider_id, so a
+    caller CANNOT hand the transport a model override — model selection
+    belongs to the server's own agent config."""
+    import inspect
+
+    for fn in _send_signatures():
+        params = inspect.signature(fn).parameters
+        assert "model_id" not in params, (fn, sorted(params))
+        assert "provider_id" not in params, (fn, sorted(params))
+
+
+def test_send_signatures_carry_no_agent_param() -> None:
+    """T8-found agent fix, rule 7: no send primitive accepts an ``agent``
+    parameter, so a caller CANNOT pin the agent — the server's own config
+    (its ``default_agent``) selects the agent, exactly as for the
+    interactive session."""
+    import inspect
+
+    for fn in _send_signatures():
+        params = inspect.signature(fn).parameters
+        assert "agent" not in params, (fn, sorted(params))
+
+
+class _PayloadClient:
+    """httpx.AsyncClient stand-in that records each POST's JSON body."""
+
+    def __init__(self) -> None:
+        self.payloads: list[Any] = []
+
+    async def post(self, url: str, **kwargs: Any) -> _RecordingResp:
+        self.payloads.append(kwargs.get("json"))
+        return _RecordingResp(200)
 
 
 @pytest.mark.asyncio
-async def test_send_message_returns_assistant_text_parts(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-) -> None:
-    backend = _backend()
-    workdir = str(tmp_path / "work")
-    monkeypatch.setattr(ob, "_POLL_INTERVAL_S", 0.05)
-    async with httpx.AsyncClient() as client:
-        await backend.create_session(client, directory=workdir)
-        resp = await backend.send_message(
-            client, FAKE_SESSION_ID,
-            agent="gentle-orchestrator", system_prompt="sys", user_text="hello",
-            model_id=None, provider_id="kinver", timeout=10.0,
-        )
-    assert resp.status_code == 200
-    assert resp.json()["parts"] == [{"type": "text", "text": "PONG"}]
+async def test_send_payload_never_carries_model_override() -> None:
+    """T6 (ct-58463) rule 7: the outbound payload has NO ``model`` key on
+    either send primitive — the streaming prompt_async (``send_prompt``)
+    and the blocking message POST (``send_message``)."""
+    backend = ob.SecureBackend()
+    client = _PayloadClient()
+    await backend.send_prompt(
+        client, "ses1", system_prompt="s",
+        user_text="u",
+    )
+    await backend.send_message(
+        client, "ses1", system_prompt="s",
+        user_text="u", timeout=1.0,
+    )
+    assert len(client.payloads) == 2, client.payloads
+    for payload in client.payloads:
+        assert "model" not in payload, payload
+        assert "agent" not in payload, payload
+        assert payload["system"] == "s", payload
+        assert payload["parts"] == [{"type": "text", "text": "u"}], payload
 
 
 @pytest.mark.asyncio
-async def test_send_message_wedge_timeout_returns_empty_parts(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-) -> None:
-    """Hollow session (no assistant text ever): the poll burns the budget
-    and the blocking caller surfaces the empty-response error."""
-    monkeypatch.setenv("FAKE_SMOKE_ENGAGED", "0")
-    monkeypatch.setattr(ob, "_POLL_INTERVAL_S", 0.02)
-    backend = _backend()
-    workdir = str(tmp_path / "work")
-    async with httpx.AsyncClient() as client:
-        await backend.create_session(client, directory=workdir)
-        resp = await backend.send_message(
-            client, FAKE_SESSION_ID,
-            agent="gentle-orchestrator", system_prompt="sys", user_text="hello",
-            model_id=None, provider_id="kinver", timeout=0.25,
-        )
-    assert resp.status_code == 200
-    assert resp.json()["parts"] == []
-
-
-# -- Existence / abort ------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_session_exists_live_session(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-) -> None:
-    backend = _backend()
-    backend._session_dirs[FAKE_SESSION_ID] = str(tmp_path / "work")
-    async with httpx.AsyncClient() as client:
-        resp = await backend.session_exists(client, FAKE_SESSION_ID)
-    assert resp.status_code == 200
+async def test_send_payload_never_carries_agent_key() -> None:
+    """T8-found agent fix, rule 7: the outbound payload has NO ``agent`` key
+    on either send primitive — the streaming prompt_async (``send_prompt``)
+    and the blocking message POST (``send_message``).  Agent selection
+    belongs to the server's own config, so the bridge cannot pin a
+    read-only agent (mirrors the T6 model-override removal)."""
+    backend = ob.SecureBackend()
+    client = _PayloadClient()
+    await backend.send_prompt(
+        client, "ses1", system_prompt="s", user_text="u",
+    )
+    await backend.send_message(
+        client, "ses1", system_prompt="s", user_text="u", timeout=1.0,
+    )
+    assert len(client.payloads) == 2, client.payloads
+    for payload in client.payloads:
+        assert "agent" not in payload, payload
+        assert payload["system"] == "s", payload
+        assert payload["parts"] == [{"type": "text", "text": "u"}], payload
 
 
 @pytest.mark.asyncio
-async def test_session_exists_gone_session_returns_404(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-) -> None:
-    monkeypatch.setenv("FAKE_UNKNOWN_SESSION", FAKE_SESSION_ID)
-    backend = _backend()
-    backend._session_dirs[FAKE_SESSION_ID] = str(tmp_path / "work")
-    async with httpx.AsyncClient() as client:
-        resp = await backend.session_exists(client, FAKE_SESSION_ID)
-    assert resp.status_code == 404
+async def test_secure_backend_urls_target_port_4096() -> None:
+    """Every one of the 13 ABC primitives builds a URL at 127.0.0.1:4096."""
+    backend = ob.SecureBackend()
+    client = _RecordingClient()
+    await backend.create_session(client, directory="/tmp/work")
+    await backend.send_prompt(
+        client, "ses1", system_prompt="s", user_text="u",
+    )
+    await backend.fetch_messages(client, "ses1")
+    await backend.session_exists(client, "ses1")
+    await backend.abort_session(client, "ses1")
+    await backend.send_message(
+        client, "ses1", system_prompt="s", user_text="u",
+        timeout=1.0,
+    )
+    await backend.fetch_message(client, "ses1", "mid1")
+    await backend.fetch_session_status(client)
+    await backend.list_sessions(client)
+    await backend.fetch_permissions(client)
+    assert await backend.reply_permission(client, "ses1", "pid1", "always")
+    await backend.fetch_questions(client)
+    assert await backend.reply_question(client, "ses1", "qid1", "yes", 1)
+    assert client.urls, "recorder saw no calls"
+    assert all(
+        u.startswith("http://127.0.0.1:4096/") for u in client.urls
+    ), client.urls
+
+
+class _DownAsyncClient:
+    """httpx.AsyncClient stand-in whose GET raises (server down)."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    async def __aenter__(self) -> "_DownAsyncClient":
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        return None
+
+    async def get(self, url: str, **kwargs: Any) -> _RecordingResp:
+        raise httpx.ConnectError("connection refused")
+
+
+class _UpAsyncClient:
+    """httpx.AsyncClient stand-in whose GET answers (server up)."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    async def __aenter__(self) -> "_UpAsyncClient":
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        return None
+
+    async def get(self, url: str, **kwargs: Any) -> _RecordingResp:
+        return _RecordingResp(200)
+
+
+@pytest.fixture
+def _lifecycle_recorders(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[str], list[tuple[int, int]]]:
+    """Record every subprocess creation and every signal sent."""
+    created: list[str] = []
+    signals: list[tuple[int, int]] = []
+
+    def _rec_popen(*args: Any, **kwargs: Any) -> Any:
+        created.append("subprocess.Popen")
+        return types.SimpleNamespace(pid=424242)
+
+    def _rec_run(*args: Any, **kwargs: Any) -> Any:
+        created.append("subprocess.run")
+        return types.SimpleNamespace(returncode=0)
+
+    async def _rec_exec(*args: Any, **kwargs: Any) -> Any:
+        created.append("asyncio.create_subprocess_exec")
+        return types.SimpleNamespace(pid=424242)
+
+    monkeypatch.setattr(subprocess, "Popen", _rec_popen)
+    monkeypatch.setattr(subprocess, "run", _rec_run)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _rec_exec)
+    monkeypatch.setattr(os, "kill", lambda pid, sig: signals.append((pid, sig)))
+    monkeypatch.setattr(
+        os, "killpg", lambda pid, sig: signals.append((pid, sig)),
+    )
+    return created, signals
 
 
 @pytest.mark.asyncio
-async def test_session_exists_daemon_down_raises_keeps_pin(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+async def test_secure_ensure_probe_only_when_down(
+    monkeypatch: pytest.MonkeyPatch,
+    _lifecycle_recorders: tuple[list[str], list[tuple[int, int]]],
 ) -> None:
-    monkeypatch.setattr(oc, "is_openchamber_daemon_running", lambda: False)
-    backend = _backend()
-    backend._session_dirs[FAKE_SESSION_ID] = str(tmp_path / "work")
-    async with httpx.AsyncClient() as client:
-        with pytest.raises(httpx.ConnectError):
-            await backend.session_exists(client, FAKE_SESSION_ID)
+    """Server DOWN under the secure backend: ensure is a pure probe — it
+    returns False, the failure text names the secure server, and no
+    subprocess is created and no signal is sent."""
+    import opencode_bridge as obr
+
+    created, signals = _lifecycle_recorders
+    monkeypatch.setattr(obr, "BACKEND", ob.SecureBackend())
+    monkeypatch.setattr(obr.httpx, "AsyncClient", _DownAsyncClient)
+
+    assert await obr.ensure_opencode_serve() is False
+    assert created == []
+    assert signals == []
+    msg = obr._serve_unreachable_message()
+    assert "secure" in msg and "4096" in msg, msg
+    # The blocking caller surfaces that same clear error and still spawns
+    # nothing (ensure returns False before any httpx client is built).
+    err = await obr.opencode_chat("hello", timeout=1.0)
+    assert "secure" in err and "4096" in err, err
+    assert created == []
+    assert signals == []
 
 
 @pytest.mark.asyncio
-async def test_abort_session_is_logged_noop(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+async def test_secure_ensure_probe_only_when_up(
+    monkeypatch: pytest.MonkeyPatch,
+    _lifecycle_recorders: tuple[list[str], list[tuple[int, int]]],
 ) -> None:
-    backend = _backend()
-    async with httpx.AsyncClient() as client:
-        await backend.abort_session(client, FAKE_SESSION_ID)  # never raises
-    assert not (tmp_path / "cli-args.log").exists()  # no CLI call made
+    """Server UP under the secure backend: ensure returns True and still
+    never spawns or signals (this is the proxy.py startup call path)."""
+    import opencode_bridge as obr
+
+    created, signals = _lifecycle_recorders
+    monkeypatch.setattr(obr, "BACKEND", ob.SecureBackend())
+    monkeypatch.setattr(obr.httpx, "AsyncClient", _UpAsyncClient)
+
+    assert await obr.ensure_opencode_serve() is True
+    assert created == []
+    assert signals == []
 
 
-# -- Serve-specific no-op mappings -----------------------------------------
+class _ValueErrorAsyncClient:
+    """httpx.AsyncClient stand-in whose GET raises ``ValueError``.
 
-@pytest.mark.asyncio
-async def test_permission_and_question_noops(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-) -> None:
-    backend = _backend()
-    async with httpx.AsyncClient() as client:
-        perms = await backend.fetch_permissions(client)
-        assert perms.status_code == 200
-        assert perms.json() == []
-        assert (await backend.fetch_questions(client)).json() == []
-        assert await backend.reply_permission(client, "s1", "p1", "always") is True
-        assert await backend.reply_question(client, "s1", "q1", "yes", 1) is True
-    assert not (tmp_path / "cli-args.log").exists()  # no CLI call made
+    Models a probe response that cannot be parsed — the third error class
+    the secure probe must absorb (U2's broadened catch arm)."""
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
 
-@pytest.mark.asyncio
-async def test_fetch_message_finds_and_misses(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-) -> None:
-    _seed_store(tmp_path, [
-        {"id": "msg_a1", "role": "assistant", "text": "PONG"},
-    ])
-    backend = _backend()
-    backend._session_dirs[FAKE_SESSION_ID] = str(tmp_path / "work")
-    async with httpx.AsyncClient() as client:
-        hit = await backend.fetch_message(client, FAKE_SESSION_ID, "msg_a1")
-        miss = await backend.fetch_message(client, FAKE_SESSION_ID, "msg_nope")
-    assert hit.status_code == 200
-    assert hit.json() == {"parts": [{"type": "text", "text": "PONG"}]}
-    assert miss.status_code == 404
+    async def __aenter__(self) -> "_ValueErrorAsyncClient":
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        return None
+
+    async def get(self, url: str, **kwargs: Any) -> _RecordingResp:
+        raise ValueError("malformed probe response")
 
 
 @pytest.mark.asyncio
-async def test_session_status_and_list_normalize(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+async def test_secure_probe_returns_false_on_value_error(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _seed_store(tmp_path, [
-        {"id": "msg_a1", "role": "assistant", "text": "PONG"},
-    ])
-    backend = _backend()
-    async with httpx.AsyncClient() as client:
-        st = await backend.fetch_session_status(client)
-        listed = await backend.list_sessions(client)
-    assert st.status_code == 200
-    assert st.json() == {FAKE_SESSION_ID: {"type": "idle"}}
-    assert listed.status_code == 200
-    assert listed.json() == [{"id": FAKE_SESSION_ID}]
+    """R3-secure-probe-narrow-catch (T9-U4, rule 7): the secure probe
+    catches ``ValueError`` as well as ``httpx.HTTPError``/``OSError`` — a
+    GET that raises ``ValueError`` reports the server DOWN, it never
+    escapes.  The sibling probes already caught ``ValueError``; this test
+    is the regression proving the secure probe's broadened arm."""
+    import opencode_bridge as obr
 
-# -- Polling error branches (F3) --------------------------------------------
+    monkeypatch.setattr(obr, "BACKEND", ob.SecureBackend())
+    monkeypatch.setattr(obr.httpx, "AsyncClient", _ValueErrorAsyncClient)
 
-@pytest.mark.asyncio
-async def test_send_message_transient_cli_failure_retries_while_daemon_alive(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-) -> None:
-    """F3a: messages rc!=0 with live daemon → retry, eventual success."""
-    monkeypatch.setattr(ob, "_POLL_INTERVAL_S", 0.02)
-    backend = _backend()
-    workdir = str(tmp_path / "work")
-    backend._session_dirs[FAKE_SESSION_ID] = workdir
-
-    # Ensure daemon stub stays healthy (autouse already does, keep explicit).
-    monkeypatch.setattr(oc, "is_openchamber_daemon_running", lambda: True)
-
-    async def _fake_ensure() -> tuple[bool, str]:
-        return True, "ok"
-
-    monkeypatch.setattr(oc, "ensure_openchamber_daemon", _fake_ensure)
-    # Also patch via ob.chamber for completeness (same module object).
-    monkeypatch.setattr(ob.chamber, "is_openchamber_daemon_running", lambda: True)
-    monkeypatch.setattr(ob.chamber, "ensure_openchamber_daemon", _fake_ensure)
-
-    call_counts = {"messages": 0, "send": 0}
-
-    async def _fake_run_cli(args: list[str], timeout: float) -> tuple[int, str]:  # type: ignore[no-untyped-def]
-        if len(args) >= 2 and args[0] == "session" and args[1] == "send":
-            call_counts["send"] += 1
-            return 0, json.dumps({"status": "ok"})
-        if len(args) >= 2 and args[0] == "session" and args[1] == "messages":
-            call_counts["messages"] += 1
-            if call_counts["messages"] == 1:
-                return 1, "transient error"
-            # Second poll succeeds with assistant text in object shape.
-            return 0, json.dumps(
-                {
-                    "status": "ok",
-                    "sessionId": FAKE_SESSION_ID,
-                    "sessionStatus": {"type": "idle"},
-                    "messages": [
-                        {
-                            "id": "msg_ok",
-                            "role": "assistant",
-                            "text": "PONG",
-                        }
-                    ],
-                }
-            )
-        return 1, ""
-
-    monkeypatch.setattr(oc, "_run_cli", _fake_run_cli)
-    monkeypatch.setattr(ob.chamber, "_run_cli", _fake_run_cli)
-
-    async with httpx.AsyncClient() as client:
-        resp = await backend.send_message(
-            client,
-            FAKE_SESSION_ID,
-            agent="gentle-orchestrator",
-            system_prompt="sys",
-            user_text="hello",
-            model_id=None,
-            provider_id="kinver",
-            timeout=1.0,
-        )
-    assert resp.status_code == 200
-    assert resp.json()["parts"] == [{"type": "text", "text": "PONG"}]
-    assert call_counts["messages"] >= 2, "poll must have retried after transient failure"
-    assert call_counts["send"] == 1
-
-
-@pytest.mark.asyncio
-async def test_send_message_raises_when_daemon_dies_mid_poll(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-) -> None:
-    """F3b: messages rc!=0 and daemon gone → httpx.ConnectError."""
-    monkeypatch.setattr(ob, "_POLL_INTERVAL_S", 0.02)
-    backend = _backend()
-    workdir = str(tmp_path / "work")
-    backend._session_dirs[FAKE_SESSION_ID] = workdir
-
-    async def _fake_run_cli(args: list[str], timeout: float) -> tuple[int, str]:  # type: ignore[no-untyped-def]
-        if len(args) >= 2 and args[0] == "session" and args[1] == "send":
-            return 0, json.dumps({"status": "ok"})
-        if len(args) >= 2 and args[0] == "session" and args[1] == "messages":
-            return 1, "cli error"
-        return 1, ""
-
-    monkeypatch.setattr(oc, "_run_cli", _fake_run_cli)
-    monkeypatch.setattr(ob.chamber, "_run_cli", _fake_run_cli)
-    # Daemon death: is_openchamber_daemon_running returns False → triggers raise.
-    monkeypatch.setattr(oc, "is_openchamber_daemon_running", lambda: False)
-    monkeypatch.setattr(ob.chamber, "is_openchamber_daemon_running", lambda: False)
-    # Ensure still pretends healthy at send time (send's _ensure_daemon uses ensure, not is_running).
-    async def _fake_ensure_ok() -> tuple[bool, str]:  # type: ignore[no-untyped-def]
-        return True, "ok"
-
-    monkeypatch.setattr(oc, "ensure_openchamber_daemon", _fake_ensure_ok)
-    monkeypatch.setattr(ob.chamber, "ensure_openchamber_daemon", _fake_ensure_ok)
-
-    async with httpx.AsyncClient() as client:
-        with pytest.raises(httpx.ConnectError, match="daemon died"):
-            await backend.send_message(
-                client,
-                FAKE_SESSION_ID,
-                agent="gentle-orchestrator",
-                system_prompt="sys",
-                user_text="hello",
-                model_id=None,
-                provider_id="kinver",
-                timeout=1.0,
-            )
-
-
-@pytest.mark.asyncio
-async def test_send_message_transient_failure_then_daemon_death(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-) -> None:
-    """Mixed: first poll transient alive, second poll daemon dead → ConnectError."""
-    monkeypatch.setattr(ob, "_POLL_INTERVAL_S", 0.02)
-    backend = _backend()
-    workdir = str(tmp_path / "work")
-    backend._session_dirs[FAKE_SESSION_ID] = workdir
-
-    poll_n = [0]
-
-    async def _fake_run_cli(args: list[str], timeout: float) -> tuple[int, str]:  # type: ignore[no-untyped-def]
-        if len(args) >= 2 and args[0] == "session" and args[1] == "send":
-            return 0, json.dumps({"status": "ok"})
-        if len(args) >= 2 and args[0] == "session" and args[1] == "messages":
-            poll_n[0] += 1
-            return 1, "error"
-        return 1, ""
-
-    monkeypatch.setattr(oc, "_run_cli", _fake_run_cli)
-    monkeypatch.setattr(ob.chamber, "_run_cli", _fake_run_cli)
-
-    # First poll sees daemon alive (retry), second sees it dead (raise).
-    daemon_calls = [0]
-
-    def _fake_daemon_running() -> bool:
-        daemon_calls[0] += 1
-        return daemon_calls[0] == 1
-
-    monkeypatch.setattr(oc, "is_openchamber_daemon_running", _fake_daemon_running)
-    monkeypatch.setattr(ob.chamber, "is_openchamber_daemon_running", _fake_daemon_running)
-
-    async def _fake_ensure_ok() -> tuple[bool, str]:  # type: ignore[no-untyped-def]
-        return True, "ok"
-
-    monkeypatch.setattr(oc, "ensure_openchamber_daemon", _fake_ensure_ok)
-    monkeypatch.setattr(ob.chamber, "ensure_openchamber_daemon", _fake_ensure_ok)
-
-    async with httpx.AsyncClient() as client:
-        with pytest.raises(httpx.ConnectError):
-            await backend.send_message(
-                client,
-                FAKE_SESSION_ID,
-                agent="gentle-orchestrator",
-                system_prompt="sys",
-                user_text="hello",
-                model_id=None,
-                provider_id="kinver",
-                timeout=1.0,
-            )
-    assert poll_n[0] == 2
+    assert await obr._secure_serve_answering() is False
+    assert await obr.ensure_opencode_serve() is False

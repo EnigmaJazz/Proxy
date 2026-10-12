@@ -26,12 +26,10 @@ from routes import (
     _looks_like_gibberish,
     _parse_coding_answer,
     _resolve_session_id,
-    _SDD_AUTONOMOUS_SYSTEM_PROMPT,
-    OPENCODE_SDD_TIMEOUT,
 )
 from tests.conftest import _NoOpCooling, _NoOpDatabase, _NoOpSystemd
 
-QUESTION = f"{_CODING_QUESTION_PREFIX} Coding task detected — route to OpenCode or the local code pathway (Professional)? Reply `opencode`, `local`, or `sdd`."
+QUESTION = f"{_CODING_QUESTION_PREFIX} Coding task detected — route to OpenCode or the local code pathway (Professional)? Reply `opencode` or `local`."
 
 
 def _classification(intent: str = "CODE", *, tools_required: bool = False, is_valid: bool = True) -> dict[str, Any]:
@@ -109,15 +107,14 @@ class TestParsers:
     def test_parse_answer_opencode(self) -> None:
         assert _parse_coding_answer("route to opencode") == "opencode"
         assert _parse_coding_answer("/opencode") == "opencode"
-        # The `sdd` arm is a distinct explicit route, not the local default.
-        assert _parse_coding_answer("use sdd please") == "sdd"
-        assert _parse_coding_answer("run a spec-driven cycle") == "sdd"
 
     def test_parse_answer_defaults_local(self) -> None:
         assert _parse_coding_answer("local") == "professional"
         assert _parse_coding_answer("use professional") == "professional"
         assert _parse_coding_answer("yes") == "professional"
         assert _parse_coding_answer("") == "professional"
+        # Replies naming a retired mode (sdd) fall to the same safe default.
+        assert _parse_coding_answer("use sdd please") == "professional"
 
     def test_parse_answer_cancel(self) -> None:
         assert _parse_coding_answer("cancel") == "cancel"
@@ -399,7 +396,7 @@ class TestCodingDecisionGate:
     async def test_code_question_includes_difficulty_assessment(self, gate_client) -> None:
         """A fresh coding request shows the local model's difficulty
         assessment inside the question.  Advisory only — the answer domain
-        (Reply `opencode`, `local`, or `sdd`.) is unchanged.
+        (Reply `opencode` or `local`.) is unchanged.
         """
         with patch(
             "routes.classify_with_frontdesk",
@@ -429,7 +426,7 @@ class TestCodingDecisionGate:
         assert "high difficulty" in content
         assert "recommends `opencode`" in content
         assert "multi-file" in content
-        assert "Reply `opencode`, `local`, or `sdd`." in content
+        assert "Reply `opencode` or `local`." in content
 
     @pytest.mark.asyncio
     async def test_code_question_falls_back_when_assessment_fails(self, gate_client) -> None:
@@ -458,7 +455,7 @@ class TestCodingDecisionGate:
 
             assert response.status_code == 200
             assert "Coding decision" in text
-            assert "Reply `opencode`, `local`, or `sdd`." in text
+            assert "Reply `opencode` or `local`." in text
 
     @pytest.mark.asyncio
     async def test_assessment_skipped_for_non_code_intent(self, gate_client) -> None:
@@ -491,21 +488,19 @@ class TestCodingDecisionGate:
         assert evaluator.await_count == 0
 
     @pytest.mark.asyncio
-    async def test_sdd_answer_runs_autonomous_cycle(self, gate_client) -> None:
-        """The user's `sdd` reply to the coding question routes the task to
-        the opencode bridge in SDD-autonomous mode (the full cycle prompt,
-        the SDD timeout, autonomous=True), and the raw model completion is
-        never streamed."""
+    async def test_sdd_answer_is_not_a_routing_decision(self, gate_client) -> None:
+        """T1 regression: an ``sdd`` reply is no longer a routing decision.
+
+        The retired mode falls to the safe default (the local code
+        pathway), and the bridge must never be launched for that reply."""
         capture = _StreamCapture()
-        seen: list[str] = []
-        seen_kwargs: list[dict[str, Any]] = []
+        bridge_calls: list[str] = []
 
         async def _fake_bridge(
             text: str, *args: Any, **kwargs: Any,
         ) -> AsyncIterator[tuple[str, str]]:
-            seen.append(text)
-            seen_kwargs.append(kwargs)
-            yield ("text", "ok")
+            bridge_calls.append(text)
+            yield ("text", "SHOULD_NOT_RUN")
 
         with patch("routes.stream_llm", new=capture), \
              patch(
@@ -526,19 +521,12 @@ class TestCodingDecisionGate:
                 },
                 headers={"Authorization": "Bearer agent-key"},
             )
-            await response.aread()
+            text = (await response.aread()).decode()
 
-        assert len(seen) == 1
-        # The bridge receives the ORIGINAL TASK, not the "use sdd please"
-        # answer (task = conversation up to the question, routes.py:2938).
-        assert seen[0] == "refactor the routing module"
-        kwargs = seen_kwargs[0]
-        # SDD-autonomous arm (routes.py:2939-2952).
-        assert kwargs["autonomous"] is True
-        assert kwargs["timeout"] == OPENCODE_SDD_TIMEOUT
-        assert kwargs["system_prompt"] == _SDD_AUTONOMOUS_SYSTEM_PROMPT
-        # The raw model completion was never streamed.
-        assert capture.payload is None
+        assert _parse_coding_answer("use sdd please") == "professional"
+        # The bridge was NOT launched — the retired reply is not a route.
+        assert bridge_calls == []
+        assert "SHOULD_NOT_RUN" not in text
 
 
 # ---------------------------------------------------------------------------
@@ -1185,6 +1173,79 @@ class TestPinnedContinuationVsGate:
         assert "Opencode" not in seen_task[0]
 
 
+class TestPinnedPermissionResume:
+    """T5 (ct-58464): the pinned-continuation resume answers a pending
+    permission only on a backend that relays permissions.  The secure
+    backend must never POST an answer."""
+
+    async def _drive_resume(
+        self, gate_client: Any, monkeypatch: pytest.MonkeyPatch, *, backend: Any,
+    ) -> list[tuple[str, str, str]]:
+        from routes import _pending_permissions_state, _resolve_session_id
+
+        task = "write a script to check for updates"
+        sid = _resolve_session_id(
+            [{"role": "user", "content": task}], proxy.app,
+        )
+        monkeypatch.setattr(
+            proxy.app.state, "opencode_sessions", {sid: "ses_0001"},
+            raising=False,
+        )
+        monkeypatch.setattr(
+            proxy.app.state, "opencode_pending_permissions",
+            {"ses_0001": ("perm_1", True)},
+            raising=False,
+        )
+
+        posted: list[tuple[str, str, str]] = []
+
+        async def _record_post(session_id, permission_id, response):
+            posted.append((session_id, permission_id, response))
+            return True
+
+        async def _persist_noop(app) -> None:
+            return None
+
+        async def _fake_stream(text, *args, **kwargs):
+            yield ("text", "done")
+
+        monkeypatch.setattr("routes._post_permission_response", _record_post)
+        monkeypatch.setattr("routes._persist_opencode_sessions", _persist_noop)
+        monkeypatch.setattr("routes.BACKEND", backend)
+        monkeypatch.setattr("routes.opencode_chat_stream_resilient", _fake_stream)
+
+        with patch(
+            "routes.classify_with_frontdesk",
+            new=AsyncMock(return_value=_classification("CODE")),
+        ):
+            response = await gate_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "auto",
+                    "messages": [
+                        {"role": "user", "content": task},
+                        {"role": "assistant", "content": "Done."},
+                        {"role": "user", "content": "go ahead"},
+                    ],
+                    "stream": True,
+                },
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            await response.aread()
+        return posted
+
+    @pytest.mark.asyncio
+    async def test_resume_never_posts_under_secure_backend(
+        self, gate_client: Any, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from opencode_backends import SecureBackend
+
+        posted = await self._drive_resume(
+            gate_client, monkeypatch, backend=SecureBackend(),
+        )
+        assert posted == []
+
+
 class TestKeywordHeuristicsTightened:
     """Regression (2026-08-07): golden-set gaps closed by the keyword nets.
 
@@ -1265,7 +1326,7 @@ class TestLowDifficultyNoPrompt:
     NON-agentic recommendation (local/professional) route straight through —
     the user asked for no prompt, so the question must NEVER appear for them.
 
-    EXCEPTION (2026-09-12): an agentic recommendation (``opencode``/``sdd``)
+    EXCEPTION (2026-09-12): an agentic recommendation (``opencode``)
     at low difficulty MUST prompt — a raw completion is never silently
     diverted into the agent bridge without the user's explicit answer.
     """
@@ -1336,59 +1397,6 @@ class TestLowDifficultyNoPrompt:
                      "difficulty": "low",
                      "recommendation": "opencode",
                      "reason": "single-file edit",
-                 }),
-             ), \
-             patch("routes.opencode_chat_stream_resilient", new=_fake_bridge):
-            response = await gate_client.post(
-                "/v1/chat/completions",
-                json={
-                    "model": "auto",
-                    "messages": [{
-                        "role": "user",
-                        "content": "refactor the routing module",
-                    }],
-                    "stream": True,
-                },
-                headers={"Authorization": "Bearer agent-key"},
-            )
-            text = (await response.aread()).decode()
-
-        # The bridge was NOT launched — the user is prompted instead.
-        assert bridge_calls == []
-        assert capture.payload is None
-        assert "Coding decision" in text
-
-    @pytest.mark.asyncio
-    async def test_low_difficulty_sdd_recommendation_prompts(
-        self, gate_client
-    ) -> None:
-        """SECURITY (2026-09-12): a low-difficulty assessment recommending
-        ``sdd`` must NOT auto-launch the bridge — the user is prompted instead.
-
-        This is the regression proof for the ``sdd`` arm: before the guard,
-        that arm auto-launched the bridge with ``autonomous=True``, the
-        dedicated SDD system prompt and ``OPENCODE_SDD_TIMEOUT``.
-        """
-        capture = _StreamCapture()
-        bridge_calls: list[str] = []
-
-        async def _fake_bridge(
-            text: str, *args: Any, **kwargs: Any,
-        ) -> AsyncIterator[tuple[str, str]]:
-            bridge_calls.append(text)
-            yield ("text", "SHOULD_NOT_RUN")
-
-        with patch("routes.stream_llm", new=capture), \
-             patch(
-                 "routes.classify_with_frontdesk",
-                 new=AsyncMock(return_value=_classification("CODE")),
-             ), \
-             patch(
-                 "routes.evaluate_coding_task",
-                 new=AsyncMock(return_value={
-                     "difficulty": "low",
-                     "recommendation": "sdd",
-                     "reason": "multi-file change needing an SDD cycle",
                  }),
              ), \
              patch("routes.opencode_chat_stream_resilient", new=_fake_bridge):

@@ -37,6 +37,34 @@ def _fast_idle_grace() -> None:
     yield
     opencode_bridge._IDLE_GRACE_S = saved
 
+
+@pytest.fixture(autouse=True)
+def _pin_default_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the sole ``SecureBackend`` transport for every test.
+
+    ``constants.py`` loads the project ``.env`` at import
+    (``constants.py:110``), so a host ``OPENCODE_BACKEND`` leaks into
+    ``os.environ`` for the whole pytest process; ``opencode_backends``
+    then resolves its module-level ``BACKEND`` once at import
+    (``opencode_backends.py``) and the suite would silently exercise
+    whatever transport the host runs in production.  Bridge v4 leaves
+    exactly ONE transport — ``SecureBackend`` — so patching BOTH module
+    bindings — ``opencode_backends.BACKEND`` (the origin) and
+    ``opencode_bridge.BACKEND`` (imported by name at
+    ``opencode_bridge.py:58``) — keeps the suite hermetic and invariant to
+    the host's ``OPENCODE_BACKEND``.
+
+    This autouse fixture is set up before the test body, so a test's own
+    ``monkeypatch.setattr(opencode_bridge, "BACKEND", ...)`` runs
+    afterwards and still wins.
+    """
+    import opencode_backends
+    import opencode_bridge
+    from opencode_backends import SecureBackend
+
+    monkeypatch.setattr(opencode_backends, "BACKEND", SecureBackend())
+    monkeypatch.setattr(opencode_bridge, "BACKEND", SecureBackend())
+
 # Ensure project root is importable when pytest loads conftest from tests/.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -168,18 +196,6 @@ cooling.CoolingStateMachine = _NoOpCooling  # type: ignore[misc]
 # 3. Now it is safe to import the real FastAPI app
 # ---------------------------------------------------------------------------
 import proxy  # noqa: E402
-
-
-# ---------------------------------------------------------------------------
-# 4. Markers
-# ---------------------------------------------------------------------------
-def pytest_configure(config: pytest.Config) -> None:
-    config.addinivalue_line(
-        "markers",
-        "real_recycle: exercise the REAL serve recycle primitive; "
-        "hermetic_serve skips its noop patches while the teardown guard "
-        "still runs (fake pids never match the live serve)",
-    )
 
 
 # ---------------------------------------------------------------------------

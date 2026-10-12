@@ -22,17 +22,17 @@ The response text is post-processed to drop proxy-status content
 assistant text.
 
 Message-path HTTP primitives route through the module-level ``BACKEND``
-instance from ``opencode_backends.py`` (openchamber-bridge-backend design,
-step 1): session create/send/fetch/abort, permission and question relay.
-The ``/event`` SSE bus and the serve lifecycle (spawn/recycle/config
-sync) stay in this module — they are serve-specific and belong to later
-steps of the design.
+instance from ``opencode_backends.py`` (its sole transport, the
+systemd-owned secure server): session create/send/fetch/abort and the
+question relay.  The ``/event`` SSE bus stays in this module.  The proxy
+owns no opencode server (bridge v4): every bridged request goes to the
+systemd-owned secure server, so ``ensure_opencode_serve`` is a pure health
+probe and no spawn, recycle, config-sync or signal path remains here.
 """
 from __future__ import annotations
 
 import asyncio
 import json
-import os
 import re
 import time
 from datetime import datetime
@@ -42,23 +42,20 @@ from typing import Any, AsyncIterator, Optional
 import httpx
 
 from constants import (
-    OPENCODE_AGENT,
-    OPENCODE_BIN,
     OPENCODE_SERVE_TIMEOUT,
-    OPENCODE_SERVE_URL,
+    OPENCODE_SECURE_SERVE_URL,
     OPENCODE_BRIDGE_DIRECTORY,
-    OPENCODE_SERVE_CONFIG_DIR,
-    OPENCODE_SERVE_PURE,
-    OPENCODE_WORKSPACE_DIR,
-    OPCODE_CONFIG_PATH,
-    _machine,
     get_logger,
 )
 from opencode_backends import BACKEND
 
 logger = get_logger("kinver.opencode_bridge")
 
-# System prompt sent to every bridge session.  The gentle-orchestrator's
+# System prompt sent to every bridge session.  It carries ONLY the channel
+# contract: the API-facing identity/language policy, the single-stream reply
+# plus turn-end/question contract, and the narration requirement.  The model's
+# own agent config (the agent the server selects) owns orchestration and tool
+# policy, so the bridge does not restate them.  The gentle-orchestrator's
 # persona (AGENTS.md) defaults direct replies to Rioplatense Spanish, which
 # is wrong for an API-facing bridge consumed by OpenWebUI/nanobot — pin
 # English unless the user's own message is in another language.
@@ -66,35 +63,17 @@ _BRIDGE_SYSTEM_PROMPT = (
     "You are an API-backed coding assistant reached through a proxy bridge. "
     "Respond in English unless the user's message is written in another "
     "language. Keep the final answer concise and in English.\n\n"
-    "WORK CONTINUITY (MANDATORY): work through MULTIPLE steps in one turn — "
-    "after each step (tool call, file read, edit), continue with the next "
-    "step immediately.  Never end your turn after a step, never stop to "
-    "report progress, and never wait for the user to say \"continue\" — "
-    "the user expects the finished result in one stream, not a series of "
-    "continue-pings.  Keep working until the task is complete.  End your "
-    "turn only when the task is done, or when you must ask the user a "
-    "clarifying question (the user CAN answer in their next message and "
-    "the same session resumes).  When the task is ambiguous, make "
-    "reasonable assumptions, state them briefly, and continue.\n\n"
+    "Deliver each request as one stream: the user expects the finished "
+    "result in one stream, not a series of continue-pings.  End your turn "
+    "only when the task is done, or when you must ask the user a clarifying "
+    "question (the user CAN answer in their next message and the same "
+    "session resumes).\n\n"
     "NARRATE (MANDATORY): before each step, tell the user in one short "
     "sentence what you are doing and why; after each step, tell them what "
     "happened in one short sentence.  Never run a tool in silence — a "
-    "silent tool run looks like a dead stream to the user.\n\n"
-    "TOOL RULES (MANDATORY): the headless tool runner can wedge indefinitely "
-    "on glob/grep/read calls (their completion never arrives, stranding the "
-    "task).  Prefer `bash` for discovery and reading — `ls`, `find`, `sed`, "
-    "`head`, `tail`, `cat` with explicit paths — and avoid glob/grep/read "
-    "where possible.  When a tool call fails with a transient error (e.g. "
-    "\"Tool execution aborted\", connection resets), retry it ONCE "
-    "immediately before giving up.\n"
+    "silent tool run looks like a dead stream to the user.\n"
 )
 
-# SDD-AUTONOMOUS system prompt: used when the client picks model
-# "opencode-sdd".  The orchestrator must run the COMPLETE SDD cycle in ONE
-# long-lived turn — no clarifying questions, no per-phase chat — because
-# the bridge is a single request/response and the user will not answer
-# follow-ups mid-cycle.  The preflight choices are supplied in the task
-# text; the orchestrator caches them and proceeds.
 #: The exact marker the orchestrator ends its final message with when an
 #: inline phase fails to produce its artifact (the loud terminal failure
 #: of the sub-agent contract).  The cycle driver matches it to exit
@@ -130,55 +109,6 @@ _SDD_SUBAGENT_CONTRACT = (
     "so far - do NOT retry, do NOT continue the pipeline, do NOT ask the "
     "user anything."
 )
-
-_SDD_AUTONOMOUS_SYSTEM_PROMPT = (
-    "You are the SDD orchestrator in AUTONOMOUS mode through a proxy "
-    "bridge. Run the COMPLETE Spec-Driven Development cycle for the "
-    "requested change in ONE continuous turn: session preflight (use the "
-    "choices already given in the task text - do NOT ask), init guard, "
-    "then proposal, spec, design, tasks, apply, verify, archive "
-    "back-to-back, delegating each phase to the appropriate sub-agent.\n\n"
-    "CRITICAL RULES:\n"
-    "- Never stop to ask a clarifying question or present the interactive "
-    "proceed/adjust/stop menu. The user cannot answer mid-cycle on this "
-    "channel; the whole cycle must complete autonomously in this turn.\n"
-    "- If the preflight choices are embedded in the task text, treat them "
-    "as the user-supplied session preflight and do not re-ask.\n"
-    "- Stream concise status lines between phases so the caller sees "
-    "progress (e.g. 'SDD: exploring', 'SDD: proposing', ...).\n"
-    "- Apply the Gatekeeper between phases; on failure fix once or abort "
-    "with a clear error - never loop.\n"
-    "- LOCAL-MODEL DELEGATION (MANDATORY): when delegating code work to "
-    "the LOCAL model (apply's local writer), delegate ONE FILE at a time "
-    "— one task per file — for big tasks; never bundle multiple files "
-    "into one local-model task (the local context window is limited).\n"
-    "- CONTEXT DISCIPLINE (MANDATORY): your session context accumulates "
-    "across phases and cannot be reset mid-cycle.  Keep it small: never "
-    "re-read a file you already hold; reference artifact paths "
-    "(openspec/changes/<change>/...) instead of pasting file contents back "
-    "into context; when an artifact is large, read only the sections you "
-    "need.  The artifact files on disk are the durable state — your "
-    "context is a working cache, not the record.\n"
-    "- TOOL RETRY (MANDATORY): when a tool call fails with a transient "
-    "error (e.g. \"Tool execution aborted\", connection reset), retry the "
-    "tool ONCE immediately before giving up - the serve's tool runner "
-    "intermittently aborts in-flight executions and the retry normally "
-    "succeeds.  The same rule applies to every sub-agent you delegate to "
-    "(say so in the delegation prompt).\n"
-    "- Keep the final summary short: change name, artifacts produced, "
-    "tests run, and any remaining risk.\n"
-    "You still have full sub-agent access; use it for every phase. Do NOT "
-    "ask the user anything.\n\n"
-    + _SDD_SUBAGENT_CONTRACT
-)
-
-
-
-# Recycle the opencode serve after this uptime: the serve's agent-loop
-# tool runner progressively wedges (bash hangs on trivial commands even
-# with healthy memory); a fresh serve runs bash reliably.
-_SERVE_RECYCLE_AFTER_S: float = 1800.0
-
 
 # Quiet period after a finished step before the bridge considers the
 # agentic session complete (the final summary message follows the last
@@ -314,20 +244,9 @@ _STATUS_SEGMENT_RE = re.compile(
 # session workspace.  In headless serve mode there is no interactive user
 # to answer, so an unanswered gate silently auto-rejects AND leaves the
 # tool wedged in "running" — the root cause of the bridge wedges.  The
-# bridge auto-allows READ commands and asks the USER about WRITE commands.
-# Pending write permissions are keyed by session id so the next request
-# (which resumes the pinned session) can answer them.
-
-# Bounded WRITE classifier for the external_directory gate: any redirect,
-# a whole-word "write", or one of these mutating command tokens marks the
-# command WRITE (needs user approval); everything else (cat/ls/head on
-# /etc or /home) is READ and auto-allowed.  echo-with-redirect is covered
-# by the ">" check alone.
-_EXTERNAL_WRITE_TOKENS: tuple[str, ...] = (
-    "mv ", "cp ", "rm ", "touch ", "mkdir ", "rmdir ", "ln ",
-    "chmod ", "chown ", "tee ", "sed -i", "install ", "dd ",
-    "git commit", "git push", "git reset", "git checkout", "printf ",
-)
+# bridge relays every permission it sees to the USER.  Pending permissions
+# are keyed by session id so the next request (which resumes the pinned
+# session) can answer them.
 
 _PERMISSION_QUESTION_TEMPLATE: str = (
     "🔒 The coding agent wants to access a path outside its workspace.\n\n"
@@ -381,48 +300,15 @@ _RELAYED_PERMISSION_TYPES: tuple[str, ...] = (
     "external_directory", "bash", "write", "edit",
 )
 
-
-def _classify_external_access(cmd: str) -> str:
-    """Classify a permissioned external-directory command as "read"/"write".
-
-    Bounded heuristic (kept intentionally simple): any redirect or a known
-    mutating command token ⇒ "write"; everything else (``cat /etc/os-release``,
-    ``ls /home``, ``head -5 /etc/passwd``) ⇒ "read".
-    """
-    c = (cmd or "").strip()
-    if ">" in c:
-        return "write"
-    if re.search(r"\bwrite\b", c):
-        return "write"
-    if any(token in c for token in _EXTERNAL_WRITE_TOKENS):
-        return "write"
-    return "read"
-
-
-_WRITE_TOOL_TYPES: frozenset[str] = frozenset({
-    "write", "edit", "patch", "create", "append", "delete", "remove",
-})
-
-
-def _classify_permission_access(perm_type: str, tool_name: str, cmd: str) -> str:
-    """Classify a permissioned external access as "read"/"write".
-
-    Type-aware first (F2): a permission whose TYPE is itself a write tool
-    ("write"/"edit"/"patch"/...) is a WRITE by definition — the cmd
-    heuristic must NOT run on it, because write/edit permission records
-    carry no bash command and an empty cmd would read as "read"
-    (auto-allowing the write even in interactive mode).  A ``write``/
-    ``edit`` TOOL on an external_directory gate is likewise WRITE.  Bash
-    commands fall back to ``_classify_external_access`` (redirects / known
-    mutating tokens ⇒ write; cat/ls/head ⇒ read).  Used by both the event-
-    bus permission handler and the polling resolver so a ``write`` tool to
-    an external dir surfaces a question instead of being auto-allowed.
-    """
-    if perm_type in _WRITE_TOOL_TYPES:
-        return "write"
-    if perm_type == "external_directory" and tool_name in _WRITE_TOOL_TYPES:
-        return "write"
-    return _classify_external_access(cmd)
+#: Status emitted while a permission prompt is pending under a backend that
+#: does NOT answer permissions (the secure server, whose own
+#: ``opencode-perm`` resolves prompts out-of-band).  The bridge relays no
+#: question and POSTs no answer — it only tells the client the session is
+#: parked, once per permission id.
+_WAITING_PERMISSION_STATUS = (
+    "🔐 waiting on a permission prompt "
+    "(the session is paused; resolve it with opencode-perm)"
+)
 
 
 def _parse_permission_answer(answer: str, *, write: bool = False) -> str:
@@ -513,38 +399,40 @@ async def _handle_permission_event(
     session_id: str,
     perm: dict[str, Any],
     pending_permissions: dict[str, tuple[str, bool]],
-    *,
-    autonomous: bool,
 ) -> Optional[str]:
     """Handle one permission request from the opencode serve.
 
     THE single permission handler, shared by all four relay paths (the
     polling-wedge check, the event-bus-timeout check, the ``permission.updated``
-    SSE event, and the completion resolver) so the read→auto-allow /
-    write→relay / autonomous→auto-allow policy lives in ONE place.
+    SSE event, and the completion resolver) so the relay policy lives in
+    ONE place.
 
     ``perm`` is either an SSE event ``properties`` dict (keys: id, type,
     title, metadata, tool) or a GET /permission record (keys: id,
-    permission, patterns, tool).  Returns None when the request was
-    HANDLED silently (read auto-allowed, or an autonomous-mode auto-allow
-    with no client surface and no pending state); returns a question
-    string when the USER must decide (interactive-mode write/git ask).
-    Never raises.
+    permission, patterns, tool).  Returns None only when the record is
+    malformed; otherwise returns a question string for the USER to decide
+    (write/git ask).  Never raises.
     """
+    if not BACKEND.answers_permissions:
+        # A non-answering backend (the secure server) never relays a
+        # permission: its own ``opencode-perm`` process resolves prompts
+        # out-of-band, so there is no question to build and no pending entry
+        # to answer on a later request.  Callers keep the request/stream
+        # alive and report the wait instead.
+        return None
     pid = str(perm.get("id") or "")
     perm_type = str(perm.get("permission") or perm.get("type") or "")
     if not pid or not perm_type:
         return None
-    # Pull the command for read/write classification: SSE events carry it
-    # in metadata.command/title; GET /permission records carry patterns and
-    # the tool part's state.input.command.
+    # Pull the command for the question display: SSE events carry it in
+    # metadata.command/title; GET /permission records carry patterns and the
+    # tool part's state.input.command.
     cmd = ""
     meta = perm.get("metadata") or {}
     if isinstance(meta, dict):
         cmd = str(meta.get("command") or "")
     cmd = cmd or str(perm.get("title") or "")
     cmd = cmd or str((perm.get("patterns") or [""])[0])
-    tool_name = ""
     try:
         tool_info = perm.get("tool") or {}
         mid = tool_info.get("messageID")
@@ -554,21 +442,10 @@ async def _handle_permission_event(
             if msg_resp.status_code == 200:
                 for part in (msg_resp.json().get("parts") or []):
                     if part.get("callID") == call_id or part.get("id") == call_id:
-                        tool_name = str(part.get("tool") or "")
                         cmd = str(((part.get("state") or {}).get("input") or {}).get("command") or cmd)
                         break
     except (httpx.HTTPError, OSError, ValueError):
         pass
-    if autonomous:
-        # SDD-autonomous mode: the user pre-approved the whole cycle, so
-        # every relayed ask (write/edit/bash/git) is auto-allowed — POST
-        # "always" with NO client surface and NO pending state.  Bounded by
-        # _post_permission_response (10s timeout, never raises).
-        await _post_permission_response(session_id, pid, "always")
-        return None
-    if _classify_permission_access(perm_type, tool_name, cmd) == "read":
-        await _post_permission_response(session_id, pid, "always")
-        return None
     pending_permissions[session_id] = (pid, True)
     template = (_GIT_PERMISSION_QUESTION_TEMPLATE
                 if perm_type == "bash"
@@ -596,8 +473,7 @@ async def _detect_pending_permission(
     ``permission.updated`` SSE event entirely — the GET /permission record
     carries ``permission: "write"`` / ``"edit"`` as its value, which
     ``_RELAYED_PERMISSION_TYPES`` now matches (task 1.9), so write/edit
-    asks are caught here and relayed/auto-allowed exactly like the
-    event-bus path.
+    asks are caught here and relayed exactly like the event-bus path.
     """
     try:
         resp = await BACKEND.fetch_permissions(client)
@@ -613,6 +489,30 @@ async def _detect_pending_permission(
     return None
 
 
+def _waiting_permission_status(
+    perm: dict[str, Any], announced_ids: set[str],
+) -> Optional[str]:
+    """The once-per-permission "waiting" status for a non-answering backend.
+
+    The secure backend is the only transport and answers NO permission:
+    there is no question to relay and no answer to POST (the server's own
+    ``opencode-perm`` resolves the prompt out-of-band), so the caller keeps
+    the stream alive and reports the wait.  The ``answers_permissions``
+    guard returns None for a hypothetical answering transport (the caller
+    would relay the permission as a question instead).  Deduped by
+    permission id (the existing announce-dedupe pattern), so a poll every
+    tick never repeats the line.  Returns None when this permission id was
+    already announced or has no id.
+    """
+    if BACKEND.answers_permissions:
+        return None
+    pid = str(perm.get("id") or "")
+    if not pid or pid in announced_ids:
+        return None
+    announced_ids.add(pid)
+    return _WAITING_PERMISSION_STATUS
+
+
 def _strip_proxy_status_text(text: str) -> str:
     """Drop proxy-status segments from a collected assistant text string."""
     if not text or "\u200b" not in text:
@@ -620,185 +520,57 @@ def _strip_proxy_status_text(text: str) -> str:
     return _STATUS_SEGMENT_RE.sub("", text)
 
 
-async def is_opencode_serve_running() -> bool:
-    """True when a complete HTTP response arrives from the serve transport.
+async def _secure_serve_answering() -> bool:
+    """Pure health probe for the systemd-owned secure server.
 
-    Transport-liveness semantics: ANY received HTTP response — 2xx, 3xx,
-    4xx, or 5xx — proves a process holds the configured port, so a
-    non-2xx responder (version-specific, missing, or degraded /config)
-    still blocks a duplicate spawn.  Only an ``httpx.HTTPError``
-    (ConnectError / ConnectTimeout / ReadTimeout) or ``OSError`` means
-    down.  The buffered ``.get()`` completion is the received-response
-    boundary; the body is never explicitly read and the status is never
-    interpreted.
+    ANY received HTTP response proves a process holds the secure port
+    (transport-liveness semantics); a transport error or an unparseable
+    probe response (``httpx.HTTPError`` / ``OSError`` / ``ValueError``)
+    means down.  Never raises — this is the proxy's only server-liveness
+    check now that it owns no server.
     """
     try:
         async with httpx.AsyncClient() as client:
-            await client.get(f"{OPENCODE_SERVE_URL}/config", timeout=3.0)
+            await client.get(f"{OPENCODE_SECURE_SERVE_URL}/config", timeout=3.0)
             return True
-    except (httpx.HTTPError, OSError):
+    except (httpx.HTTPError, OSError, ValueError):
         return False
 
 
+def _serve_unreachable_message() -> str:
+    """The bridge-failure text for ``ensure_opencode_serve`` returning False.
+
+    The sole transport owns no server, so the message names the
+    systemd-owned server so the operator knows the proxy will not start it
+    (an owning transport would keep the original, generic string).
+    """
+    if not BACKEND.owns_server:
+        return (
+            "[OpenCode Bridge Failed: the systemd-owned secure opencode "
+            f"server ({OPENCODE_SECURE_SERVE_URL}) is not answering; start "
+            "secure-opencode.service (the proxy never starts it).]"
+        )
+    return "[OpenCode Bridge Failed: opencode serve not reachable.]"
+
+
 async def ensure_opencode_serve() -> bool:
-    """Ensure the opencode serve backend is up (spawn if missing).
+    """Ensure the opencode backend is answering (pure health probe).
 
-    Returns True when the backend is answering.  Spawns ``opencode serve``
-    as a detached child process bound to ``OPENCODE_SERVE_URL`` — the
-    proxy owns its lifecycle so no systemd unit is required.  Never raises.
-
-    Config-drift gate (REQ-5): when a serve IS running and the serve
-    template (OPCODE_CONFIG_PATH) is newer than the mtime cached at the
-    last successful spawn, the serve is recycled via ``_force_recycle_serve``
-    and respawned so the edited config actually loads.  An unreadable
-    template is treated as no-drift.
+    The proxy owns no opencode server (bridge v4): every bridged request
+    goes to the systemd-owned secure-opencode server, so this is a health
+    probe of ``OPENCODE_SECURE_SERVE_URL`` alone.  There is no spawn, no
+    recycle, no config sync, no auth copy and no drift detection — a down
+    server returns False and the callers fail with an error naming it; the
+    proxy never starts it.  Never raises.
     """
-    global _serve_config_mtime
-    mtime = await asyncio.to_thread(_config_mtime)
-    if await is_opencode_serve_running():
-        if mtime is None:
-            return True  # template unreadable — treat as no-drift
-        if _serve_config_mtime is not None and mtime > _serve_config_mtime:
-            logger.warning(
-                "opencode serve config drifted (mtime %.3f > cached %.3f) — "
-                "recycling serve", mtime, _serve_config_mtime,
-            )
-            await _force_recycle_serve()
-            # Drain the old listener so the respawn can bind the port.
-            for _ in range(4):
-                if not await is_opencode_serve_running():
-                    break
-                await asyncio.sleep(0.25)
-        else:
-            if _serve_config_mtime is None:
-                # Proxy restarted while the serve survived: adopt the
-                # current template as the baseline, no recycle.
-                _serve_config_mtime = mtime
-            return True
-    return await _spawn_serve(mtime)
-
-
-
-def _sync_openai_auth_into_serve(serve_env: dict[str, str]) -> None:
-    """Refresh the serve's openai OAuth access token from the TUI/CLI
-    auth.json and copy the auth file into the serve's ISOLATED data
-    home (the chatgpt-headless route the TUI/CLI use — the env apiKey
-    alone is rejected: the ChatGPT-Plus OAuth token lacks the
-    api.responses.write scope).  Sync file I/O: callers run it via
-    asyncio.to_thread.  Never raises.
-    """
-    try:
-        with open(
-            os.path.expanduser("~/.local/share/opencode/auth.json"),
-            encoding="utf-8",
-        ) as _af:
-            _auth = json.load(_af)
-        _tok = (_auth.get("openai") or {}).get("access")
-        if _tok:
-            serve_env["OPENAI_API_KEY"] = _tok
-        # The serve's data home is ISOLATED (XDG_DATA_HOME ->
-        # serve-config), so its auth lookup would miss the TUI/CLI's
-        # auth.json (OAuth tokens) and fall back to the env apiKey
-        # (which the API rejects).  Copy the auth file into the serve's
-        # data home so the serve resolves the openai provider through
-        # the SAME chatgpt-headless OAuth route the TUI/CLI use
-        # (2026-08-09).
-        _serve_auth = os.path.join(
-            OPENCODE_SERVE_CONFIG_DIR, "opencode", "auth.json",
-        )
-        _src_auth = os.path.expanduser("~/.local/share/opencode/auth.json")
-        if os.path.exists(_src_auth):
-            os.makedirs(os.path.dirname(_serve_auth), exist_ok=True)
-            with open(_src_auth, "rb") as _sf, open(_serve_auth, "wb") as _df:
-                _df.write(_sf.read())
-            # The copy holds OAuth tokens: enforce the same 0600 the
-            # source auth.json carries (open('wb') would create it
-            # 0644 under a normal umask — world-readable).
-            try:
-                os.chmod(_serve_auth, 0o600)
-            except OSError:
-                pass
-    except (OSError, ValueError, TypeError):
-        pass
-
-async def _spawn_serve(mtime: Optional[float]) -> bool:
-    """Spawn the opencode serve with the serve-scoped config (candidate B).
-
-    Syncs the reduced template into ``OPENCODE_SERVE_CONFIG_DIR`` and
-    spawns with ``XDG_CONFIG_HOME`` pointing there, so ONLY the referenced
-    plugins load (the rate-limit-fallback plugin; the wedge-prone
-    skill-registry / review-result-artifacts / model-variants .ts plugins
-    never auto-load — the serve-config dir holds no .ts files).
-    ``OPENCODE_SERVE_PURE`` toggles candidate A (``--pure``, no plugins).
-    Records ``_serve_config_mtime`` on success so the drift gate can
-    compare.  Never raises.
-    """
-    global _serve_config_mtime
-    try:
-        port = OPENCODE_SERVE_URL.rsplit(":", 1)[-1]
-        await asyncio.to_thread(_sync_serve_config)
-        serve_log = await asyncio.to_thread(_open_serve_log)
-        # The serve inherits a minimal systemd PATH; give it the usual
-        # user paths so the fallback plugin's gentle-ai binary resolves.
-        serve_env = dict(os.environ)
-        serve_env["PATH"] = (
-            _machine("LINUXBREW_PREFIX", os.path.expanduser("~/.linuxbrew")) + "/bin:"
-            + _machine("LOCAL_BIN_DIR", os.path.expanduser("~/.local/bin")) + ":"
-            + _machine("OPENCODE_BIN_DIR", os.path.expanduser("~/.opencode/bin")) + ":"
-            + "/usr/local/bin:/usr/bin:/bin"
-        )
-        # Candidate B: serve-scoped config dir (never ~/.config/opencode).
-        serve_env["XDG_CONFIG_HOME"] = OPENCODE_SERVE_CONFIG_DIR
-        # The auth sync is sync file I/O: keep it off the event loop
-        # (Rule 3 discipline — the config sync and log opens do the same).
-        await asyncio.to_thread(_sync_openai_auth_into_serve, serve_env)
-        # Full serve isolation (2026-08-09): the serve must NOT share the
-        # TUI's data/cache locations.  The shared session DB + plugin
-        # caches caused cross-process contention (systematic plugin's
-        # models.json cache, session storage churn) and let the serve's
-        # stalls poison the TUI and vice versa.  Data (sessions) and cache
-        # now live under the serve-config dir, unique to the serve.
-        serve_env["XDG_DATA_HOME"] = OPENCODE_SERVE_CONFIG_DIR
-        serve_env["XDG_CACHE_HOME"] = os.path.join(OPENCODE_SERVE_CONFIG_DIR, "cache")
-        args = [
-            OPENCODE_BIN, "serve", "--port", port, "--hostname", "127.0.0.1",
-        ]
-        if OPENCODE_SERVE_PURE:
-            args.append("--pure")  # candidate A fallback: no plugins at all
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdout=serve_log,
-            stderr=serve_log,
-            start_new_session=True,
-            cwd=OPENCODE_WORKSPACE_DIR,
-            env=serve_env,
-        )
-        logger.info(
-            "Opened opencode serve (pid=%s) on %s", proc.pid, OPENCODE_SERVE_URL,
-        )
-        # Wait briefly for the listener to come up.
-        for _ in range(10):
-            await asyncio.sleep(0.5)
-            if await is_opencode_serve_running():
-                _serve_config_mtime = mtime
-                return True
-    except asyncio.CancelledError:
-        # Cancellation must propagate (never swallow it).
-        raise
-    except OSError as exc:
-        logger.error("Failed to spawn opencode serve: %s", exc)
-    return False
+    return await _secure_serve_answering()
 
 
 async def opencode_chat(
     user_text: str,
     *,
-    agent: str = OPENCODE_AGENT,
-    model_id: Optional[str] = None,
-    provider_id: str = "kinver",
     timeout: float = OPENCODE_SERVE_TIMEOUT,
     system_prompt: str = _BRIDGE_SYSTEM_PROMPT,
-    autonomous: bool = False,
     directory: Optional[str] = None,
 ) -> str:
     """Send a task to headless opencode and return the assistant text.
@@ -809,40 +581,37 @@ async def opencode_chat(
     string on failure (escalation-friendly, never raises).
 
     While the message POST is in flight the call polls ``GET /permission``
-    (``_BLOCKING_PERMISSION_POLL_S`` cadence): READ asks are auto-allowed,
-    WRITE/git asks are NOT granted (headless callers have no user to relay
-    a question to) — the session is aborted and a clear error is returned
-    instead of burning the full timeout on a parked agent.  ``autonomous``
-    preserves the streaming path's auto-allow-all semantics.  On every
+    (``_BLOCKING_PERMISSION_POLL_S`` cadence): permission asks are NOT
+    granted (headless callers have no user to relay a question to) — the
+    session is aborted and a clear error is returned instead of burning
+    the full timeout on a parked agent.  On every
     non-success exit the created session is aborted best-effort so no busy
     zombie is left on the serve.
 
     A network-class failure after a successful first ensure triggers one
-    bounded respawn: the serve is force-recycled, re-ensured, and the whole
-    call retried exactly once.  HTTP-status errors and permission aborts
-    never retry.
+    bounded retry: the backend is re-ensured and the whole call retried
+    exactly once.  HTTP-status errors and permission aborts never retry.
     """
     if not await ensure_opencode_serve():
-        return "[OpenCode Bridge Failed: opencode serve not reachable.]"
+        return _serve_unreachable_message()
     async with httpx.AsyncClient() as client:
         text, network_failed = await _opencode_chat_attempt(
-            client, user_text, agent=agent, model_id=model_id,
-            provider_id=provider_id, timeout=timeout,
-            system_prompt=system_prompt, autonomous=autonomous,
+            client, user_text, timeout=timeout,
+            system_prompt=system_prompt,
             directory=directory,
         )
         if not network_failed:
             return text
-        # The serve died mid-call (network-class failure after a successful
-        # ensure): recycle once, re-ensure, and retry the whole call once.
-        # No loop — a failed re-ensure or failed retry returns its error.
-        await _force_recycle_serve("blocking-path respawn")
+        # The server went away mid-call (network-class failure after a
+        # successful ensure): re-ensure and retry the whole call once.  The
+        # proxy owns no server, so there is nothing to recycle — the health
+        # probe decides.  No loop — a failed re-ensure or a failed retry
+        # returns its error.
         if not await ensure_opencode_serve():
-            return "[OpenCode Bridge Failed: opencode serve not reachable.]"
+            return _serve_unreachable_message()
         text, _ = await _opencode_chat_attempt(
-            client, user_text, agent=agent, model_id=model_id,
-            provider_id=provider_id, timeout=timeout,
-            system_prompt=system_prompt, autonomous=autonomous,
+            client, user_text, timeout=timeout,
+            system_prompt=system_prompt,
             directory=directory,
         )
         return text
@@ -852,12 +621,8 @@ async def _opencode_chat_attempt(
     client: httpx.AsyncClient,
     user_text: str,
     *,
-    agent: str,
-    model_id: Optional[str],
-    provider_id: str,
     timeout: float,
     system_prompt: str,
-    autonomous: bool,
     directory: Optional[str] = None,
 ) -> tuple[str, bool]:
     """One blocking attempt: create session, POST with permission polling,
@@ -885,8 +650,8 @@ async def _opencode_chat_attempt(
         post_task = asyncio.create_task(
             BACKEND.send_message(
                 client, session_id,
-                agent=agent, system_prompt=system_prompt, user_text=user_text,
-                model_id=model_id, provider_id=provider_id, timeout=timeout,
+                system_prompt=system_prompt, user_text=user_text,
+                timeout=timeout,
             )
         )
         try:
@@ -902,8 +667,10 @@ async def _opencode_chat_attempt(
                     if perm is not None:
                         question = await _handle_permission_event(
                             client, session_id, perm, {},
-                            autonomous=autonomous,
                         )
+                        # A non-answering backend (secure) leaves ``question``
+                        # None: the prompt is resolved out-of-band, so the
+                        # loop keeps polling and never aborts the session.
                         if question:
                             # Interactive-mode WRITE/git ask on a headless
                             # blocking call: no user can answer, and the
@@ -952,16 +719,11 @@ async def _opencode_chat_attempt(
 async def opencode_chat_stream(
     user_text: str,
     *,
-    agent: str = OPENCODE_AGENT,
-    model_id: Optional[str] = None,
-    provider_id: str = "kinver",
     session_map: Optional[dict[str, str]] = None,
     session_key: Optional[str] = None,
     pending_permissions: Optional[dict[str, tuple[str, bool]]] = None,
-    just_approved_permission: bool = False,
     system_prompt: str = _BRIDGE_SYSTEM_PROMPT,
     timeout: float = OPENCODE_SERVE_TIMEOUT,
-    autonomous: bool = False,
     directory: Optional[str] = None,
 ) -> AsyncIterator[tuple[str, str]]:
     """Stream a task through headless opencode, yielding assistant content live.
@@ -980,18 +742,8 @@ async def opencode_chat_stream(
     "question" → the agent is waiting for user input (stop streaming).
     On failure yields a status tuple (never raises).
     """
-    # SDD-autonomous mode (model "opencode-sdd", explicit flag — not the
-    # old timeout inference): force a fresh serve BEFORE spawning so the
-    # cycle never runs on a progressively-wedged tool runner.
-    if autonomous:
-        await _force_recycle_serve()
-    # Recycle BEFORE ensure: the recycle SIGTERMs the serve (low memory or
-    # uptime > _SERVE_RECYCLE_AFTER_S) and never respawns, so running it
-    # after ensure would break the next request with a spurious ConnectError.
-    # The ensure below respawns a fresh serve when a recycle fired.
-    await _recycle_serve_if_low_memory()
     if not await ensure_opencode_serve():
-        yield ("status", "[OpenCode Bridge Failed: opencode serve not reachable.]")
+        yield ("status", _serve_unreachable_message())
         return
     # Rule 6: pending-permission state lives on app.state in routes.py and is
     # threaded in; standalone callers (scripts/tests) fall back to a fresh
@@ -999,10 +751,9 @@ async def opencode_chat_stream(
     pending_permissions = (
         pending_permissions if pending_permissions is not None else {}
     )
+    session_id: Optional[str] = None
     async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
         try:
-            protected = set(session_map.values()) if session_map else None
-            await _abort_zombie_sessions(client, protected)
             session_id = (
                 session_map.get(session_key)
                 if session_map and session_key else None
@@ -1011,9 +762,7 @@ async def opencode_chat_stream(
             # resume path posts it as a question reply, so no prompt POST).
             skip_prompt = False
             # A pending question request owned by the pinned session (the
-            # agent's question tool is waiting on the user).  Detected
-            # BEFORE the busy check: a question session is legitimately
-            # busy and must never be aborted as stuck.
+            # agent's question tool is waiting on the user).
             pending_question_id: Optional[str] = None
             pending_question_count = 0
             if session_id:
@@ -1022,14 +771,11 @@ async def opencode_chat_stream(
                 )
             if session_id:
                 # Follow-up in the same conversation: reuse the pinned agent
-                # session so it retains its tool state and context.  But a
-                # session that is STILL BUSY (a previously hung agent tool)
-                # can never accept new work — abort it, drop the pin, and
-                # start fresh instead of queueing behind a zombie.
+                # session so it retains its tool state and context.
                 # A session the serve no longer LISTS is stale: the serve was
                 # recycled (or the session was dropped), so posting to the
                 # pinned id would fail every retry — drop the pin and start
-                # fresh.  Only a SUCCESSFUL status fetch may trigger the
+                # fresh.  Only a SUCCESSFUL existence probe may trigger the
                 # drop; a transport-error fetch keeps the pin conservatively.
                 # A session's real existence must NOT be inferred from
                 # /session/status: the serve's status map only holds BUSY
@@ -1042,8 +788,7 @@ async def opencode_chat_stream(
                 # session and the agent lost the task context
                 # ('runs a few commands and then stops').  Existence is
                 # probed with GET /session/<id> (200 = live, 404 =
-                # genuinely gone — serve recycled or dropped).  The status
-                # fetch remains only for the busy-stuck abort below.
+                # genuinely gone — serve recycled or dropped).
                 fetch_ok = False
                 exists = True
                 try:
@@ -1052,12 +797,6 @@ async def opencode_chat_stream(
                     exists = get_resp.status_code == 200
                 except (httpx.HTTPError, ValueError):
                     pass
-                st = None
-                try:
-                    st_resp = await BACKEND.fetch_session_status(client)
-                    st = (st_resp.json().get(session_id) or {}).get("type")
-                except (httpx.HTTPError, ValueError):
-                    st = None
                 if fetch_ok and not exists:
                     # Stale pin: a successful existence probe shows the
                     # session is gone — no abort POST is needed (aborting
@@ -1069,23 +808,6 @@ async def opencode_chat_stream(
                     pending_permissions.pop(session_id, None)
                     if session_map is not None and session_key:
                         session_map.pop(session_key, None)
-                    session_id = None
-                elif st == "busy" and not just_approved_permission and not pending_question_id:
-                    # A session that just resumed after a permission
-                    # approval is legitimately busy executing the approved
-                    # tool (or generating its summary) — do NOT abort it.
-                    # Only a busy session with NO such resume is stuck.
-                    # Same for a session with a pending question (the agent
-                    # is waiting on the user, not stuck).
-                    logger.warning(
-                        "pinned session %s is busy (likely stuck) — aborting and starting fresh",
-                        session_id[:16],
-                    )
-                    await _abort_stream_session_best_effort(
-                        client, session_id,
-                        session_map=session_map, session_key=session_key,
-                        pending_permissions=pending_permissions,
-                    )
                     session_id = None
             # True when the session_id came from the session map (a pin),
             # NOT from a fresh POST /session below — only resumed sessions
@@ -1101,8 +823,12 @@ async def opencode_chat_stream(
             pending_done = False
             session_busy = True  # assume working until a status event says idle
             seen_question_pids: set[str] = set()
+            # Permission ids already reported as "waiting" under a backend
+            # that does not answer permissions (the secure server) — dedupes
+            # the status so a poll every tick never repeats the line.
+            announced_permission_ids: set[str] = set()
             running_question_times: list[float] = []
-            if resumed:
+            if resumed and session_id is not None:
                 # Seed part state for the resumed conversation so the
                 # polling fallback never replays history or re-surfaces a
                 # stale question that kills the stream.  Best-effort.  The
@@ -1179,14 +905,13 @@ async def opencode_chat_stream(
             # fire-and-forget (no replay), so connecting after prompt_async
             # misses the early events (user message, assistant start, first
             # reasoning/tool parts) and the stream would look empty.
-            async with client.stream("GET", f"{OPENCODE_SERVE_URL}/event") as ev:
+            async with client.stream("GET", f"{BACKEND.event_bus_url}/event") as ev:
                 async_resp = None
                 if not skip_prompt:
                     async_resp = await BACKEND.send_prompt(
                         client, session_id,
-                        agent=agent, system_prompt=system_prompt,
-                        user_text=user_text, model_id=model_id,
-                        provider_id=provider_id,
+                        system_prompt=system_prompt,
+                        user_text=user_text,
                     )
                 if async_resp is not None and async_resp.status_code != 204:
                     # Session was created and pinned before this POST — do
@@ -1348,20 +1073,33 @@ async def opencode_chat_stream(
                                 elif time.monotonic() - idle_since > _IDLE_GRACE_S:
                                     # The agent looks done, but it may be
                                     # parked on a permission the bridge
-                                    # never answered.  Resolve it BEFORE
-                                    # returning: READ -> auto-allow (tool
-                                    # proceeds), WRITE -> surface a question
-                                    # so the next request answers it.
+                                    # has not relayed yet.  Resolve it BEFORE
+                                    # returning: surface the question so the
+                                    # next request answers it.
                                     pending_perm = await _detect_pending_permission(client, session_id)
                                     if pending_perm:
                                         question = await _handle_permission_event(
                                             client, session_id, pending_perm,
-                                            pending_permissions, autonomous=autonomous,
+                                            pending_permissions,
                                         )
                                         if question:
                                             yield ("question", question)
                                             return
-                                    return
+                                        if BACKEND.answers_permissions:
+                                            return
+                                        # Non-answering backend: the prompt is
+                                        # resolved out-of-band, so the parked
+                                        # session must NOT look done.  Report
+                                        # the wait once and restart the idle
+                                        # grace so polling continues.
+                                        status = _waiting_permission_status(
+                                            pending_perm, announced_permission_ids,
+                                        )
+                                        if status:
+                                            yield ("status", status)
+                                        idle_since = time.monotonic()
+                                    else:
+                                        return
                             else:
                                 idle_since = None
                             # Real agent work with no new parts (long bash
@@ -1399,11 +1137,16 @@ async def opencode_chat_stream(
                                 if pending_perm:
                                     question = await _handle_permission_event(
                                         client, session_id, pending_perm,
-                                        pending_permissions, autonomous=autonomous,
+                                        pending_permissions,
                                     )
                                     if question:
                                         yield ("question", question)
                                         return
+                                    status = _waiting_permission_status(
+                                        pending_perm, announced_permission_ids,
+                                    )
+                                    if status:
+                                        yield ("status", status)
                                     continue
                                 if await _detect_wedged_tool(client, session_id):
                                     await _abort_stream_session_best_effort(
@@ -1417,9 +1160,7 @@ async def opencode_chat_stream(
                                     # tool destroys every live session (seen
                                     # 2026-08-08: a wedged bash in one cycle
                                     # SIGTERMed the serve mid-other-cycle).
-                                    # The session abort frees the tool runner;
-                                    # the autonomous force-recycle handles
-                                    # serve health at the next long call.
+                                    # The session abort frees the tool runner.
                                     yield ("status", "[OpenCode Bridge Error: agent tool runner wedged — session aborted. Please retry.]")
                                     return
                             await asyncio.sleep(1.0)
@@ -1453,11 +1194,16 @@ async def opencode_chat_stream(
                             if pending_perm:
                                 question = await _handle_permission_event(
                                     client, session_id, pending_perm,
-                                    pending_permissions, autonomous=autonomous,
+                                    pending_permissions,
                                 )
                                 if question:
                                     yield ("question", question)
                                     return
+                                status = _waiting_permission_status(
+                                    pending_perm, announced_permission_ids,
+                                )
+                                if status:
+                                    yield ("status", status)
                                 continue
                             if await _detect_wedged_tool(client, session_id):
                                 await _abort_stream_session_best_effort(
@@ -1530,19 +1276,22 @@ async def opencode_chat_stream(
                         # bash gate fires for git ask-rules (commit/push/
                         # reset/rebase).  A headless serve auto-rejects
                         # silently and leaves the tool stuck "running" (the
-                        # bridge wedges).  Auto-allow READ external-dir
-                        # commands; WRITE and git commands yield a question
-                        # and stop so the USER decides on the next request
-                        # (the session stays pinned).  Autonomous mode
-                        # auto-allows everything (REQ-2).
+                        # bridge wedges).  A permission ask is relayed as a
+                        # question; the stream stops so the USER decides on
+                        # the next request.
+                        # (the session stays pinned).
                         if props.get("type") in _RELAYED_PERMISSION_TYPES:
                             question = await _handle_permission_event(
                                 client, session_id, props, pending_permissions,
-                                autonomous=autonomous,
                             )
                             if question:
                                 yield ("question", question)
                                 return
+                            status = _waiting_permission_status(
+                                props, announced_permission_ids,
+                            )
+                            if status:
+                                yield ("status", status)
                             continue
                         # Other permission types: no existing branch matches,
                         # so fall through to the rest of the loop body.
@@ -1653,26 +1402,19 @@ async def opencode_chat_stream_resilient(
     user_text: str,
     **kwargs: Any,
 ) -> AsyncIterator[tuple[str, str]]:
-    """``opencode_chat_stream`` with one automatic retry on a fresh serve.
+    """``opencode_chat_stream`` with one automatic retry.
 
-    The headless serve's tool runner fails at a high rate (upstream defect
-    family anomalyco/opencode #35066: glob/grep/read error or wedge, and a
-    tool error can kill the session processing silently).  When the first
+    The upstream serve's tool runner fails at a high rate (defect family
+    anomalyco/opencode #35066: glob/grep/read error or wedge, and a tool
+    error can kill the session processing silently).  When the first
     attempt ends in a bridge failure WITHOUT delivering any assistant text
-    or question, the serve is recycled (fresh runner) and the FULL task is
-    retried once — the same bounded-retry pattern the SDD cycle driver
-    uses.  A stream that delivered text or ended in a question is never
-    retried (the agent produced output or is waiting for the user); a
-    failed attempt that already delivered text surfaces its error as-is so
-    the partial result is never duplicated.  Autonomous mode (SDD cycle)
-    is never auto-retried: the cycle driver owns its recovery.  Never
-    raises; yields (kind, text) tuples exactly like the underlying stream.
+    or question, the FULL task is retried once.  A stream that delivered
+    text or ended in a question is never retried (the agent produced output
+    or is waiting for the user); a failed attempt that already delivered
+    text surfaces its error as-is so the partial result is never
+    duplicated.  Never raises; yields (kind, text) tuples exactly like the
+    underlying stream.
     """
-    if kwargs.get("autonomous"):
-        async for kind, payload in opencode_chat_stream(user_text, **kwargs):
-            yield kind, payload
-        return
-
     attempt1: list[tuple[str, str]] = []
     failed: Optional[str] = None
     delivered = False  # any text or question surfaced to the caller
@@ -1690,17 +1432,17 @@ async def opencode_chat_stream_resilient(
             failed = payload
         attempt1.append((kind, payload))
     if failed and not delivered:
-        # The first attempt died before producing any output: recycle the
-        # serve (its tool runner is suspect) and retry the full task once.
+        # The first attempt died before producing any output: retry the
+        # full task once (the proxy cannot recycle the systemd-owned
+        # server, so this is a plain bounded retry).
         logger.warning(
-            "opencode bridge attempt failed (%s) — retrying once on a fresh serve",
+            "opencode bridge attempt failed (%s) — retrying once",
             failed[:80],
         )
         yield (
             "status",
-            "[OpenCode Bridge: attempt failed — retrying once on a fresh serve…]\n",
+            "[OpenCode Bridge: attempt failed — retrying once…]\n",
         )
-        await _force_recycle_serve("plain bridge auto-retry")
         async for kind, payload in opencode_chat_stream(user_text, **kwargs):
             yield kind, payload
         return
@@ -1718,13 +1460,12 @@ async def opencode_escalation(stage: int, prompt: str) -> str:
     Directs the user prompt to the opencode gentle-orchestrator agent
     OpenRouter.  ``stage`` is informational (passed through to logging).
 
-    Conservative by design: this headless worker path runs with
-    ``autonomous=False`` — READ permissions are auto-allowed, WRITE/git
-    asks abort the session with a clear error (no user is present to
-    relay a question, and unprompted grants are never issued).
+    Conservative by design: this headless worker path never grants a
+    permission; a permission ask aborts the session with a clear error (no
+    user is present to relay the question).
     """
     logger.info("OpenCode escalation (stage=%d): %r", stage, prompt[:200])
-    return await opencode_chat(prompt, agent=OPENCODE_AGENT)
+    return await opencode_chat(prompt)
 
 
 
@@ -2047,16 +1788,8 @@ async def _detect_wedged_tool(client: httpx.AsyncClient, session_id: str) -> boo
     "running") but never actually execute it, leaving the session busy
     forever.  A running tool part with no output whose start is older than
     ``_TOOL_WEDGE_AFTER_S`` is wedged, not working.  Never raises.
-
-    STALE-PART GUARD (2026-08-08): tool parts started BEFORE the current
-    serve process are debris from a dead serve (the serve dies silently
-    under load; the session storage survives and the pinned session is
-    resumed on a fresh serve).  Aborting the session for stale debris
-    kills a healthy resumed cycle, so parts older than the serve's start
-    are ignored.
     """
     try:
-        serve_start_ms = await asyncio.to_thread(_serve_start_epoch_ms)
         resp = await BACKEND.fetch_messages(client, session_id)
         if resp.status_code != 200:
             return False
@@ -2072,9 +1805,6 @@ async def _detect_wedged_tool(client: httpx.AsyncClient, session_id: str) -> boo
                 if start is None:
                     continue
                 start_ms = int(start)
-                if serve_start_ms is not None and start_ms < serve_start_ms:
-                    # Stale part from a previous serve — not a live wedge.
-                    continue
                 elapsed_s = (now_ms - start_ms) / 1000
                 threshold_s = (
                     _TASK_WEDGE_AFTER_S if p.get("tool") == "task"
@@ -2125,79 +1855,6 @@ async def _detect_wedged_tool(client: httpx.AsyncClient, session_id: str) -> boo
     return False
 
 
-def _serve_start_epoch_ms() -> Optional[int]:
-    """Epoch-ms when the current serve process started (from /proc), or
-    None when it cannot be determined (no stale guard)."""
-    try:
-        pid = _find_serve_pid(OPENCODE_SERVE_URL.rsplit(":", 1)[-1])
-        if not pid:
-            return None
-        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
-            parts = fh.read().split()
-        start_ticks = int(parts[21])
-        with open("/proc/uptime", encoding="utf-8") as fh:
-            uptime_s = float(fh.read().split()[0])
-        start_s = time.time() - uptime_s + start_ticks / os.sysconf("SC_CLK_TCK")
-        return int(start_s * 1000)
-    except (OSError, ValueError, IndexError):
-        return None
-
-
-async def _session_busy_on_current_serve(
-    client: httpx.AsyncClient, session_id: str, serve_start_ms: int,
-) -> bool:
-    """True when the session has a tool part that is RUNNING on the current
-    serve (started after the serve process).  Such sessions are quiet-but-
-    working (e.g. a cycle's main session during a sub-agent phase) and must
-    not be swept as zombies.  Never raises.
-    """
-    try:
-        resp = await BACKEND.fetch_messages(client, session_id)
-        if resp.status_code != 200:
-            return False
-        for m in resp.json():
-            for p in m.get("parts") or []:
-                if p.get("type") != "tool" or p.get("tool") == "question":
-                    continue
-                st = p.get("state") or {}
-                if st.get("status") != "running" or st.get("output"):
-                    continue
-                start = (st.get("time") or {}).get("start")
-                if start is not None and int(start) >= serve_start_ms:
-                    return True
-    except (httpx.HTTPError, OSError, ValueError):
-        pass
-    return False
-
-
-async def _session_over_context_cap(
-    client: httpx.AsyncClient, session_id: str,
-) -> bool:
-    """Rough token estimate of a session's accumulated context.
-
-    Text/reasoning parts only, ~4 chars per token.  The agent inside the
-    session cannot reset its own context (no tools), so the bridge resets
-    it: a pinned session whose estimate exceeds the cap is dropped on the
-    next resume and a fresh session starts.  Never raises; any fetch
-    failure keeps the pin (False).
-    """
-    try:
-        resp = await BACKEND.fetch_messages(client, session_id)
-        if resp.status_code != 200:
-            return False
-        body = resp.json()
-        if not isinstance(body, list):
-            return False
-        total = 0
-        for m in body:
-            for p in m.get("parts") or []:
-                if p.get("type") in ("text", "reasoning"):
-                    total += len(str(p.get("text") or "")) // 4
-        return total > _SESSION_CONTEXT_CAP_TOKENS
-    except (httpx.HTTPError, OSError, ValueError):
-        return False
-
-
 async def _seed_resumed_session_state(
     client: httpx.AsyncClient,
     session_id: str,
@@ -2206,7 +1863,7 @@ async def _seed_resumed_session_state(
     tool_state: dict[str, str],
     seen_question_pids: set[str],
     running_question_times: Optional[list[float]] = None,
-) -> None:
+) -> int:
     """Best-effort seed of per-call part state for a RESUMED pinned session.
 
     The per-call text_lens/tool_state/user_mids are normally fed only by
@@ -2300,323 +1957,10 @@ async def _poll_session_deltas(
 
 
 
-_DRAIN_PROBES = 4
-_DRAIN_PROBE_S = 0.25
-
-
-async def _drain_serve_shutdown() -> None:
-    """Boundedly wait for the killed serve listener to stop.
-
-    is_opencode_serve_running() answers True mid-SIGTERM, so
-    ensure_opencode_serve would otherwise skip the respawn and the stream
-    POSTs into a dying listener.  Poll a few times and return — never
-    raises, never exceeds the budget.
-    """
-    for _ in range(_DRAIN_PROBES):
-        if not await is_opencode_serve_running():
-            return
-        await asyncio.sleep(_DRAIN_PROBE_S)
-
-
-async def _recycle_serve_if_low_memory() -> None:
-    """Restart the opencode serve when the system is critically short of
-    memory.
-
-    The serve's ~1GB RSS is a significant reclaim when the box is swap
-    thrashing, and a memory-starved serve hangs its bash tool on trivial
-    commands (the agent-loop tool runner cannot spawn/complete shells).
-    Killing the serve lets the next ``ensure_opencode_serve`` respawn a
-    fresh one.  Never raises.
-    """
-    try:
-        port = OPENCODE_SERVE_URL.rsplit(":", 1)[-1]
-        pressure, elapsed = await asyncio.to_thread(_serve_health, port)
-        reason = None
-        if pressure:
-            reason = "low memory"
-        elif elapsed is not None and elapsed > _SERVE_RECYCLE_AFTER_S:
-            reason = f"up {elapsed / 60:.0f} min (progressive tool-runner wedging)"
-        if not reason:
-            return
-        logger.warning("Recycling opencode serve: %s", reason)
-        pid = await asyncio.to_thread(_find_serve_pid, port)
-        if pid:
-            if not await asyncio.to_thread(_pid_is_serve, pid, port):
-                # Pid-reuse race guard: this pid no longer belongs to the
-                # serve (it died and the OS recycled the pid between the
-                # scan and the kill).  Skip the kill; the serve stays
-                # absent and the next ensure respawns a fresh one.
-                logger.warning(
-                    "skipping recycle: pid %s no longer matches the serve", pid,
-                )
-                return
-            try:
-                os.kill(pid, 15)
-            except (OSError, ProcessLookupError):
-                pass
-            await _drain_serve_shutdown()
-    except (OSError, ValueError):
-        return
-
-
-async def _force_recycle_serve(reason: str = "long-lived call") -> None:
-    """Kill the opencode serve unconditionally so the next
-    ``ensure_opencode_serve`` respawns a fresh one.
-
-    Used by long-lived calls (SDD-autonomous mode) and the config-drift
-    gate (REQ-5): the serve's tool runner progressively wedges (bash hangs
-    on trivial commands), and an SDD cycle can burn a full hour on a
-    wedged runner.  A fresh serve at cycle start removes that risk.  The
-    drift gate recycles when the serve template changes under a running
-    serve.  Never raises.
-    """
-    try:
-        port = OPENCODE_SERVE_URL.rsplit(":", 1)[-1]
-        pid = await asyncio.to_thread(_find_serve_pid, port)
-        if pid:
-            if not await asyncio.to_thread(_pid_is_serve, pid, port):
-                # Pid-reuse race guard: the found pid no longer belongs to
-                # the serve — never signal a reused pid.  The serve stays
-                # absent and the next ensure respawns a fresh one.
-                logger.warning(
-                    "skipping force-recycle: pid %s no longer matches the serve", pid,
-                )
-                return
-            logger.warning("Forcing opencode serve recycle (%s)", reason)
-            os.kill(pid, 15)
-            await _drain_serve_shutdown()
-    except (OSError, ProcessLookupError):
-        pass
-    except (OSError, ValueError):
-        return
-
-
-# F5 (tasks 4.4): the config-mtime cache lives module-level, NOT on
-# proxy.app.state — the spawn gate (ensure_opencode_serve) is a
-# bridge-internal function with no request/app handle (pending_permissions
-# is threaded IN from routes as a plain dict; this cache is owned by the
-# spawn gate itself, so there is no clean app.state channel).  Design.md
-# chose module-level; review-accepted via F5.  Set after every successful
-# spawn; drives the REQ-5 drift recycle.
-_serve_config_mtime: Optional[float] = None
-
-
-def _config_mtime() -> Optional[float]:
-    """mtime of OPCODE_CONFIG_PATH, or None when unreadable (no drift)."""
-    try:
-        return os.path.getmtime(OPCODE_CONFIG_PATH)
-    except OSError:
-        return None
-
-
-def _sync_serve_config() -> None:
-    """Idempotently copy the serve template + fallback-plugin config into the
-    serve-config dir.
-
-    opencode is an XDG app: with XDG_CONFIG_HOME=OPENCODE_SERVE_CONFIG_DIR it
-    reads <dir>/opencode/opencode.jsonc — so the template lands in the
-    ``opencode/`` subdir (empirically verified 2026-08-08: the file at the
-    XDG base root is NOT read).  The reduced file there (file:// plugin ref
-    for the fallback plugin ONLY, no .ts plugin files) is the serve's whole
-    config.  The fallback plugin resolves its OWN config
-    (rate-limit-fallback.json) via $XDG_CONFIG_HOME/opencode/ too — without
-    a copy there it initializes with its defaults (logging OFF, which
-    would blind the REQ-4 fallback-log evidence), so the proxy syncs the
-    user's plugin config alongside the template.  Copies are skipped when
-    the destination already matches, so repeated spawns do not churn the
-    dir."""
-    dst_dir = os.path.join(OPENCODE_SERVE_CONFIG_DIR, "opencode")
-    os.makedirs(dst_dir, exist_ok=True)
-    _copy_if_changed(
-        OPCODE_CONFIG_PATH, os.path.join(dst_dir, "opencode.jsonc"),
-    )
-    plugin_cfg = os.path.expanduser(
-        "~/.config/opencode/rate-limit-fallback.json"
-    )
-    if os.path.exists(plugin_cfg):
-        _copy_if_changed(
-            plugin_cfg, os.path.join(dst_dir, "rate-limit-fallback.json"),
-        )
-
-
-def _copy_if_changed(src: str, dst: str) -> None:
-    """Copy ``src`` to ``dst`` when the contents differ (idempotent)."""
-    with open(src, encoding="utf-8") as fh:
-        data = fh.read()
-    try:
-        with open(dst, encoding="utf-8") as fh:
-            if fh.read() == data:
-                return
-    except OSError:
-        pass
-    with open(dst, "w", encoding="utf-8") as fh:
-        fh.write(data)
-    logger.info("Synced opencode serve config template -> %s", dst)
-
-
-def _serve_health(port: str) -> tuple[bool, Optional[float]]:
-    """Sync health probe (offloaded by the caller): (memory_pressure,
-    serve_elapsed_seconds).  Returns (False, None) when the serve is
-    healthy and recent — callers recycle only on low memory or age."""
-    pressure = _memory_pressure()
-    pid = _find_serve_pid(port)
-    elapsed: Optional[float] = None
-    if pid:
-        try:
-            with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
-                parts = fh.read().split()
-            start_ticks = int(parts[21])
-            with open("/proc/uptime", encoding="utf-8") as fh:
-                uptime_s = float(fh.read().split()[0])
-            # Process uptime = system uptime - (start ticks / clock rate).
-            elapsed = uptime_s - (start_ticks / os.sysconf("SC_CLK_TCK"))
-        except (OSError, ValueError, IndexError):
-            elapsed = None
-    return pressure, elapsed
 
 
 
 
-def _open_serve_log() -> Any:
-    """Open (create) the serve log file with sync I/O off the event loop."""
-    os.makedirs(OPENCODE_WORKSPACE_DIR, exist_ok=True)
-    return open(
-        os.path.join(OPENCODE_WORKSPACE_DIR, "opencode-serve.log"), "ab", buffering=0,
-    )
 
 
-def _memory_pressure() -> bool:
-    """True when the system is critically short of memory (sync /proc read,
-    offloaded to a worker thread by the caller — Rule 3)."""
-    try:
-        with open("/proc/meminfo", encoding="utf-8") as fh:
-            for line in fh:
-                if line.startswith("MemAvailable:"):
-                    avail_kb = int(line.split()[1])
-                    break
-            else:
-                return False
-        if avail_kb < 2_000_000:
-            logger.warning(
-                "Low memory (%.1fGB available) — recycling opencode serve",
-                avail_kb / 1048576,
-            )
-            return True
-    except (OSError, ValueError):
-        pass
-    return False
 
-
-def _cmdline_matches_serve(cmd: str, port: str) -> bool:
-    """True when a normalized /proc cmdline belongs to the opencode serve
-    bound to ``port``.
-
-    /proc/<pid>/cmdline separates argv with NUL bytes, not spaces — the old
-    space-form match NEVER matched any process, so serve recycling (age,
-    low-memory, wedge recovery) silently did nothing and a wedged tool
-    runner lived forever.  NULs are normalized to spaces and the argv is
-    tokenized before matching.  PORT MATCHING IS EXACT ONLY: neither a
-    longer advertised value (--port 189990 vs search "18999") nor a shorter
-    search (--port 18999 vs search "1899") may match (prefix-false-positive
-    bug, cycle 9).
-    """
-    tokens = cmd.replace("\x00", " ").split()
-    if not any("opencode" in tok for tok in tokens) or "serve" not in tokens:
-        return False
-    if f"--port={port}" in tokens:
-        return True
-    for i, tok in enumerate(tokens):
-        if tok == "--port" and i + 1 < len(tokens) and tokens[i + 1] == port:
-            return True
-    return False
-
-
-def _pid_is_serve(pid: int, port: str) -> bool:
-    """Re-verify ``pid`` still belongs to the opencode serve before a kill.
-
-    Guards the pid-reuse TOCTOU race: the pid found by ``_find_serve_pid``
-    may have died and been recycled by the OS between the scan and the
-    kill.  Unreadable/missing cmdline counts as mismatch (never raises).
-    """
-    try:
-        with open(f"/proc/{pid}/cmdline", "rb") as fh:
-            cmd = fh.read().decode("utf-8", "ignore")
-        return _cmdline_matches_serve(cmd, port)
-    except OSError:
-        return False
-
-
-def _find_serve_pid(port: str) -> Optional[int]:
-    """Locate the opencode serve process pid by scanning /proc cmdlines."""
-    try:
-        for entry in os.listdir("/proc"):
-            if not entry.isdigit():
-                continue
-            try:
-                with open(f"/proc/{entry}/cmdline", "rb") as fh:
-                    cmd = fh.read().decode("utf-8", "ignore")
-                if _cmdline_matches_serve(cmd, port):
-                    return int(entry)
-            except (OSError, ValueError):
-                continue
-    except OSError:
-        pass
-    return None
-
-
-async def _abort_zombie_sessions(
-    client: httpx.AsyncClient,
-    protected_ids: Optional[set[str]] = None,
-) -> None:
-    """Abort sessions that are stuck (busy with no recent activity).
-
-    The opencode serve processes agent sessions through a sequential tool
-    runner: a hung tool (e.g. an agent bash call that never completes)
-    leaves the session busy FOREVER and blocks every later task behind it —
-    which made the bridge look like it "consistently fails" after one
-    zombie session accumulated.  A busy session whose last update is older
-    than a few minutes is stuck, not working; abort it so new tasks get a
-    free slot.  Never raises (best-effort hygiene).
-
-    ``protected_ids`` holds sessions currently pinned as active
-    conversations in the session map.  Pinned sessions sit idle BY DESIGN
-    between user messages (clarifying questions, multi-turn coding), so
-    they are never swept here — the busy-status check at resume time
-    handles the genuinely stuck pinned session instead.
-    """
-    try:
-        resp = await BACKEND.list_sessions(client)
-        if resp.status_code != 200:
-            return
-        now_ms = int(time.time() * 1000)
-        threshold_ms = 240_000
-        serve_start_ms = await asyncio.to_thread(_serve_start_epoch_ms)
-        for s in resp.json():
-            sid = s.get("id")
-            if not sid:
-                continue
-            if protected_ids and sid in protected_ids:
-                # Pinned conversation waiting on the user — not a zombie.
-                continue
-            updated = ((s.get("time") or {}).get("updated") or 0)
-            if updated and now_ms - updated > threshold_ms:
-                if (
-                    serve_start_ms is not None
-                    and updated >= serve_start_ms
-                    and await _session_busy_on_current_serve(
-                        client, sid, serve_start_ms,
-                    )
-                ):
-                    # Quiet but working (sub-agent phase) — not a zombie.
-                    logger.debug(
-                        "opencode session %s quiet but busy — skipped by sweep",
-                        str(sid)[:16],
-                    )
-                    continue
-                logger.warning(
-                    "opencode zombie session %s idle for %.0fs — aborting",
-                    str(sid)[:16], (now_ms - updated) / 1000,
-                )
-                await BACKEND.abort_session(client, sid)
-    except (httpx.HTTPError, OSError, ValueError):
-        return

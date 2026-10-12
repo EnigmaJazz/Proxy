@@ -192,18 +192,9 @@ OPENCODE_SERVE_URL: str = "http://127.0.0.1:18900"
 # OPENCODE_BACKEND=secure; a down server is the user's to start.
 OPENCODE_SECURE_SERVE_URL: str = "http://127.0.0.1:4096"
 
-# Working directory for the headless opencode serve.  Deliberately OUTSIDE
-# the proxy repo: bridge sessions (gentle-orchestrator/build agents) write
-# files there, and running them in the repo polluted the proxy git tree
-# (stray artifacts + corrupt index objects).
-OPENCODE_WORKSPACE_DIR: str = _machine(
-    "OPENCODE_WORKSPACE_DIR", os.path.expanduser("~/opencode-workspace"),
-)
-
-# Directory the opencode bridge creates sessions in.  The serve defaults to
-# its own cwd (OPENCODE_WORKSPACE_DIR); passing an explicit directory lets
-# bridge sessions operate on a real project (e.g. the proxy repo, which
-# hosts the OpenSpec SDD store) instead of the scratch workspace.
+# Directory the opencode bridge creates sessions in.  Passing an explicit
+# directory lets bridge sessions operate on a real project (e.g. the proxy
+# repo, which hosts the OpenSpec SDD store) instead of a scratch workspace.
 OPENCODE_BRIDGE_DIRECTORY: str = _machine("OPENCODE_BRIDGE_DIRECTORY", _REPO_ROOT)
 
 # Absolute path to the opencode binary.  systemd services run with a
@@ -220,33 +211,6 @@ OPENCODE_AGENT: str = "gentle-orchestrator"
 
 # How long to wait for the opencode agent to finish a task.
 OPENCODE_SERVE_TIMEOUT: float = 600.0
-
-# Serve stability mode (REQ-4): candidate B (serve-scoped config dir via
-# XDG_CONFIG_HOME, default) vs candidate A (`--pure` arg).  When True the
-# serve spawns with `--pure`, disabling ALL external plugin auto-load
-# incl. the rate-limit-fallback plugin — kept as a documented fallback
-# only; the reduced-config path is the default.  Subprocess-scoped toggle,
-# never touches the user's TUI config.
-OPENCODE_SERVE_PURE: bool = False
-
-# Scratch config dir the proxy OWNS for the headless serve (candidate B).
-# The serve spawns with XDG_CONFIG_HOME pointing here, and the proxy
-# syncs a REDUCED opencode.jsonc template into its ``opencode/`` subdir
-# (opencode-serve-config.opencode.jsonc) so ONLY the rate-limit-fallback
-# plugin loads.  Never points at ~/.config/opencode — the user's TUI
-# config stays untouched.
-OPENCODE_SERVE_CONFIG_DIR: str = _machine(
-    "OPENCODE_SERVE_CONFIG_DIR",
-    os.path.join(OPENCODE_WORKSPACE_DIR, "serve-config"),
-)
-
-# Path whose mtime drives config-drift detection (REQ-5): the committed
-# serve template.  Hot-editing it while a serve runs recycles the serve
-# before the next request so the new config actually loads.
-OPCODE_CONFIG_PATH: str = _machine(
-    "OPCODE_CONFIG_PATH",
-    os.path.join(_REPO_ROOT, "opencode-serve-config.opencode.jsonc"),
-)
 
 # Bridge model keys exposed to clients, validated alongside ALL_MODEL_KEYS.
 # "opencode" routes to the opencode serve bridge instead of llama.cpp.

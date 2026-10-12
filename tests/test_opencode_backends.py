@@ -334,23 +334,4 @@ async def test_secure_ensure_probe_only_when_up(
     assert signals == []
 
 
-@pytest.mark.asyncio
-async def test_secure_lifecycle_functions_are_noops(
-    monkeypatch: pytest.MonkeyPatch,
-    _lifecycle_recorders: tuple[list[str], list[tuple[int, int]]],
-) -> None:
-    """The guard sites themselves: recycle / force-recycle / spawn /
-    config-sync all return immediately under a non-owning backend — no
-    subprocess and no SIGTERM, even when called directly."""
-    import opencode_bridge as obr
 
-    created, signals = _lifecycle_recorders
-    monkeypatch.setattr(obr, "BACKEND", ob.SecureBackend())
-
-    await obr._recycle_serve_if_low_memory()
-    await obr._force_recycle_serve("test")
-    assert await obr._spawn_serve(None) is False
-    obr._sync_serve_config()
-
-    assert created == []
-    assert signals == []

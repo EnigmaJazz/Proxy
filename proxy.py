@@ -90,7 +90,6 @@ from llm import (
     openrouter_cloud_escalation,
 )
 from opencode_bridge import (
-    ensure_opencode_serve,
     opencode_escalation,
 )
 from constants import CLOUD_ESCALATION_BACKEND
@@ -249,14 +248,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         PROJECT_ROOT / "config" / "model_profiles.yaml"
     )
 
-    # ---- 5b. OpenCode serve backend (best-effort) --------------------------
-    # The bridge (model "opencode", /opencode, queue-worker escalation)
-    # needs a headless opencode serve listening on OPENCODE_SERVE_URL.
-    # Spawn it here when missing; never block startup on it.
-    if CLOUD_ESCALATION_BACKEND == "opencode":
-        await ensure_opencode_serve()
-
-    # ---- 5c. Warm the pinned-opencode-session map (Rule 3) -----------------
+    # ---- 5b. Warm the pinned-opencode-session map (Rule 3) -----------------
     # _opencode_session_state loads the disk-backed session map lazily on
     # first access.  Warm it HERE (startup, off the request path) so the
     # one-time sync disk read never runs on a request — the request path

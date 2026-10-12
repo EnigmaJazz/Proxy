@@ -171,7 +171,7 @@ only after its checks were observed.
     that restates orchestration.
   - Send no model override, so the secure server's agent config chooses the model.
   - Landed 2026-10-11 (commit 692e52a, 5 files, +210/-93; host suite 586 passed; .gga hook PASSED). Review review-6c8716f4feaf045c (high, 4/4 lenses) APPROVED + acknowledged.
-- [ ] **T7 (ct-58461)** User action: register the nanobot workspace with
+- [x] **T7 (ct-58461)** User action: register the nanobot workspace with
   `scripts/register-project.ts`, then restart `sandbox-broker.service` and
   `secure-opencode.service`. Alternatively, change `OPENCODE_BRIDGE_DIRECTORY` to a
   directory that is already registered. Ask the user which.
@@ -183,7 +183,7 @@ only after its checks were observed.
     when those sessions are clear (exact pending command):
     `systemctl restart sandbox-broker.service secure-opencode.service`
   - Checkbox stays UNCHECKED until the user confirms both restarts.
-- [ ] **T8 (ct-58465)** Full test suite, then a live probe: one bridged request on port
+- [x] **T8 (ct-58465)** Full test suite, then a live probe: one bridged request on port
   4096 whose `grep` permission prompt is resolved by the user through `opencode-perm`.
   - T8 must VERIFY the mitigation transfer: confirm the secure server's own agent config (the agent the server selects) carries the orchestration and tool guidance the bridge prompt used to impose — the bash-first / retry-ONCE tool discipline against the known upstream serve tool wedge, and the multi-step work-continuity expectation. If that config lacks it, bridge streams can regress to the documented wedge/hang behaviour even though this review approved the prompt shrink (T6 advisory R4-prompt-mitigation-transfer).
   - T8 runbook (probe prepared, NOT yet run — restart for T7 is pending):
@@ -236,10 +236,34 @@ only after its checks were observed.
     - correct `_inject_current_datetime`'s docstring — it says the method stamps the full date
       AND time while the implementation correctly stamps date-only (KV-cache rationale, memory
       #1129) (the T5 .gga doc-only observation);
+    - R4-001 (WARNING, opencode_bridge.py:514): a parked secure session holds the stream open
+      with no internal bound — the waiting status fires once per permission id, then silence, so
+      a client or fronting proxy idle-read timeout can drop the connection before completion;
+    - R4-002 (WARNING, opencode_bridge.py:438): the blocking path produces no client-visible
+      distinction and no log while a prompt is parked, so a never-resolved prompt costs the full
+      request window silently;
     - R4-003 (WARNING, pre-existing, opencode_backends.py:95): `OpenChamberBackend` advertises
       `answers_permissions` True but its polling discovery returns no records, so a permission
       arriving outside a live SSE window is never detected and the stream can park with no
-      signal — this gap disappears when `OpenChamberBackend` is deleted in T9.
+      signal — this gap disappears when `OpenChamberBackend` is deleted in T9;
+    - R4-004 (SUGGESTION, routes.py:1173): a pending-permission entry for a secure session is
+      never popped, so if the config later flips back to an answering backend the first resume
+      would POST an answer from the stale entry.
+  - Deferred to T9 from the T8 probe (2026-10-12):
+    - R3-003 (SUGGESTION, refuted by the refuter — recorded for completeness, no action);
+    - R3-004 (SUGGESTION): the probe logs but passes through an absolute `--write-path`;
+    - R3-005 (SUGGESTION): the backend precondition is advisory — UNKNOWN does not block the run;
+    - R3-006 (SUGGESTION): the probe tests were first authored under a stub harness; the host
+      suite now runs them for real;
+    - R3-007 (SUGGESTION): the conftest autouse fixture imports inside the fixture body;
+    - R4-probe-question-park-false-positive: the question heuristic can mask an acceptance
+      failure as a manual step;
+    - R4-probe-symlink-write-through: the guard refuses a symlinked fixture dir but the run can
+      still write through it;
+    - R4-probe-tool-markers-not-model-gated: markers fold from any chunk regardless of the model
+      field;
+    - R4-request-path-fix-runtime-unverified: OBSOLETE — the live probe has since exercised the
+      request path end to end.
 
 Route per task: delegated writer for T1 to T6 and T9 (each touches two or more
 non-trivial files). T7 and the T8 probe need the user.
@@ -350,3 +374,8 @@ non-trivial files). T7 and the T8 probe need the user.
 - T8 review-correction route evidence — route: delegated; specialist: odd-apply; trigger: the RDD review's correction_required verdict on R3-001 and R3-002 (both probe-local, budget 200 lines); user flow 2026-10-12.
 
 - 2026-10-12: T8 REVIEW CORRECTION DONE (code-level; host suite + commit pending; the RDD review's correction_required verdict on R3-001 and R3-002). R3-001 (`_remove_probe_dir`): the guard now CANONICALIZES both sides — it resolves the probe dir ITSELF and the workspace and compares `resolved_probe.name == _PROBE_DIRNAME` and `resolved_probe.parent == resolved_workspace`, so an unresolved `workspace / ".opencode_bridge_probe"` call site cannot make a resolved-vs-unresolved comparison disagree; it still refuses a symlink (`probe_dir.is_symlink()`), a wrong basename or a foreign parent, still returns False and never raises (resolution errors are caught as `(OSError, RuntimeError)` and refused), and still never removes anything outside the fixture. R3-002(a) (`_named_delegate`): the captured token is now edge-punctuation-stripped (`_NAME_EDGE_PUNCT`) and case-folded before the stop-word test, so "Alpha." yields "Alpha" and a capitalized stop-word ("Worker"/"The") is still rejected. R3-002(b) (fact 2b): a PASS now REQUIRES the positive stream marker (`outcome.delegation_signals`); the prose-only path (a named delegate, with or without the file on disk) is downgraded to UNKNOWN with a note that delegation was claimed but not positively observed, while the write-present-without-delegation path stays FAIL and the neither-observed path stays UNKNOWN. Tests added/updated in `tests/test_probe_secure_bridge.py`: new `test_remove_probe_dir_symlinked_workspace_cannot_bypass_guard` (a nested foreign `.opencode_bridge_probe` reached through a symlinked workspace is refused; positive control asserts the foreign target still exists byte-for-byte); `test_named_delegate_captures_trailing_punctuation_verbatim` rewritten as `test_named_delegate_strips_trailing_punctuation` ("Alpha." → "Alpha", "Beta-X." → "Beta-X"); `test_named_delegate_rejects_common_stop_words` extended with the capitalized stop-word legs ("Worker", "The."); `test_fact2b_prose_needs_the_file_on_disk_to_pass` rewritten as `test_fact2b_prose_only_is_unknown_never_pass` (prose + file → UNKNOWN, prose without file → UNKNOWN). No existing test was weakened or deleted — the two that asserted the OLD (reviewed-and-refuted) behaviour were corrected to the honest expectation. Checks observed: `python3 -m py_compile scripts/probe_secure_bridge.py` and `python3 -m py_compile tests/test_probe_secure_bridge.py` both clean (worker python3 3.13.5); `python3 -m pytest --noconftest -q tests/test_probe_secure_bridge.py` fails to COLLECT in the sandbox with `ModuleNotFoundError: No module named 'httpx'` (scripts/probe_secure_bridge.py:76), so the module-level suite cannot run here and its result is NOT fabricated. Host suite + commit pending. `sandbox_apply` is refused for the protected `scripts/` path and the result is retained.
+- 2026-10-12: T7 DONE — the bridge workspace is registered and the services carry the secure selection. Registered /home/james/.nanobot/workspace via the approved host registration path (project id `workspace`; git ok; `.atl/` skill-registry cache and `.codegraph/` created; broker project list, read allowlist, launcher root and `.git` grant updated). User restarted sandbox-broker.service + secure-opencode.service and ai-proxy.service. `OPENCODE_BACKEND=secure` is set in the repo `.env` (EnvironmentFile of ai-proxy.service, gitignored, host-local). No remote was created.
+- 2026-10-12: T8 DONE — the secure bridge is proven live. `scripts/probe_secure_bridge.py` (+ `tests/test_probe_secure_bridge.py`) sends one bridged request through `:13000` to the secure server on `:4096` and reports every acceptance fact separately as PASS/FAIL/UNKNOWN. Live run: ALL SIX FACTS PASS — (1) streamed reply, 32 content chunks with [DONE]; (2) tool results observed: glob, read, grep; (2b) delegation observed: a `task` marker in the stream; (3) work on disk: `<workspace>/.opencode_bridge_probe/out.txt` contains `secure-bridge-probe-ok`; (4) opencode session artifact; (5) log file; cleanup removed the probe dir. The read-only agent delegated the write and the delegate landed it via sandbox_finish + sandbox_apply. Commits: 05dbfaa (probe + tests), 1f5e029 (review correction).
+- 2026-10-12: T8 REVIEW OUTCOME — APPROVED, authority burned (lineage review-8e2889f515c94069, high, 4/4 lenses + provider refuter + targeted validator on the correction). One bounded correction was required and made: R3-001 (`_remove_probe_dir` now canonicalizes the probe dir and the workspace before comparing, so a non-canonical/symlinked workspace cannot slip the guard) and R3-002 (fact 2b now requires the positive delegation marker; a prose-only claim downgrades to UNKNOWN; `_named_delegate` strips edge punctuation and case-folds stop-words). Correction validated; host suite 624 passed.
+- 2026-10-12: T8 review advisories carried (all non-blocking, informational; none reopened the review): R3-003 refuted by the refuter; R3-004 (probe logs but passes through an absolute --write-path); R3-005 (the backend precondition is advisory — UNKNOWN does not block the run); R3-006 (the probe tests were first authored under a stub harness; the host suite now runs them for real); R3-007 (the conftest autouse fixture imports inside the fixture body); R4-probe-question-park-false-positive (the question heuristic can mask an acceptance failure as a manual step); R4-probe-symlink-write-through (the guard refuses a symlinked fixture dir but the run can still write through it); R4-probe-tool-markers-not-model-gated (markers fold from any chunk regardless of the model field); R4-request-path-fix-runtime-unverified (OBSOLETE — the live probe has since exercised the request path end to end).
+- 2026-10-12: GLOBAL NOTE — the `.gga` review hook is non-deterministic in scope on this repo (the same file passed on one commit and reported 35 pre-existing test-module Pyright findings on another) and its provider now aborts before evaluating; it flagged the probe's missing regression tests as a genuine Rule 7 finding. RDD remained the authoritative gate throughout.

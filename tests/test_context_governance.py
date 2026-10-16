@@ -6,6 +6,7 @@ and the dream fast-path, plus the per-request opt-out header).
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Optional
 from unittest.mock import AsyncMock, patch
@@ -255,6 +256,97 @@ class TestBudgetSnip:
         assert len(governed) <= len(messages)
         assert governed[-1]["content"] == "the current question"
 
+    def test_keeps_system_message_when_snipping(self) -> None:
+        messages = [{"role": "system", "content": "the system prompt"}] + [
+            {"role": "user", "content": "old " * 60_000}
+        ] * 3 + [{"role": "user", "content": "the current question"}]
+        governed = apply_context_governance(
+            messages,
+            model_key="professional",
+            context_window=65_536,
+            max_output_tokens=4096,
+        )
+        assert len(governed) < len(messages)
+        assert governed[0] == {"role": "system", "content": "the system prompt"}
+        assert governed[-1]["content"] == "the current question"
+
+    def test_oversized_system_message_kept_and_overflow_logged(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # The system prompt is the client's instruction text: governance
+        # never rewrites it (Glass Pipe), even when it alone is over budget.
+        system = "rules " * 100_000  # ~150k est. tokens, over any 65k budget
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": "the current question"},
+        ]
+        with caplog.at_level(logging.WARNING, logger="kinver.context_governance"):
+            governed = apply_context_governance(
+                messages,
+                model_key="professional",
+                context_window=65_536,
+                max_output_tokens=4096,
+            )
+        assert governed[0] == {"role": "system", "content": system}
+        assert governed[-1]["content"] == "the current question"
+        assert any(
+            "over the input budget" in r.getMessage() for r in caplog.records
+        )
+
+    def test_short_system_message_kept_when_user_turn_overflows(self) -> None:
+        messages = [
+            {"role": "system", "content": "be"},
+            {"role": "user", "content": "q " * 200_000},
+        ]
+        governed = apply_context_governance(
+            messages,
+            model_key="professional",
+            context_window=65_536,
+            max_output_tokens=4096,
+        )
+        assert governed[0] == {"role": "system", "content": "be"}
+
+    def test_keeps_system_prompt_when_last_user_turn_alone_overflows(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # The last user turn alone is over budget; the system prompt survives.
+        system = "follow these rules carefully. " * 40
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": "q " * 200_000},
+        ]
+        with caplog.at_level(logging.WARNING, logger="kinver.context_governance"):
+            governed = apply_context_governance(
+                messages,
+                model_key="professional",
+                context_window=65_536,
+                max_output_tokens=4096,
+            )
+        assert governed[0] == {"role": "system", "content": system}
+        assert any(
+            "over the input budget" in r.getMessage() for r in caplog.records
+        )
+
+    def test_warns_when_still_over_budget(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # A list-of-parts system message is kept as-is too; the leftover
+        # overflow must be logged, not passed on silently.
+        messages = [
+            {"role": "system", "content": [{"type": "text", "text": "rules " * 100_000}]},
+            {"role": "user", "content": "the current question"},
+        ]
+        with caplog.at_level(logging.WARNING, logger="kinver.context_governance"):
+            apply_context_governance(
+                messages,
+                model_key="professional",
+                context_window=65_536,
+                max_output_tokens=4096,
+            )
+        assert any(
+            "over the input budget" in r.getMessage() for r in caplog.records
+        )
+
     def test_never_splits_tool_pair(self) -> None:
         # Several old turns with tool calls, then the current turn.
         old_turn = [
@@ -432,3 +524,92 @@ class TestEndpointGovernance:
                 for m in sent
             ), f"sentinel status leaked into outbound: {sent!r}"
             assert any("the real answer" in m["content"] for m in sent)
+
+
+def _ctx_from_argv(argv: list[str]) -> Optional[int]:
+    """The ``-c`` / ``--ctx-size`` value in a llama-server argv (space or
+    ``=`` form); the last occurrence wins, as in llama.cpp's parser."""
+    value: Optional[int] = None
+    for i, arg in enumerate(argv):
+        if arg in ("-c", "--ctx-size") and i + 1 < len(argv):
+            nxt = argv[i + 1]
+            if nxt.isdigit():
+                value = int(nxt)
+        elif arg.startswith(("-c=", "--ctx-size=")):
+            tail = arg.split("=", 1)[1]
+            if tail.isdigit():
+                value = int(tail)
+    return value
+
+
+class TestCtxFromArgv:
+    """Deterministic coverage for the live-window parser."""
+
+    @pytest.mark.parametrize(
+        ("argv", "expected"),
+        [
+            (["llama-server", "-c", "118784", "-fa", "on"], 118784),
+            (["llama-server", "--ctx-size", "65536"], 65536),
+            (["llama-server", "--ctx-size=32768"], 32768),
+            (["llama-server", "-c=16384"], 16384),
+            (["llama-server", "-c", "1024", "--ctx-size", "2048"], 2048),
+            (["llama-server", "-ctk", "q8_0", "-cb"], None),
+            (["llama-server", "-c"], None),
+        ],
+    )
+    def test_parses_every_flag_form(
+        self, argv: list[str], expected: Optional[int],
+    ) -> None:
+        assert _ctx_from_argv(argv) == expected
+
+
+class TestRuntimeWindowMatchesLiveUnit:
+    """RUNTIME_CONTEXT_WINDOWS must track the live ``-c``: a stale, larger
+    value lets prompts pass the snip and overflow at the server.  Local
+    only (the unit lives on this machine), like the profile drift check.
+
+    The argv comes from systemd's merged view (``systemctl show``), so
+    drop-in overrides and backslash-continued ExecStart lines resolve
+    exactly as the service manager runs them.  The test skips only when
+    the unit is absent; an installed unit without a parsable window fails.
+    """
+
+    @staticmethod
+    def _systemctl_show(service: str) -> Optional[str]:
+        """``systemctl show`` output for the unit, or None when systemd
+        is unavailable or the unit is not loaded on this machine."""
+        import shutil
+        import subprocess
+        if shutil.which("systemctl") is None:
+            return None
+        try:
+            out = subprocess.run(
+                ["systemctl", "show", "-p", "LoadState,ExecStart", service],
+                capture_output=True, text=True, timeout=10, check=False,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return out if "LoadState=loaded" in out else None
+
+    @staticmethod
+    def _argv_from_show(show: str) -> Optional[list[str]]:
+        import re
+        match = re.search(r"argv\[\]=(.*?) ;", show)
+        return match.group(1).split() if match else None
+
+    def test_unparsable_exec_start_yields_no_argv(self) -> None:
+        assert self._argv_from_show("LoadState=loaded\nExecStart=\n") is None
+        assert self._argv_from_show(
+            "ExecStart={ path=/x ; argv[]=/x -c 4096 ; ignore_errors=no }",
+        ) == ["/x", "-c", "4096"]
+
+    def test_professional_window_matches_live_ctx(self) -> None:
+        from constants import RUNTIME_CONTEXT_WINDOWS
+        show = self._systemctl_show("llama-professional")
+        if show is None:
+            pytest.skip("llama-professional unit not installed on this machine")
+        argv = self._argv_from_show(show)
+        assert argv is not None, f"loaded unit has no parsable ExecStart: {show!r}"
+        live = _ctx_from_argv(argv)
+        assert live is not None, f"no -c/--ctx-size in the live ExecStart: {argv}"
+        assert RUNTIME_CONTEXT_WINDOWS["professional"] == live

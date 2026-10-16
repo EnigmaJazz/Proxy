@@ -5,7 +5,7 @@ Mirrors the budget discipline nanobot-ai applies inside its own agent loop
 nanobot, curl, web UIs, custom clients — gets the same protection regardless
 of the client-side agent.
 
-The transform is a pure function over the OUTBOUND model-copy:
+The transform builds a new OUTBOUND model-copy (offload writes files):
 
   1. structural cleanup   — drop orphan tool results and malformed tool_calls
   2. tool-result budget   — truncate oversized results; offload very large
@@ -18,12 +18,14 @@ The transform is a pure function over the OUTBOUND model-copy:
 
 Constraints (deliberate):
 
-- Only ``role: \"tool\"`` result messages are truncated or replaced. User and
-  assistant text is NEVER altered.
+- Only ``role: \"tool\"`` result messages are truncated or replaced. User,
+  assistant and system text is NEVER rewritten; the snip drops whole old
+  turns, and ``strip_proxy_status`` drops the proxy's own status messages.
 - The client's stored conversation and the DB job audit copy are untouched —
   governance operates on a copy that is only ever sent to the model.
-- The snip never splits a tool_call/result pair and never drops the most
-  recent user turn.
+- The snip never splits a tool_call/result pair, never drops the most
+  recent user turn or a system message, and logs a warning when the prompt
+  is still over budget.
 - Truncation and offload append a marker so the model knows a result was
   partial and why (prevents silent re-call loops).
 - Per-request opt-out: ``X-Proxy-Context-Governance: off``.
@@ -299,7 +301,8 @@ def _snip_to_budget(
 
     Atomic units: a user message alone, an assistant message alone (no tool
     calls), or an assistant tool-call message TOGETHER with its consecutive
-    tool results.  The most recent user turn is never dropped.
+    tool results.  The most recent user turn and system messages (the
+    model's instructions) are never dropped.
     """
     if budget_tokens <= 0:
         return messages
@@ -311,6 +314,9 @@ def _snip_to_budget(
     i = 0
     while i < len(remaining) and total > budget_tokens:
         msg = remaining[i]
+        if msg.get("role") == "system":
+            i += 1
+            continue
         group = [msg]
         if msg.get("role") == "assistant" and msg.get("tool_calls"):
             j = i + 1
@@ -325,6 +331,14 @@ def _snip_to_budget(
             break  # never drop the last user turn
         del remaining[i : i + len(group)]
         total -= group_tokens
+    if total > budget_tokens:
+        # Nothing droppable is left (system messages, or one oversized
+        # last user turn): the server decides; make the overflow visible
+        # instead of silent.
+        logger.warning(
+            "Prompt still over the input budget after snipping "
+            "(~%d est. tokens > %d)", total, budget_tokens,
+        )
     return remaining
 
 

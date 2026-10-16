@@ -11,11 +11,14 @@ out per request with ``X-Proxy-Repo-Context: off``.
 """
 from __future__ import annotations
 
+import shutil
 import subprocess
 import types
 from typing import Any
 
 import pytest
+
+from tests.test_image_downscale import image_client  # noqa: F401  (fixture)
 
 
 @pytest.fixture
@@ -37,12 +40,20 @@ def work_repo(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
     return repo
 
 
-def _govern(msgs: list[dict[str, Any]], headers: dict[str, str]) -> Any:
+def _govern(
+    msgs: list[dict[str, Any]],
+    headers: dict[str, str],
+    *,
+    has_tools: bool = False,
+) -> Any:
     """Run routes._govern_messages with the given headers."""
     from routes import _govern_messages
 
     request = types.SimpleNamespace(headers=headers)
-    return _govern_messages(request, msgs, model_key="professional", max_tokens=4096)
+    return _govern_messages(
+        request, msgs, model_key="professional", max_tokens=4096,
+        has_tools=has_tools,
+    )
 
 
 class TestRepoContextCapture:
@@ -130,6 +141,26 @@ class TestRepoContextInjection:
             routes._RECENT_OPENCODE_WORK.clear()
 
     @pytest.mark.asyncio
+    async def test_skipped_when_request_carries_tools(self, work_repo: Any) -> None:
+        """A tool-calling client reads the files itself; the live block
+        would change mid-loop (the agent's own writes) and force a full
+        re-prefill of the conversation behind the system message."""
+        import routes
+
+        routes._RECENT_OPENCODE_WORK.clear()
+        try:
+            routes._capture_opencode_work(["Some work."])
+            msgs = [{"role": "system", "content": "sys"},
+                    {"role": "user", "content": "hi"}]
+            out = await _govern(
+                msgs, {"x-proxy-date-time": "off"}, has_tools=True,
+            )
+            assert out[0]["content"] == "sys"
+            assert out[1] == msgs[1]
+        finally:
+            routes._RECENT_OPENCODE_WORK.clear()
+
+    @pytest.mark.asyncio
     async def test_quiet_without_captured_work_still_injects_live_state(
         self, work_repo: Any,
     ) -> None:
@@ -200,3 +231,106 @@ class TestRepoContentSection:
         out = self._section("?? memory/history.jsonl\n?? SOUL.md", tmp_path)
         assert "history.jsonl" not in out
         assert "[File: SOUL.md]" in out
+
+    @pytest.mark.skipif(shutil.which("git") is None, reason="needs the git binary")
+    def test_worktree_modified_line_with_leading_space_gets_diff(
+        self, tmp_path: Any,
+    ) -> None:
+        # ``git status --short`` writes a worktree-only change as " M path";
+        # the leading space must not swallow the status code into the path.
+        def git(*args: str) -> None:
+            subprocess.run(["git", "-C", str(tmp_path), *args], check=True,
+                           capture_output=True)
+        git("init", "-q")
+        (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+        (tmp_path / "b.py").write_text("y = 1\n", encoding="utf-8")
+        git("add", ".")
+        git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init")
+        (tmp_path / "b.py").write_text("y = 2\n", encoding="utf-8")
+        (tmp_path / "c.py").write_text("z = 1\n", encoding="utf-8")
+        out = self._section("?? c.py\n M b.py", tmp_path)
+        assert "[File: c.py]" in out
+        assert "[Diff: b.py]" in out
+        assert "+y = 2" in out
+
+
+class TestRepoContextWire:
+    """End-to-end: a tool-calling request's OUTBOUND system message carries
+    no repo block; a plain chat request still does."""
+
+    _TOOLS = [{
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a file",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+        },
+    }]
+
+    async def _outbound_system(
+        self,
+        client: Any,
+        *,
+        tools: list[dict[str, Any]] | None,
+        dream: bool = False,
+    ) -> str:
+        from unittest.mock import AsyncMock, patch
+
+        from tests.test_image_downscale import _StreamCapture
+
+        body: dict[str, Any] = {
+            "model": "auto",
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "summarise my notes"},
+            ],
+        }
+        if tools:
+            body["tools"] = tools
+        capture = _StreamCapture()
+        with patch("routes.stream_llm", new=capture), patch(
+            "routes._repo_context_block", return_value="REPO-BLOCK-MARKER",
+        ), patch(
+            "routes.is_dream_process", new=AsyncMock(return_value=dream),
+        ):
+            response = await client.post(
+                "/v1/chat/completions",
+                json=body,
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            await response.aread()
+        assert response.status_code == 200, response.text
+        assert capture.payload is not None
+        return capture.payload["messages"][0]["content"]
+
+    @pytest.mark.asyncio
+    async def test_tool_request_outbound_has_no_repo_block(
+        self, image_client: Any,
+    ) -> None:
+        system = await self._outbound_system(image_client, tools=self._TOOLS)
+        assert "REPO-BLOCK-MARKER" not in system
+
+    @pytest.mark.asyncio
+    async def test_plain_request_outbound_keeps_repo_block(
+        self, image_client: Any,
+    ) -> None:
+        system = await self._outbound_system(image_client, tools=None)
+        assert "REPO-BLOCK-MARKER" in system
+
+    @pytest.mark.asyncio
+    async def test_dream_tool_request_outbound_has_no_repo_block(
+        self, image_client: Any,
+    ) -> None:
+        """The dream/soul fast path is the nanobot tool loop that measured
+        the full re-prefills; it builds its payload separately."""
+        system = await self._outbound_system(
+            image_client, tools=self._TOOLS, dream=True,
+        )
+        assert "REPO-BLOCK-MARKER" not in system
+
+    @pytest.mark.asyncio
+    async def test_dream_plain_request_outbound_keeps_repo_block(
+        self, image_client: Any,
+    ) -> None:
+        system = await self._outbound_system(image_client, tools=None, dream=True)
+        assert "REPO-BLOCK-MARKER" in system

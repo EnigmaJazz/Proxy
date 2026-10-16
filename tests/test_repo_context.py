@@ -268,9 +268,13 @@ class TestRepoContextWire:
     }]
 
     async def _outbound_system(
-        self, client: Any, *, tools: list[dict[str, Any]] | None,
+        self,
+        client: Any,
+        *,
+        tools: list[dict[str, Any]] | None,
+        dream: bool = False,
     ) -> str:
-        from unittest.mock import patch
+        from unittest.mock import AsyncMock, patch
 
         from tests.test_image_downscale import _StreamCapture
 
@@ -286,6 +290,8 @@ class TestRepoContextWire:
         capture = _StreamCapture()
         with patch("routes.stream_llm", new=capture), patch(
             "routes._repo_context_block", return_value="REPO-BLOCK-MARKER",
+        ), patch(
+            "routes.is_dream_process", new=AsyncMock(return_value=dream),
         ):
             response = await client.post(
                 "/v1/chat/completions",
@@ -309,4 +315,22 @@ class TestRepoContextWire:
         self, image_client: Any,
     ) -> None:
         system = await self._outbound_system(image_client, tools=None)
+        assert "REPO-BLOCK-MARKER" in system
+
+    @pytest.mark.asyncio
+    async def test_dream_tool_request_outbound_has_no_repo_block(
+        self, image_client: Any,
+    ) -> None:
+        """The dream/soul fast path is the nanobot tool loop that measured
+        the full re-prefills; it builds its payload separately."""
+        system = await self._outbound_system(
+            image_client, tools=self._TOOLS, dream=True,
+        )
+        assert "REPO-BLOCK-MARKER" not in system
+
+    @pytest.mark.asyncio
+    async def test_dream_plain_request_outbound_keeps_repo_block(
+        self, image_client: Any,
+    ) -> None:
+        system = await self._outbound_system(image_client, tools=None, dream=True)
         assert "REPO-BLOCK-MARKER" in system

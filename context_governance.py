@@ -329,7 +329,37 @@ def _snip_to_budget(
             break  # never drop the last user turn
         del remaining[i : i + len(group)]
         total -= group_tokens
+    if total > budget_tokens:
+        remaining = _truncate_system_messages(remaining, total - budget_tokens)
     return remaining
+
+
+SYSTEM_TRUNCATION_MARKER = "\n\n[system prompt truncated by proxy to fit the context window]"
+
+
+def _truncate_system_messages(
+    messages: list[dict[str, Any]],
+    excess_tokens: int,
+) -> list[dict[str, Any]]:
+    """Last resort once no droppable turn is left: cut the TAIL of the
+    largest string system messages (the head holds the core instructions)
+    until the estimated excess is gone.  Returns a copy; never mutates."""
+    out = list(messages)
+    order = sorted(
+        (i for i, m in enumerate(out)
+         if m.get("role") == "system" and isinstance(m.get("content"), str)),
+        key=lambda i: len(out[i]["content"]),
+        reverse=True,
+    )
+    for i in order:
+        if excess_tokens <= 0:
+            break
+        content = out[i]["content"]
+        cut = (excess_tokens + 1) * ESTIMATED_CHARS_PER_TOKEN + len(SYSTEM_TRUNCATION_MARKER)
+        keep = max(0, len(content) - cut)
+        out[i] = {**out[i], "content": content[:keep] + SYSTEM_TRUNCATION_MARKER}
+        excess_tokens -= (len(content) - len(out[i]["content"])) // ESTIMATED_CHARS_PER_TOKEN
+    return out
 
 
 def _session_key(messages: list[dict[str, Any]]) -> str:

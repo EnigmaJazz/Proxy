@@ -11,6 +11,7 @@ out per request with ``X-Proxy-Repo-Context: off``.
 """
 from __future__ import annotations
 
+import shutil
 import subprocess
 import types
 from typing import Any
@@ -201,12 +202,12 @@ class TestRepoContentSection:
         assert "history.jsonl" not in out
         assert "[File: SOUL.md]" in out
 
+    @pytest.mark.skipif(shutil.which("git") is None, reason="needs the git binary")
     def test_worktree_modified_line_with_leading_space_gets_diff(
         self, tmp_path: Any,
     ) -> None:
         # ``git status --short`` writes a worktree-only change as " M path";
         # the leading space must not swallow the status code into the path.
-        import subprocess
         def git(*args: str) -> None:
             subprocess.run(["git", "-C", str(tmp_path), *args], check=True,
                            capture_output=True)

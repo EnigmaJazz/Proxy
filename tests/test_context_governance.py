@@ -269,6 +269,26 @@ class TestBudgetSnip:
         assert governed[0] == {"role": "system", "content": "the system prompt"}
         assert governed[-1]["content"] == "the current question"
 
+    def test_truncates_system_message_that_alone_exceeds_budget(self) -> None:
+        system = "rules " * 100_000  # ~150k est. tokens, over any 65k budget
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": "the current question"},
+        ]
+        governed = apply_context_governance(
+            messages,
+            model_key="professional",
+            context_window=65_536,
+            max_output_tokens=4096,
+        )
+        total = sum(len(m["content"]) for m in governed) // 4
+        assert total <= 65_536 - 4096 - 1024
+        assert governed[0]["role"] == "system"
+        assert governed[0]["content"].startswith("rules rules")
+        assert "[system prompt truncated by proxy" in governed[0]["content"]
+        assert governed[-1]["content"] == "the current question"
+        assert messages[0]["content"] == system  # input never mutated
+
     def test_never_splits_tool_pair(self) -> None:
         # Several old turns with tool calls, then the current turn.
         old_turn = [
@@ -446,3 +466,35 @@ class TestEndpointGovernance:
                 for m in sent
             ), f"sentinel status leaked into outbound: {sent!r}"
             assert any("the real answer" in m["content"] for m in sent)
+
+
+class TestRuntimeWindowMatchesLiveUnit:
+    """RUNTIME_CONTEXT_WINDOWS must track the live ``-c``: a stale, larger
+    value lets prompts pass the snip and overflow at the server.  Local
+    only (the units live on this machine), like the profile drift check."""
+
+    UNIT_DIR = Path("/etc/systemd/system")
+
+    def _live_ctx(self, service: str) -> Optional[int]:
+        import re
+        files = [self.UNIT_DIR / f"{service}.service"] + sorted(
+            (self.UNIT_DIR / f"{service}.service.d").glob("*.conf")
+        )
+        exec_start = None
+        for f in files:
+            if not f.is_file():
+                continue
+            for line in f.read_text(encoding="utf-8").splitlines():
+                if line.startswith("ExecStart=") and line != "ExecStart=":
+                    exec_start = line  # later files override earlier ones
+        if exec_start is None:
+            return None
+        match = re.search(r"\s(?:-c|--ctx-size)\s+(\d+)", exec_start)
+        return int(match.group(1)) if match else None
+
+    def test_professional_window_matches_live_ctx(self) -> None:
+        from constants import RUNTIME_CONTEXT_WINDOWS
+        live = self._live_ctx("llama-professional")
+        if live is None:
+            pytest.skip("llama-professional unit not installed on this machine")
+        assert RUNTIME_CONTEXT_WINDOWS["professional"] == live

@@ -575,8 +575,9 @@ class TestRuntimeWindowMatchesLiveUnit:
     """
 
     @staticmethod
-    def _live_argv(service: str) -> Optional[list[str]]:
-        import re
+    def _systemctl_show(service: str) -> Optional[str]:
+        """``systemctl show`` output for the unit, or None when systemd
+        is unavailable or the unit is not loaded on this machine."""
         import shutil
         import subprocess
         if shutil.which("systemctl") is None:
@@ -588,16 +589,27 @@ class TestRuntimeWindowMatchesLiveUnit:
             ).stdout
         except (OSError, subprocess.SubprocessError):
             return None
-        if "LoadState=loaded" not in out:
-            return None
-        match = re.search(r"argv\[\]=(.*?) ;", out)
+        return out if "LoadState=loaded" in out else None
+
+    @staticmethod
+    def _argv_from_show(show: str) -> Optional[list[str]]:
+        import re
+        match = re.search(r"argv\[\]=(.*?) ;", show)
         return match.group(1).split() if match else None
+
+    def test_unparsable_exec_start_yields_no_argv(self) -> None:
+        assert self._argv_from_show("LoadState=loaded\nExecStart=\n") is None
+        assert self._argv_from_show(
+            "ExecStart={ path=/x ; argv[]=/x -c 4096 ; ignore_errors=no }",
+        ) == ["/x", "-c", "4096"]
 
     def test_professional_window_matches_live_ctx(self) -> None:
         from constants import RUNTIME_CONTEXT_WINDOWS
-        argv = self._live_argv("llama-professional")
-        if argv is None:
+        show = self._systemctl_show("llama-professional")
+        if show is None:
             pytest.skip("llama-professional unit not installed on this machine")
+        argv = self._argv_from_show(show)
+        assert argv is not None, f"loaded unit has no parsable ExecStart: {show!r}"
         live = _ctx_from_argv(argv)
         assert live is not None, f"no -c/--ctx-size in the live ExecStart: {argv}"
         assert RUNTIME_CONTEXT_WINDOWS["professional"] == live

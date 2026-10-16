@@ -331,6 +331,15 @@ def _snip_to_budget(
         total -= group_tokens
     if total > budget_tokens:
         remaining = _truncate_system_messages(remaining, total - budget_tokens)
+        total = sum(_estimate_tokens(m) for m in remaining)
+        if total > budget_tokens:
+            # Nothing left to drop or cut (e.g. list-of-parts system
+            # content, or one oversized last user turn): the server
+            # decides; make the overflow visible instead of silent.
+            logger.warning(
+                "Prompt still over the input budget after snipping "
+                "(~%d est. tokens > %d)", total, budget_tokens,
+            )
     return remaining
 
 
@@ -357,8 +366,12 @@ def _truncate_system_messages(
         content = out[i]["content"]
         cut = (excess_tokens + 1) * ESTIMATED_CHARS_PER_TOKEN + len(SYSTEM_TRUNCATION_MARKER)
         keep = max(0, len(content) - cut)
-        out[i] = {**out[i], "content": content[:keep] + SYSTEM_TRUNCATION_MARKER}
-        excess_tokens -= (len(content) - len(out[i]["content"])) // ESTIMATED_CHARS_PER_TOKEN
+        truncated = content[:keep] + SYSTEM_TRUNCATION_MARKER
+        saved = (len(content) - len(truncated)) // ESTIMATED_CHARS_PER_TOKEN
+        if saved <= 0:
+            continue  # too short: the marker would grow it, not shrink it
+        out[i] = {**out[i], "content": truncated}
+        excess_tokens -= saved
     return out
 
 

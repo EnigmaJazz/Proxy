@@ -6,6 +6,7 @@ and the dream fast-path, plus the per-request opt-out header).
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Optional
 from unittest.mock import AsyncMock, patch
@@ -288,6 +289,41 @@ class TestBudgetSnip:
         assert "[system prompt truncated by proxy" in governed[0]["content"]
         assert governed[-1]["content"] == "the current question"
         assert messages[0]["content"] == system  # input never mutated
+
+    def test_short_system_message_never_replaced_by_longer_marker(self) -> None:
+        # Only the last user turn is over budget: cutting the 2-char system
+        # message would GROW it (the marker is longer), so it stays as-is.
+        messages = [
+            {"role": "system", "content": "be"},
+            {"role": "user", "content": "q " * 200_000},
+        ]
+        governed = apply_context_governance(
+            messages,
+            model_key="professional",
+            context_window=65_536,
+            max_output_tokens=4096,
+        )
+        assert governed[0] == {"role": "system", "content": "be"}
+
+    def test_warns_when_still_over_budget(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # A list-of-parts system message is not truncatable, so the prompt
+        # stays over budget; that must be logged, not passed on silently.
+        messages = [
+            {"role": "system", "content": [{"type": "text", "text": "rules " * 100_000}]},
+            {"role": "user", "content": "the current question"},
+        ]
+        with caplog.at_level(logging.WARNING, logger="kinver.context_governance"):
+            apply_context_governance(
+                messages,
+                model_key="professional",
+                context_window=65_536,
+                max_output_tokens=4096,
+            )
+        assert any(
+            "over the input budget" in r.getMessage() for r in caplog.records
+        )
 
     def test_never_splits_tool_pair(self) -> None:
         # Several old turns with tool calls, then the current turn.

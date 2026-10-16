@@ -774,9 +774,10 @@ async def _inject_repo_context(
 
     R1 carve-out (2026-08-14, user-requested): the local model has no
     tools and no visibility of the opencode agents' work, so a future
-    conversation can't pick up the code.  The block is APPENDED (the
-    stable system prefix stays KV-cache-visible; only the delta
-    re-prefills) and is cache-stable between repo changes.  Never
+    conversation can't pick up the code.  The block is APPENDED to the
+    system message, so a repo change re-prefills everything after it
+    (the whole conversation); it is cache-stable between repo changes,
+    and tool-calling requests skip it (``_govern_messages``).  Never
     touches the client's stored conversation or the DB audit copy.
     Opt out per request with ``X-Proxy-Repo-Context: off``.
     """
@@ -839,6 +840,7 @@ async def _govern_messages(
     messages: list[dict[str, Any]],
     model_key: str,
     max_tokens: int,
+    has_tools: bool = False,
 ) -> list[dict[str, Any]]:
     """Apply frontend-agnostic context governance to the OUTBOUND copy.
 
@@ -863,8 +865,15 @@ async def _govern_messages(
     # the local model has no tools and no visibility of the opencode
     # agents' work; append the recent-task summaries + working-tree state
     # to the OUTBOUND system message.  Opt out per request with
-    # ``X-Proxy-Repo-Context: off``.
-    if request.headers.get("x-proxy-repo-context", "").strip().lower() != "off":
+    # ``X-Proxy-Repo-Context: off``.  Skipped when the request carries
+    # tools (2026-10-16): the client reads the files itself, and its own
+    # writes changed the block mid tool loop, so every following round
+    # re-prefilled the whole conversation behind the system message
+    # (10.9k tokens / 17s measured on professional).
+    if (
+        not has_tools
+        and request.headers.get("x-proxy-repo-context", "").strip().lower() != "off"
+    ):
         messages = await _inject_repo_context(messages)
     # Search-result enrichment (explicit user-approved R1 carve-out
     # extension): frontends execute search_web themselves and often return
@@ -1244,6 +1253,7 @@ async def chat_completions(request: Request) -> Response:
                 processed_messages,
                 model_key="professional",
                 max_tokens=int(parameters["max_tokens"]),
+                has_tools=bool(tools),
             ),
             "temperature": parameters["temperature"],
             "max_tokens": parameters["max_tokens"],
@@ -1672,6 +1682,7 @@ async def chat_completions(request: Request) -> Response:
             processed_messages,
             model_key=route.model_key,
             max_tokens=int(parameters["max_tokens"]),
+            has_tools=bool(tools),
         ),
         "temperature": parameters["temperature"],
         "top_p": parameters["top_p"],

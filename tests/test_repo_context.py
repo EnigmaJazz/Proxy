@@ -18,6 +18,8 @@ from typing import Any
 
 import pytest
 
+from tests.test_image_downscale import image_client  # noqa: F401  (fixture)
+
 
 @pytest.fixture
 def work_repo(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
@@ -38,12 +40,20 @@ def work_repo(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
     return repo
 
 
-def _govern(msgs: list[dict[str, Any]], headers: dict[str, str]) -> Any:
+def _govern(
+    msgs: list[dict[str, Any]],
+    headers: dict[str, str],
+    *,
+    has_tools: bool = False,
+) -> Any:
     """Run routes._govern_messages with the given headers."""
     from routes import _govern_messages
 
     request = types.SimpleNamespace(headers=headers)
-    return _govern_messages(request, msgs, model_key="professional", max_tokens=4096)
+    return _govern_messages(
+        request, msgs, model_key="professional", max_tokens=4096,
+        has_tools=has_tools,
+    )
 
 
 class TestRepoContextCapture:
@@ -127,6 +137,26 @@ class TestRepoContextInjection:
                 msgs, {"x-proxy-repo-context": "off", "x-proxy-date-time": "off"},
             )
             assert out[0]["content"] == "sys"
+        finally:
+            routes._RECENT_OPENCODE_WORK.clear()
+
+    @pytest.mark.asyncio
+    async def test_skipped_when_request_carries_tools(self, work_repo: Any) -> None:
+        """A tool-calling client reads the files itself; the live block
+        would change mid-loop (the agent's own writes) and force a full
+        re-prefill of the conversation behind the system message."""
+        import routes
+
+        routes._RECENT_OPENCODE_WORK.clear()
+        try:
+            routes._capture_opencode_work(["Some work."])
+            msgs = [{"role": "system", "content": "sys"},
+                    {"role": "user", "content": "hi"}]
+            out = await _govern(
+                msgs, {"x-proxy-date-time": "off"}, has_tools=True,
+            )
+            assert out[0]["content"] == "sys"
+            assert out[1] == msgs[1]
         finally:
             routes._RECENT_OPENCODE_WORK.clear()
 
@@ -222,3 +252,61 @@ class TestRepoContentSection:
         assert "[File: c.py]" in out
         assert "[Diff: b.py]" in out
         assert "+y = 2" in out
+
+
+class TestRepoContextWire:
+    """End-to-end: a tool-calling request's OUTBOUND system message carries
+    no repo block; a plain chat request still does."""
+
+    _TOOLS = [{
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a file",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+        },
+    }]
+
+    async def _outbound_system(
+        self, client: Any, *, tools: list[dict[str, Any]] | None,
+    ) -> str:
+        from unittest.mock import patch
+
+        from tests.test_image_downscale import _StreamCapture
+
+        body: dict[str, Any] = {
+            "model": "auto",
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "summarise my notes"},
+            ],
+        }
+        if tools:
+            body["tools"] = tools
+        capture = _StreamCapture()
+        with patch("routes.stream_llm", new=capture), patch(
+            "routes._repo_context_block", return_value="REPO-BLOCK-MARKER",
+        ):
+            response = await client.post(
+                "/v1/chat/completions",
+                json=body,
+                headers={"Authorization": "Bearer agent-key"},
+            )
+            await response.aread()
+        assert response.status_code == 200, response.text
+        assert capture.payload is not None
+        return capture.payload["messages"][0]["content"]
+
+    @pytest.mark.asyncio
+    async def test_tool_request_outbound_has_no_repo_block(
+        self, image_client: Any,
+    ) -> None:
+        system = await self._outbound_system(image_client, tools=self._TOOLS)
+        assert "REPO-BLOCK-MARKER" not in system
+
+    @pytest.mark.asyncio
+    async def test_plain_request_outbound_keeps_repo_block(
+        self, image_client: Any,
+    ) -> None:
+        system = await self._outbound_system(image_client, tools=None)
+        assert "REPO-BLOCK-MARKER" in system

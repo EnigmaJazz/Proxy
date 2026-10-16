@@ -5,7 +5,7 @@ Mirrors the budget discipline nanobot-ai applies inside its own agent loop
 nanobot, curl, web UIs, custom clients — gets the same protection regardless
 of the client-side agent.
 
-The transform is a pure function over the OUTBOUND model-copy:
+The transform builds a new OUTBOUND model-copy (offload writes files):
 
   1. structural cleanup   — drop orphan tool results and malformed tool_calls
   2. tool-result budget   — truncate oversized results; offload very large
@@ -18,12 +18,14 @@ The transform is a pure function over the OUTBOUND model-copy:
 
 Constraints (deliberate):
 
-- Only ``role: \"tool\"`` result messages are truncated or replaced. User and
-  assistant text is NEVER altered.
+- Only ``role: \"tool\"`` result messages are truncated or replaced. User,
+  assistant and system text is NEVER rewritten; the snip drops whole old
+  turns, and ``strip_proxy_status`` drops the proxy's own status messages.
 - The client's stored conversation and the DB job audit copy are untouched —
   governance operates on a copy that is only ever sent to the model.
-- The snip never splits a tool_call/result pair and never drops the most
-  recent user turn.
+- The snip never splits a tool_call/result pair, never drops the most
+  recent user turn or a system message, and logs a warning when the prompt
+  is still over budget.
 - Truncation and offload append a marker so the model knows a result was
   partial and why (prevents silent re-call loops).
 - Per-request opt-out: ``X-Proxy-Context-Governance: off``.
@@ -330,49 +332,14 @@ def _snip_to_budget(
         del remaining[i : i + len(group)]
         total -= group_tokens
     if total > budget_tokens:
-        remaining = _truncate_system_messages(remaining, total - budget_tokens)
-        total = sum(_estimate_tokens(m) for m in remaining)
-        if total > budget_tokens:
-            # Nothing left to drop or cut (e.g. list-of-parts system
-            # content, or one oversized last user turn): the server
-            # decides; make the overflow visible instead of silent.
-            logger.warning(
-                "Prompt still over the input budget after snipping "
-                "(~%d est. tokens > %d)", total, budget_tokens,
-            )
+        # Nothing droppable is left (system messages, or one oversized
+        # last user turn): the server decides; make the overflow visible
+        # instead of silent.
+        logger.warning(
+            "Prompt still over the input budget after snipping "
+            "(~%d est. tokens > %d)", total, budget_tokens,
+        )
     return remaining
-
-
-SYSTEM_TRUNCATION_MARKER = "\n\n[system prompt truncated by proxy to fit the context window]"
-
-
-def _truncate_system_messages(
-    messages: list[dict[str, Any]],
-    excess_tokens: int,
-) -> list[dict[str, Any]]:
-    """Last resort once no droppable turn is left: cut the TAIL of the
-    largest string system messages (the head holds the core instructions)
-    until the estimated excess is gone.  Returns a copy; never mutates."""
-    out = list(messages)
-    order = sorted(
-        (i for i, m in enumerate(out)
-         if m.get("role") == "system" and isinstance(m.get("content"), str)),
-        key=lambda i: len(out[i]["content"]),
-        reverse=True,
-    )
-    for i in order:
-        if excess_tokens <= 0:
-            break
-        content = out[i]["content"]
-        cut = (excess_tokens + 1) * ESTIMATED_CHARS_PER_TOKEN + len(SYSTEM_TRUNCATION_MARKER)
-        keep = max(0, len(content) - cut)
-        truncated = content[:keep] + SYSTEM_TRUNCATION_MARKER
-        saved = (len(content) - len(truncated)) // ESTIMATED_CHARS_PER_TOKEN
-        if saved <= 0:
-            continue  # too short: the marker would grow it, not shrink it
-        out[i] = {**out[i], "content": truncated}
-        excess_tokens -= saved
-    return out
 
 
 def _session_key(messages: list[dict[str, Any]]) -> str:

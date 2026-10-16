@@ -299,7 +299,8 @@ def _snip_to_budget(
 
     Atomic units: a user message alone, an assistant message alone (no tool
     calls), or an assistant tool-call message TOGETHER with its consecutive
-    tool results.  The most recent user turn is never dropped.
+    tool results.  The most recent user turn and system messages (the
+    model's instructions) are never dropped.
     """
     if budget_tokens <= 0:
         return messages
@@ -311,6 +312,9 @@ def _snip_to_budget(
     i = 0
     while i < len(remaining) and total > budget_tokens:
         msg = remaining[i]
+        if msg.get("role") == "system":
+            i += 1
+            continue
         group = [msg]
         if msg.get("role") == "assistant" and msg.get("tool_calls"):
             j = i + 1

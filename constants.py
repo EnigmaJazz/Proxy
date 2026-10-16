@@ -34,10 +34,10 @@ PROJECT_ROOT: Path = Path(__file__).resolve().parent
 RUNTIME_CONTEXT_WINDOWS: dict[str, int] = {
     "frontdesk": 12_288,
     "chatter": 32_768,
-    # 131072 since 2026-08-14: the context bump (-c 131072, KV quants
-    # unchanged) fits because --fit on rebalances model layers to CPU;
-    # load-time VRAM ~12.5GB of 12.87GB.  65536 was the pre-bump value.
-    "professional": 131_072,
+    # 118784 since the 2026-10-09 Nail IQ4_XS swap (zzz-nail.conf drop-in,
+    # -c 118784) — the snip budget must sit under the live -c or long
+    # prompts overflow at the server instead of being snipped.
+    "professional": 118_784,
     "scholar": 32_768,
     "creative": 32_768,
     "architect": 32_768,

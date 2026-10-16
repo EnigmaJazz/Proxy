@@ -719,7 +719,8 @@ def _repo_content_section(
     lines_out: list[str] = []
     budget = _MAX_CONTENT_LINES
     for line in status.splitlines():
-        st, _, path = line.partition(" ")
+        # Strip first: git writes worktree-only changes as " M path".
+        st, _, path = line.strip().partition(" ")
         path = path.strip()
         if not path or any(path.startswith(p) for p in _NANOBOT_INTERNAL_PREFIXES):
             continue

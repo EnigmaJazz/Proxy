@@ -255,6 +255,20 @@ class TestBudgetSnip:
         assert len(governed) <= len(messages)
         assert governed[-1]["content"] == "the current question"
 
+    def test_keeps_system_message_when_snipping(self) -> None:
+        messages = [{"role": "system", "content": "the system prompt"}] + [
+            {"role": "user", "content": "old " * 60_000}
+        ] * 3 + [{"role": "user", "content": "the current question"}]
+        governed = apply_context_governance(
+            messages,
+            model_key="professional",
+            context_window=65_536,
+            max_output_tokens=4096,
+        )
+        assert len(governed) < len(messages)
+        assert governed[0] == {"role": "system", "content": "the system prompt"}
+        assert governed[-1]["content"] == "the current question"
+
     def test_never_splits_tool_pair(self) -> None:
         # Several old turns with tool calls, then the current turn.
         old_turn = [

@@ -200,3 +200,24 @@ class TestRepoContentSection:
         out = self._section("?? memory/history.jsonl\n?? SOUL.md", tmp_path)
         assert "history.jsonl" not in out
         assert "[File: SOUL.md]" in out
+
+    def test_worktree_modified_line_with_leading_space_gets_diff(
+        self, tmp_path: Any,
+    ) -> None:
+        # ``git status --short`` writes a worktree-only change as " M path";
+        # the leading space must not swallow the status code into the path.
+        import subprocess
+        def git(*args: str) -> None:
+            subprocess.run(["git", "-C", str(tmp_path), *args], check=True,
+                           capture_output=True)
+        git("init", "-q")
+        (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+        (tmp_path / "b.py").write_text("y = 1\n", encoding="utf-8")
+        git("add", ".")
+        git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init")
+        (tmp_path / "b.py").write_text("y = 2\n", encoding="utf-8")
+        (tmp_path / "c.py").write_text("z = 1\n", encoding="utf-8")
+        out = self._section("?? c.py\n M b.py", tmp_path)
+        assert "[File: c.py]" in out
+        assert "[Diff: b.py]" in out
+        assert "+y = 2" in out

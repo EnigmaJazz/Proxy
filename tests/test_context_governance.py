@@ -526,33 +526,78 @@ class TestEndpointGovernance:
             assert any("the real answer" in m["content"] for m in sent)
 
 
+def _ctx_from_argv(argv: list[str]) -> Optional[int]:
+    """The ``-c`` / ``--ctx-size`` value in a llama-server argv (space or
+    ``=`` form); the last occurrence wins, as in llama.cpp's parser."""
+    value: Optional[int] = None
+    for i, arg in enumerate(argv):
+        if arg in ("-c", "--ctx-size") and i + 1 < len(argv):
+            nxt = argv[i + 1]
+            if nxt.isdigit():
+                value = int(nxt)
+        elif arg.startswith(("-c=", "--ctx-size=")):
+            tail = arg.split("=", 1)[1]
+            if tail.isdigit():
+                value = int(tail)
+    return value
+
+
+class TestCtxFromArgv:
+    """Deterministic coverage for the live-window parser."""
+
+    @pytest.mark.parametrize(
+        ("argv", "expected"),
+        [
+            (["llama-server", "-c", "118784", "-fa", "on"], 118784),
+            (["llama-server", "--ctx-size", "65536"], 65536),
+            (["llama-server", "--ctx-size=32768"], 32768),
+            (["llama-server", "-c=16384"], 16384),
+            (["llama-server", "-c", "1024", "--ctx-size", "2048"], 2048),
+            (["llama-server", "-ctk", "q8_0", "-cb"], None),
+            (["llama-server", "-c"], None),
+        ],
+    )
+    def test_parses_every_flag_form(
+        self, argv: list[str], expected: Optional[int],
+    ) -> None:
+        assert _ctx_from_argv(argv) == expected
+
+
 class TestRuntimeWindowMatchesLiveUnit:
     """RUNTIME_CONTEXT_WINDOWS must track the live ``-c``: a stale, larger
     value lets prompts pass the snip and overflow at the server.  Local
-    only (the units live on this machine), like the profile drift check."""
+    only (the unit lives on this machine), like the profile drift check.
 
-    UNIT_DIR = Path("/etc/systemd/system")
+    The argv comes from systemd's merged view (``systemctl show``), so
+    drop-in overrides and backslash-continued ExecStart lines resolve
+    exactly as the service manager runs them.  The test skips only when
+    the unit is absent; an installed unit without a parsable window fails.
+    """
 
-    def _live_ctx(self, service: str) -> Optional[int]:
+    @staticmethod
+    def _live_argv(service: str) -> Optional[list[str]]:
         import re
-        files = [self.UNIT_DIR / f"{service}.service"] + sorted(
-            (self.UNIT_DIR / f"{service}.service.d").glob("*.conf")
-        )
-        exec_start = None
-        for f in files:
-            if not f.is_file():
-                continue
-            for line in f.read_text(encoding="utf-8").splitlines():
-                if line.startswith("ExecStart=") and line != "ExecStart=":
-                    exec_start = line  # later files override earlier ones
-        if exec_start is None:
+        import shutil
+        import subprocess
+        if shutil.which("systemctl") is None:
             return None
-        match = re.search(r"\s(?:-c|--ctx-size)\s+(\d+)", exec_start)
-        return int(match.group(1)) if match else None
+        try:
+            out = subprocess.run(
+                ["systemctl", "show", "-p", "LoadState,ExecStart", service],
+                capture_output=True, text=True, timeout=10, check=False,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if "LoadState=loaded" not in out:
+            return None
+        match = re.search(r"argv\[\]=(.*?) ;", out)
+        return match.group(1).split() if match else None
 
     def test_professional_window_matches_live_ctx(self) -> None:
         from constants import RUNTIME_CONTEXT_WINDOWS
-        live = self._live_ctx("llama-professional")
-        if live is None:
+        argv = self._live_argv("llama-professional")
+        if argv is None:
             pytest.skip("llama-professional unit not installed on this machine")
+        live = _ctx_from_argv(argv)
+        assert live is not None, f"no -c/--ctx-size in the live ExecStart: {argv}"
         assert RUNTIME_CONTEXT_WINDOWS["professional"] == live
